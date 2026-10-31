@@ -447,16 +447,40 @@ await atest('无 trace 目录 → undetermined，不崩', async () => {
   ok(cap.blockedReason !== null, '应给出阻断原因');
 });
 
-await atest('基线与观测模型不同 → 告警（模型不同则静态前缀不同）', async () => {
+await atest('跨模型自动隔离：只会用同一模型的样本，并告警排除了多少', async () => {
   const { autoCapture } = await import('./verify/auto-capture.mjs');
   fs.rmSync(tracesDir, { recursive: true, force: true });
   SESS.clear();
   SESS.set('111', applyAtMs - 120000);
   SESS.set('222', applyAtMs + 5000);
-  writeTrace('111', 'r1.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
-  writeTrace('222', 'r1.jsonl', new Date(applyAtMs + 10000).toISOString(), 'other-model', 1000 + EXP);
+  // 基线用 minimax，观测故意用另一个模型 → 应被排除，导致"找不到观测"
+  writeTrace('111', 'base.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
+  writeTrace('222', 'obs.jsonl', new Date(applyAtMs + 10000).toISOString(), 'other-model', 1000 + EXP);
+
   const cap = autoCapture({ configRoot: cfg, applyAtMs, expectedDelta: EXP, sessionStartOf: startOf });
-  ok(cap.warnings.some((w) => /模型不同/.test(w)), `应给出模型不同告警：${JSON.stringify(cap.warnings)}`);
+  // 观测被排除 → 报"没有新会话"，而不是拿另一个模型硬比
+  ok(cap.blockedReason !== null, '跨模型时应阻断而不是硬比');
+  ok(/新建/.test(cap.blockedReason ?? ''), `应指导用户：${cap.blockedReason}`);
+});
+
+await atest('跨模型：有同模型样本时优先用同模型，并如实报告排除了多少', async () => {
+  const { autoCapture } = await import('./verify/auto-capture.mjs');
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.clear();
+  SESS.set('111', applyAtMs - 120000);
+  SESS.set('222', applyAtMs + 5000);
+  SESS.set('333', applyAtMs + 8000);
+  writeTrace('111', 'base.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
+  writeTrace('222', 'other.jsonl', new Date(applyAtMs + 6000).toISOString(), 'other-model', 9999);
+  writeTrace('333', 'obs.jsonl', new Date(applyAtMs + 10000).toISOString(), CHAT_MODEL, 1000 + EXP);
+
+  const cap = autoCapture({ configRoot: cfg, applyAtMs, expectedDelta: EXP, sessionStartOf: startOf });
+  eq(cap.blockedReason, null, `不应阻断：${cap.blockedReason}`);
+  eq(cap.evidence.targetModel, CHAT_MODEL, `应锁定同一模型，实际 ${cap.evidence.targetModel}`);
+  eq(cap.evidence.observed.worker, '333', `应跳过 other-model，实际观测来自 ${cap.evidence.observed.worker}`);
+  eq(cap.evidence.observed.promptTokens, 1000 + EXP, '观测 token 应来自同模型那一次');
+  ok(cap.evidence.otherModelsExcluded >= 1, '应报告排除了其它模型样本');
+  ok(cap.warnings.some((w) => /其它模型|跨模型/.test(w)), `应告警：${JSON.stringify(cap.warnings)}`);
 });
 
 // ══════════════ P1a：个性化五项 ══════════════

@@ -52,20 +52,29 @@ export function defaultSessionStartOf(configRoot) {
 
 /**
  * 选出基线会话与观测会话。
+ *
  * @param {Array} generations readGenerations 的输出
  * @param {number} applyAtMs
  * @param {(worker:string)=>number|null} sessionStartOf
+ * @param {{preferModel?:string}} [opts]
+ *   `preferModel`：有多个聊天模型时优先用哪个（默认自动：取最近一次聊天用的模型）。
+ *   跨模型比较的增量无意义 —— 静态前缀不同，模型分词器也可能不同。
  */
-export function pickSessions(generations, applyAtMs, sessionStartOf) {
+export function pickSessions(generations, applyAtMs, sessionStartOf, opts = {}) {
   // 只保留可信的聊天样本
   const chat = generations.filter(
     (g) => g.isChat && g.atMs != null && g.promptTokens > 0 && g.finishReason !== 'content_filter',
   );
   const excluded = generations.length - chat.length;
 
+  /** 自动选模型：优先用"改动前最后一次聊天所用的模型" */
+  const beforeAll = chat.filter((g) => g.atMs < applyAtMs).sort((a, b) => b.atMs - a.atMs);
+  const targetModel = opts.preferModel ?? beforeAll[0]?.model ?? null;
+  const sameModel = targetModel ? chat.filter((g) => g.model === targetModel) : chat;
+
   /** 每个 worker 一条会话，取其**首条**聊天请求 */
   const byWorker = new Map();
-  for (const g of chat) {
+  for (const g of sameModel) {
     const cur = byWorker.get(g.worker);
     if (!cur || g.atMs < cur.first.atMs) byWorker.set(g.worker, { worker: g.worker, first: g });
   }
@@ -84,12 +93,18 @@ export function pickSessions(generations, applyAtMs, sessionStartOf) {
   const before = sessions.filter((s) => s.startMs < applyAtMs);
   const after = sessions.filter((s) => s.startMs > applyAtMs);
 
+  /** 其它模型被排除的样本数（供告警用） */
+  const otherModelsExcluded = targetModel ? chat.length - sameModel.length : 0;
+
   return {
     baselineSession: before.at(-1) ?? null,
     observedSession: after[0] ?? null,
-    chatCount: chat.length,
+    chatCount: sameModel.length,
     excludedCount: excluded,
     sessionCount: sessions.length,
+    /** 使用的模型（跨模型不可比，所以固定一个） */
+    targetModel,
+    otherModelsExcluded,
     /** 是否所有会话起点都来自目录创建时间（否则是次优信号） */
     allStartsAuthoritative: sessions.every((s) => s.startSource === 'dir-created'),
   };
@@ -128,6 +143,12 @@ export function autoCapture({ configRoot, applyAtMs, expectedDelta, limitFiles, 
       + '若某会话在改动前创建、改动后才发请求，它会被误当作观测点，结论可能偏保守。',
     );
   }
+  if (picked.otherModelsExcluded > 0) {
+    warnings.push(
+      `已排除 ${picked.otherModelsExcluded} 条**其它模型**的样本（本次只用 ${picked.targetModel}）——`
+      + '不同模型的静态前缀与分词器不同，跨模型算增量没有意义。',
+    );
+  }
   if (baselineSession.first.model !== observedSession.first.model) {
     warnings.push(
       `基线与观测的模型不同（${baselineSession.first.model} vs ${observedSession.first.model}）——`
@@ -157,6 +178,8 @@ export function autoCapture({ configRoot, applyAtMs, expectedDelta, limitFiles, 
       },
       excludedSamples: picked.excludedCount,
       sessionCount: picked.sessionCount,
+      targetModel: picked.targetModel,
+      otherModelsExcluded: picked.otherModelsExcluded,
       /** 会话首条请求才是可比量：同会话后续轮次含累积历史 */
       basis: 'session-first-request',
     },

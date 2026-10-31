@@ -16,8 +16,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** 非聊天模型（不作为 token-delta 样本） */
-const NON_CHAT_MODEL = /^wb-lite$/i;
+/**
+ * 非聊天模型（不作为 token-delta 样本）
+ *
+ * 实测（本机 560 条 generation）：
+ *   - `wb-lite`：标题生成，静态提示词约 517 tokens → 明显不是聊天
+ *   - `step-5-preview`：302 条，首条 token 跨度 **530–180541**（340 倍）
+ *     → 这不是普通聊天：极可能是子任务/预览类请求，规模随任务而变。
+ *     拿它当基线会严重失真，因此**排除出 token-delta 样本池**。
+ *   - `minimax-m3.1-flash` / `deepseek-v4.1-flash`：真正的聊天模型
+ *
+ * 判据是"是否参与主聊天链路"，不是"模型名字像不像聊天"。
+ * 新增模型时：若它的 token 规模与主聊天差异巨大，就应加进这里。
+ */
+const NON_CHAT_MODEL = /^(wb-lite|step-5-preview)$/i;
 
 /** @param {string} configRoot */
 export function traceRoot(configRoot) {
@@ -124,7 +136,7 @@ export function readGenerations(configRoot, opts = {}) {
         cachedTokens: u.cachedTokens,
         finishReason: u.finishReason,
         contentPreview: String(u.content ?? '').slice(0, 80),
-        /** 聊天模型才可作为对照样本 */
+        /** 只有参与主聊天链路的请求才可作为对照样本 */
         isChat: !NON_CHAT_MODEL.test(String(u.model ?? '')),
       });
     }
