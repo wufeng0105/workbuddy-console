@@ -23,6 +23,11 @@
  *   node src/cli.mjs profile-verify <id>
  *   node src/cli.mjs profile-rm     <id>
  *
+ * 版本重放（演进契约：升级后走一遍路线）：
+ *   node src/cli.mjs bundle           建重放包（收 upgradeBehavior=invalidated 的把手）
+ *   node src/cli.mjs drift            只读检测：升级后哪些定制没了
+ *   node src/cli.mjs replay [--only a,b] [--confirm]   把快照灌回去（一次事务）
+ *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
  *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console）
@@ -340,6 +345,61 @@ async function main(argv) {
     case 'profile-rm': {
       const r = engine.removeProfile(f._[1]);
       return out(json ? r : `✅ 已删除档位 ${r.id}`, false);
+    }
+
+    // ── 版本重放 ──────────────────────────────────────────────
+    case 'bundle': {
+      const r = await engine.captureBundle();
+      if (json) return out(r, true);
+      const n = Object.keys(r.bundle.entries).length;
+      console.log(`✅ 重放包已建立（WorkBuddy ${r.bundle.version}）`);
+      console.log(`   收录 ${n} 项需要重放的定制：`);
+      for (const [id, e] of Object.entries(r.bundle.entries)) {
+        console.log(`     ${id.padEnd(30)} ${String(e.bytes).padStart(7)} B  ← ${e.capturedFrom}`);
+      }
+      if (r.bundle.skipped.length) {
+        console.log(`\n   跳过 ${r.bundle.skipped.length} 项（不需要重放）：`);
+        for (const s of r.bundle.skipped.slice(0, 10)) console.log(`     ${s.id.padEnd(30)} ${s.reason}`);
+      }
+      console.log(`\n   文件：${tildify(r.file)}`);
+      return undefined;
+    }
+
+    case 'drift': {
+      const d = await engine.checkDrift();
+      if (json) return out(d, true);
+      if (!d.ok) return console.log(`⚠️  ${d.reason}`);
+      console.log(`重放包建于 ${d.bundleCreatedAt}（WorkBuddy ${d.bundleVersion}）`);
+      console.log(`当前版本 ${d.currentVersion}${d.versionChanged ? '  ← 版本变了' : ''}\n`);
+      const icon = { unchanged: '✅', 'vendor-restored': '⚠️ ', 'target-missing': '❌', 'anchor-missing': '❌', 'handle-missing': '·' };
+      for (const r of d.results) {
+        console.log(`${icon[r.kind] ?? '·'} ${String(r.id).padEnd(30)} ${r.kind}`);
+        if (r.detail) console.log(`     ${r.detail}`);
+        if (r.moved) console.log('     路径也变了（升级换了版本目录）');
+      }
+      console.log(`\n需要重放：${d.needReplay.length} 项${d.needReplay.length ? `（${d.needReplay.join(', ')}）` : ''}`);
+      if (d.needReplay.length) console.log('重放：node src/cli.mjs replay --confirm');
+      return undefined;
+    }
+
+    case 'replay': {
+      const only = typeof f.only === 'string' ? f.only.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+      const r = await engine.replay({ only, confirm: f.confirm === true });
+      if (json) return out(r, true);
+      if (r.replayed.length === 0) return console.log(`没有需要重放的把手${r.note ? `（${r.note}）` : ''}`);
+      const badge = r.failed === 0 ? '✅' : r.ok === 0 ? '❌' : '⚠️ ';
+      console.log(`${badge} 重放结果：成功 ${r.ok} / 失败 ${r.failed}（共 ${r.replayed.length}）`);
+      console.log(`   备份 ${r.backupId}（覆盖 ${r.files} 个文件，可整体还原）`);
+      for (const x of r.replayed) {
+        console.log(x.ok ? `   · ${x.handle}` : `   ❌ ${x.handle}  ${x.error}`);
+      }
+      if (r.partial) console.log('\n⚠️  部分成功 —— 有把手没灌回去，请按上面的错误逐个处理，不要当成完成。');
+      if (r.failed > 0) process.exitCode = 2;
+      if (r.skipped.length) {
+        console.log(`\n   跳过 ${r.skipped.length} 项：`);
+        for (const s of r.skipped) console.log(`     ${s.id}  ${s.reason}`);
+      }
+      return undefined;
     }
 
     case 'audit': {

@@ -13,7 +13,7 @@ import { createBackup, restoreBackup, listBackups } from './backup.mjs';
 import { appendAudit, readAudit } from './audit.mjs';
 import { diffLines, renderDiff } from './diff.mjs';
 import { estimateCost } from './tokens.mjs';
-import { ConfirmationRequiredError, GateBlockedError } from './errors.mjs';
+import { ConfirmationRequiredError, GateBlockedError, ConsoleError } from './errors.mjs';
 import * as registry from './registry.mjs';
 import { isWorkBuddyRunning } from './appstate.mjs';
 import { readActiveToneStyle } from './appconfig.mjs';
@@ -22,6 +22,7 @@ import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 import {
   writeProfile, readProfile, listProfiles, deleteProfile, slugify, PROFILE_HANDLES,
 } from './profiles.mjs';
+import { buildBundle, readBundle, detectDrift } from './replay.mjs';
 import { tildify } from './paths.mjs';
 
 /** @param {object} h */
@@ -455,6 +456,108 @@ export function createEngine({
     });
   }
 
+  // ── 版本重放（演进契约）─────────────────────────────────────
+
+  /** 建重放包：只收 upgradeBehavior==='invalidated' 的把手 */
+  async function captureBundle() {
+    return buildBundle({ storeRoot, handles: registry.list(), ctx });
+  }
+
+  /** 只读检测：升级后哪些定制没了、哪些需要重放 */
+  async function checkDrift() {
+    return detectDrift({ storeRoot, handles: registry.list(), ctx });
+  }
+
+  /**
+   * 重放：把快照灌回**指定**（默认全部需要重放的）把手。
+   * 一次备份覆盖全部目标、一条审计、整体可还原 —— 与档位切换同一套事务语义。
+   * @param {{only?:string[], confirm?:boolean, reason?:string}} [opts]
+   */
+  async function replay({ only, confirm = false, reason } = {}) {
+    const drift = await checkDrift();
+    if (!drift.ok) {
+      throw new ConsoleError('NO_BUNDLE', drift.reason, { hint: '先运行 captureBundle' });
+    }
+    const bundle = readBundle(storeRoot);
+    const targets = (only?.length ? only : drift.needReplay).filter(Boolean);
+    if (targets.length === 0) {
+      return { replayed: [], skipped: [], note: '没有需要重放的把手（定制都还在）', drift };
+    }
+
+    /** @type {Map<string,{key:string, absPath:string}>} */
+    const backups = new Map();
+    const plan = [];
+    const skipped = [];
+
+    for (const id of targets) {
+      const h = registry.get(id);
+      const entry = bundle.entries[id];
+      if (!entry) { skipped.push({ id, reason: '重放包里没有这一项' }); continue; }
+      if (entry.content == null) {
+        skipped.push({ id, reason: '这一项不是文本型（如规则矩阵），重放需单独处理' });
+        continue;
+      }
+      const gate = gateCheck(h);
+      if (gate.blocked) {
+        throw new GateBlockedError(gate.reason, { handle: id, op: 'replay' });
+      }
+      if (h.writeClass === 'vendor-file' && !confirm) {
+        throw new ConfirmationRequiredError(
+          `重放涉及厂商文件把手 ${id}，需显式确认（--confirm）`,
+          { handle: id },
+        );
+      }
+      const anchor = anchorFor(h);
+      backups.set(anchor.path, { key: anchor.key ?? h.target, absPath: anchor.path });
+      plan.push({ h, next: entry.content });
+    }
+
+    if (plan.length === 0) {
+      return { replayed: [], skipped, note: '没有可重放的文本型把手', drift };
+    }
+
+    const manifest = createBackup({
+      storeRoot,
+      actor,
+      reason: reason ?? `replay（${plan.length} 个把手 / ${backups.size} 个文件）`,
+      entries: [...backups.values()],
+    });
+
+    const replayed = [];
+    for (const { h, next } of plan) {
+      try {
+        const r = await h.apply(ctx, { next });
+        replayed.push({ handle: h.id, ok: true, ...r });
+      } catch (e) {
+        replayed.push({ handle: h.id, ok: false, error: `${e.code ?? 'ERR'}: ${e.message}` });
+      }
+    }
+
+    const okCount = replayed.filter((r) => r.ok).length;
+    const failed = replayed.filter((r) => !r.ok);
+
+    appendAudit(storeRoot, {
+      event: 'replay',
+      backupId: manifest.id,
+      handles: plan.map((p) => p.h.id),
+      ok: okCount,
+      failed: failed.length,
+      actor,
+    });
+
+    return {
+      backupId: manifest.id,
+      replayed,
+      ok: okCount,
+      failed: failed.length,
+      /** 有失败就必须让调用方看得见 —— 不允许"部分成功"被说成成功 */
+      partial: failed.length > 0 && okCount > 0,
+      skipped,
+      files: backups.size,
+      drift,
+    };
+  }
+
   // ── 6. 还原 ────────────────────────────────────────────────
   function restore(backupId, { dryRun = false } = {}) {
     const r = restoreBackup({ storeRoot, id: backupId, dryRun });
@@ -497,5 +600,7 @@ export function createEngine({
     captureProfile, planProfile, applyProfile, verifyProfile,
     profiles: () => listProfiles(storeRoot),
     removeProfile: (id) => deleteProfile(storeRoot, id),
+    // 版本重放（演进契约）
+    captureBundle, checkDrift, replay,
   };
 }

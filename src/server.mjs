@@ -97,6 +97,16 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
       return engine.removeProfile(String(body.id ?? ''));
     }
 
+    // ── 版本重放（演进契约）──
+    if (pathname === '/api/bundle' && method === 'POST') return engine.captureBundle();
+    if (pathname === '/api/drift' && method === 'GET') return engine.checkDrift();
+    if (pathname === '/api/replay' && method === 'POST') {
+      return engine.replay({
+        only: Array.isArray(body.only) && body.only.length ? body.only : undefined,
+        confirm: body.confirm === true,
+      });
+    }
+
     const m = /^\/api\/handle\/([^/]+)\/(probe|plan|apply|verify)$/.exec(pathname);
     if (m) {
       const id = decodeURIComponent(m[1]);

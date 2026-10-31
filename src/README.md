@@ -24,6 +24,7 @@ src/
 | `core/profiles.mjs` | ✅ 已实现 | 档位（源状态）存取：原子写、结构校验、损坏可见；**存用户数据目录，不进仓库** |
 | `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份；**档位多把手事务**（一次备份 / 一条审计 / 整体还原） |
 | `core/trace.mjs` | ✅ 已实现 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
+| `core/replay.mjs` | ✅ 已实现 | 版本重放：建包（存锚点键不存路径）、漂移检测（5 类）、重放（一次事务 + 如实报告失败） |
 | `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
 | `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |
 | `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |

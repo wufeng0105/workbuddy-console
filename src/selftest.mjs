@@ -839,6 +839,7 @@ console.log('\n【12】P2a · C 组提示词模板（版本定位 / 头部通道
 // 造 C 组插件缓存：双版本并存（低版本 + fixture 已有版本），并注入 content_policy 段
 const builtinDir = path.join(cfg, 'plugins', 'cache', 'workbuddy-builtin');
 const FIXTURE_VER = '5.9.3-wb.selftest.g0000.h0000';
+const FIXTURE_VER_NEXT = '5.9.4-wb.99999999.gdeadbeef.hcafebabe';
 const OLD_VER = '5.8.3-wb.41334564.gdb0e9b51.h4da087921e4a';
 function seedPromptTpl(mode, versionDir, body) {
   const d = ensureDir(path.join(builtinDir, `welcomemode-${mode}`, versionDir));
@@ -1125,6 +1126,151 @@ await atest('按路径定向：只改指定路径的规则', async () => {
   eq(rules.find((r) => r.path === '~/.ssh/').write, 'allow', '指定路径应被改');
   eq(rules.find((r) => r.path === '~/.aws/').write, 'ask', '其他路径不应被动');
   engineB.restore(ap.backupId);
+});
+
+// ══════════════ P2c：版本重放（演进契约）══════════════
+console.log('\n【14】P2c · 版本重放（升级后走一遍路线）');
+
+await atest('建重放包：只收 invalidated 的把手，跳过存活的', async () => {
+  const r = await engineB.captureBundle();
+  const ids = Object.keys(r.bundle.entries);
+  ok(ids.includes('style.creative'), `应收录 style.creative，实际 ${ids.join(',')}`);
+  ok(ids.includes('prompt.welcomemode-code'), '应收录 prompt.welcomemode-code');
+  eq(ids.includes('personalization.soul'), false, 'SOUL.md 是 survives，不应收录');
+  ok(r.bundle.skipped.some((s) => s.id === 'personalization.soul' && /survives/.test(s.reason)),
+    '应说明跳过原因');
+});
+
+await atest('重放包存的是**锚点键**而非绝对路径（升级后路径会变）', async () => {
+  const r = await engineB.captureBundle();
+  const e = r.bundle.entries['style.creative'];
+  eq(e.anchor, 'templates.style', `应存锚点键，实际 ${e.anchor}`);
+  ok(e.content.length > 0, '应存全文');
+  ok(e.sha256, '应存指纹');
+});
+
+await atest('drift：定制都还在 → unchanged，无需重放', async () => {
+  await engineB.captureBundle();
+  const d = await engineB.checkDrift();
+  eq(d.ok, true, '应有重放包');
+  eq(d.needReplay.length, 0, `现状应与快照一致，实际需要重放：${d.needReplay.join(',')}`);
+  ok(d.results.every((r) => r.kind === 'unchanged'), '应全部为 unchanged');
+});
+
+await atest('drift：内容被替换（模拟升级）→ vendor-restored', async () => {
+  await engineB.captureBundle();
+  const p = path.join(styleDir, 'style-creative.md');
+  fs.writeFileSync(p, '升级后变成出厂内容', 'utf8');
+  const d = await engineB.checkDrift();
+  const r = d.results.find((x) => x.id === 'style.creative');
+  eq(r.kind, 'vendor-restored', `应识别为被替换，实际 ${r.kind}`);
+  eq(r.severity, 'warn', '应为警告级');
+  ok(d.needReplay.includes('style.creative'), '应列入待重放');
+});
+
+await atest('重放：未确认的厂商文件 → 拒绝（铁律 5）', async () => {
+  await athrowsCode(() => engineB.replay({ only: ['style.creative'] }), 'CONFIRMATION_REQUIRED');
+});
+
+/** 把 style-creative.md 恢复成"用户定制"的样子，再建包 —— 保证快照里是好内容 */
+async function freshBundle(engine, styleText = STYLE_TEXTS.creative) {
+  fs.writeFileSync(path.join(styleDir, 'style-creative.md'), styleText, 'utf8');
+  return engine.captureBundle();
+}
+
+await atest('重放：带确认 → 把定制灌回 + 一次备份 + 逐字节可还原', async () => {
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await freshBundle(e);
+  const p = path.join(styleDir, 'style-creative.md');
+  fs.writeFileSync(p, '升级后变成出厂内容', 'utf8'); // 模拟升级替换
+  const beforeReplay = hashOf(p);
+
+  const r = await e.replay({ only: ['style.creative'], confirm: true });
+  eq(r.replayed.length, 1, '应重放 1 项');
+  eq(r.ok, 1, `应成功 1 项，失败 ${r.failed}：${JSON.stringify(r.replayed)}`);
+  eq(r.failed, 0, '不应有失败');
+  eq(fs.readFileSync(p, 'utf8'), STYLE_TEXTS.creative, '内容应回到快照');
+  eq(r.files, 1, '应备份 1 个文件');
+
+  e.restore(r.backupId);
+  eq(hashOf(p), beforeReplay, '应能还原到重放前（即被升级替换后的状态）');
+});
+
+await atest('重放失败必须如实报告，不得假装成功', async () => {
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await freshBundle(e);
+  // 把目标文件删掉 → apply 会失败
+  fs.rmSync(path.join(styleDir, 'style-creative.md'), { force: true });
+  const r = await e.replay({ only: ['style.creative'], confirm: true });
+  eq(r.failed, 1, '失败数应为 1');
+  eq(r.ok, 0, '成功数应为 0');
+  eq(r.replayed[0].ok, false, '该项应标记失败');
+  ok(/不存在|STYLE_FILE/.test(r.replayed[0].error), `错误信息应可读：${r.replayed[0].error}`);
+  // 复原
+  fs.writeFileSync(path.join(styleDir, 'style-creative.md'), STYLE_TEXTS.creative, 'utf8');
+});
+
+await atest('重放后在检测 → 回到 unchanged', async () => {
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await freshBundle(e);
+  fs.writeFileSync(path.join(styleDir, 'style-creative.md'), '又被替换了', 'utf8');
+  await e.replay({ only: ['style.creative'], confirm: true });
+  const d = await e.checkDrift();
+  const r = d.results.find((x) => x.id === 'style.creative');
+  eq(r.kind, 'unchanged', `重放后应一致，实际 ${r.kind}`);
+});
+
+await atest('升级换了版本目录 → 仍能按锚点键重新定位（重放的核心价值）', async () => {
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await freshBundle(e);
+  const oldDir = path.join(builtinDir, 'welcomemode-code', FIXTURE_VER);
+  const newDir = path.join(builtinDir, 'welcomemode-code', FIXTURE_VER_NEXT);
+  ensureDir(newDir);
+  fs.writeFileSync(path.join(newDir, 'prompt.tpl'), '升级后的出厂 prompt', 'utf8');
+  fs.rmSync(oldDir, { recursive: true, force: true });
+  fs.writeFileSync(path.join(styleDir, 'style-creative.md'), '升级后出厂风格', 'utf8');
+
+  const d = await e.checkDrift();
+  const promptDrift = d.results.find((x) => x.id === 'prompt.welcomemode-code');
+  eq(promptDrift.kind, 'vendor-restored', `新版本目录应被识别为已替换，实际 ${promptDrift.kind}`);
+  eq(promptDrift.moved, true, '应标记"路径也变了"');
+
+  const r = await e.replay({ only: ['prompt.welcomemode-code', 'style.creative'], confirm: true });
+  eq(r.failed, 0, `重放不应失败：${JSON.stringify(r.replayed.map((x) => x.error))}`);
+  eq(fs.readFileSync(path.join(newDir, 'prompt.tpl'), 'utf8'), `新版 code\n${POLICY_TXT}\n`,
+    '应灌回到**新**版本目录（按锚点键重新定位）');
+  eq(fs.readFileSync(path.join(styleDir, 'style-creative.md'), 'utf8'), STYLE_TEXTS.creative,
+    'style 也应灌回');
+
+  // 复原：把版本目录换回去，避免影响后续测试
+  fs.rmSync(newDir, { recursive: true, force: true });
+  writeFixture();
+  for (const mode of ['code', 'work', 'design']) {
+    seedPromptTpl(mode, OLD_VER, `旧版 ${mode}\n${POLICY_TXT}\n`);
+    seedPromptTpl(mode, FIXTURE_VER, `新版 ${mode}\n${POLICY_TXT}\n`);
+  }
+});
+
+await atest('没有重放包时 drift/replay 明确报未准备', async () => {
+  const emptyStore = ensureDir(path.join(fixtureRoot, 'empty-store'));
+  const e3 = createEngine({ configRoot: cfg, storeRoot: emptyStore, sessionStartOf: startOf, appStateProbe: () => false });
+  const d = await e3.checkDrift();
+  eq(d.ok, false, '没有包时应报 ok=false');
+  ok(/重放包/.test(d.reason), `应提示先建包：${d.reason}`);
+  await athrowsCode(() => e3.replay({ confirm: true }), 'NO_BUNDLE');
+});
+
+await atest('版本探测到未知版本 → 硬报错并提示"新增数据"（升级后第一道关）', async () => {
+  const upRoot = path.join(fixtureRoot, 'upgraded');
+  fs.rmSync(upRoot, { recursive: true, force: true });
+  ensureDir(path.join(upRoot, 'app'));
+  ensureDir(path.join(upRoot, 'user-0000000000-personal'));
+  ensureDir(path.join(upRoot, 'plugins', 'cache', 'workbuddy-builtin', 'welcomemode-code', FIXTURE_VER_NEXT));
+  const e = (() => { try { return { engine: createEngine({ configRoot: upRoot, storeRoot: store }) }; } catch (err) { return { err }; } })();
+  ok(e.err, '应当抛错而不是猜一个锚点表');
+  eq(e.err.code, 'ANCHOR_MISSING', '错误码应为 ANCHOR_MISSING');
+  ok(/新增数据/.test(e.err.message), `应提示新增数据：${e.err.message}`);
+  ok(Array.isArray(e.err.detail?.available), '应列出已有版本');
 });
 
 // ══════════════ 汇总 ══════════════
