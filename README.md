@@ -26,6 +26,55 @@ WorkBuddy（腾讯出品的桌面 AI 助手）里，"能改它行为的地方"�
 - 不改 `app.asar`、不改 Electron fuses
 - 不改模型自身行为（模型的对齐倾向不在可达范围内）
 
+## 快速上手
+
+需要 Node ≥ 20，**无依赖、无需构建**。
+
+```bash
+node src/cli.mjs doctor    # ① 体检：锚点是否成立、把手是否可用
+node src/cli.mjs list      # ② 看有哪些把手可管
+node src/cli.mjs serve     # ③ 开控制台（比命令行顺手，会打印带令牌的 URL）
+```
+
+> 不带参数运行 `node src/cli.mjs` 会打印完整的快速上手。
+
+### 常见动作
+
+```bash
+# 改一项人设（改之前先看差异，改之后验证）
+node src/cli.mjs probe personalization.soul
+node src/cli.mjs plan  personalization.soul --set soul.md      # 只读预览：差异 + token 代价
+node src/cli.mjs apply personalization.soul --set soul.md      # 写入（自动备份）
+node src/cli.mjs verify personalization.soul                   # 验证是否真进模型
+
+# 存一套人设并一键切换
+node src/cli.mjs profile-save "代码专家"
+node src/cli.mjs profile-apply code-expert
+
+# 审批自动同意（放宽：写入不问，删除仍确认）
+node src/cli.mjs approval-plan relaxed
+node src/cli.mjs approval-apply relaxed --confirm
+
+# 升级之后：检查定制还在不在
+node src/cli.mjs drift
+node src/cli.mjs replay --confirm
+
+# 后悔了
+node src/cli.mjs backups
+node src/cli.mjs restore <backupId>
+```
+
+### 三个档位的取舍
+
+| 档位 | 规则面（宿主弹窗） | 提示词面（模型自己问） |
+|---|---|---|
+| `off` | 不改 | 8 条全保留 |
+| **`relaxed`**（推荐） | read/write 放开，**delete 仍确认** | 去 3 条强制询问，**保留红线与安全网** |
+| `full` | 三动作全放开 | 额外去 3 条安全网（**模型可能直接删且不留退路**） |
+
+> ⚠️ **工具会如实告诉你：规则面可靠，提示词面无法保证。**
+> 若"模型问"来自模型自身对齐（上游），改提示词无效——这不是配置错了。
+
 ## 文档
 
 | 文档 | 内容 |

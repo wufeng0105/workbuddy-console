@@ -1,45 +1,35 @@
 #!/usr/bin/env node
 /**
  * workbuddy-console CLI
- * ---------------------------------------------------------------
- * 用法：
- *   node src/cli.mjs doctor                体检：锚点是否成立 + 把手契约是否满足
- *   node src/cli.mjs list                  列出把手
- *   node src/cli.mjs probe   <handleId>
- *   node src/cli.mjs plan    <handleId> --set <file|->
- *   node src/cli.mjs apply   <handleId> --set <file|-> [--confirm] [--reason <s>]
- *   node src/cli.mjs verify  <handleId> [--baseline N --observed N --expected N]
- *   node src/cli.mjs restore <backupId> [--dry-run]
- *   node src/cli.mjs backups
- *   node src/cli.mjs audit [--limit N]
- *   node src/cli.mjs traces [--limit N]     列出 trace 里的 generation 记录（诊断 token-delta 数据源）
- *   node src/cli.mjs serve [--port N]       启动本地控制台（仅 127.0.0.1）
  *
- * 专家档位（多把手事务）：
- *   node src/cli.mjs profiles                列出档位
- *   node src/cli.mjs profile-save <名称> [--id <id>]   采集**当前实际状态**为档位
- *   node src/cli.mjs profile-plan   <id>     预览切换（逐把手差异 + 合计期望增量）
- *   node src/cli.mjs profile-apply  <id> [--confirm]
- *   node src/cli.mjs profile-verify <id>
- *   node src/cli.mjs profile-rm     <id>
+ * 快速上手（第一次用照这个顺序）：
+ *   node src/cli.mjs doctor          ① 体检：锚点是否成立、把手是否可用
+ *   node src/cli.mjs list            ② 看有哪些把手可管
+ *   node src/cli.mjs serve           ③ 开控制台（比命令行顺手）
  *
- * 版本重放（演进契约：升级后走一遍路线）：
- *   node src/cli.mjs bundle           建重放包（收 upgradeBehavior=invalidated 的把手）
- *   node src/cli.mjs drift            只读检测：升级后哪些定制没了
- *   node src/cli.mjs replay [--only a,b] [--confirm]   把快照灌回去（一次事务）
+ * 常用：
+ *   node src/cli.mjs probe   <handleId>                看现状
+ *   node src/cli.mjs plan    <handleId> --set <file>    预览差异与代价（不写盘）
+ *   node src/cli.mjs apply   <handleId> --set <file>    写入（自动备份）
+ *   node src/cli.mjs verify  <handleId>                 验证是否真生效
+ *   node src/cli.mjs restore <backupId>                 还原
  *
- * P3 · 审批自动同意（编排规则面 + 提示词面）：
- *   node src/cli.mjs approval                 查看当前状态与可选档位
- *   node src/cli.mjs approval-plan  <档位>     只读预览：两面各改什么
- *   node src/cli.mjs approval-apply <档位> [--confirm]
- *   node src/cli.mjs approval-verify <档位>
+ * 专家档位（N 套人设一键切换）：
+ *   node src/cli.mjs profiles / profile-save <名称> / profile-plan <id> / profile-apply <id> / profile-verify <id>
+ *
+ * 审批自动同意：
+ *   node src/cli.mjs approval / approval-plan <档位> / approval-apply <档位> / approval-verify <档位>
  *   档位：off（原厂）/ relaxed（读写不问、删除仍确认）/ full（读写删都不问）
+ *
+ * 版本重放（升级后走一遍）：
+ *   node src/cli.mjs bundle / drift / replay
  *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
- *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console）
+ *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console，可用 WORKBUDDY_CONSOLE_HOME）
  *   --version <v>   覆盖版本探测
  *   --json          机器可读输出
+ *   --confirm       厂商文件写入的显式确认
  */
 
 import process from 'node:process';
@@ -104,6 +94,19 @@ function out(v, json) {
 }
 
 const VERDICT_BADGE = { effective: '✅ 生效', ineffective: '❌ 未生效', undetermined: '⚠️  无法判定' };
+
+/** 快速上手：从文件头注释里提取，去掉注释符号 */
+function helpText() {
+  const src = fs.readFileSync(new URL(import.meta.url), 'utf8');
+  const block = src.split('*/')[0];
+  return block
+    .replace(/^#![^\n]*\n/, '')
+    .replace(/^\/\*\*\n?/, '')
+    .split('\n')
+    .map((l) => l.replace(/^\s*\*\s?/, ''))
+    .join('\n')
+    .trimEnd();
+}
 
 /** @param {string[]} argv */
 async function main(argv) {
@@ -495,8 +498,9 @@ async function main(argv) {
     }
 
     default:
-      console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('*/')[0].replace(/^#!.*\n/, ''));
-      return process.exitCode = 1;
+      // 无参数或未知命令 → 打印快速上手（而不是只吐一句 usage）
+      console.log(helpText());
+      return process.exitCode = cmd ? 1 : 0;
   }
 }
 
