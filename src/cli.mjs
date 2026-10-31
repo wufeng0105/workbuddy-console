@@ -118,10 +118,20 @@ async function main(argv) {
       const p = await engine.plan(f._[1], { next });
       if (json) return out({ ...p, preview: { ...p.preview, diff: undefined } }, true);
       console.log(`${p.handle.title}  →  ${p.anchor.path}`);
-      console.log(`现在 ${p.current.bytes} B / 约 ${p.current.tokens} tokens   →   改后 ${Buffer.byteLength(next, 'utf8')} B`);
-      console.log(`修正 ${p.preview.cost.delta >= 0 ? '+' : ''}${p.preview.cost.delta} tokens（估算）`);
-      console.log(`\n${p.preview.diffText}\n`);
-      console.log(`缓存代价：${p.preview.cost.cacheNote}`);
+      const pv = p.preview;
+      if (pv.valueAfter !== undefined) {
+        // JSON 字段型把手：比"整个文件字节数"没有意义，要展示**取值**变化
+        console.log(`取值  ${JSON.stringify(pv.valueBefore)}  →  ${JSON.stringify(pv.valueAfter)}`);
+        if (pv.injectedChars != null) console.log(`真正注入请求的内容：${pv.injectedChars} 字符`);
+        if (pv.expectedDeltaTokens != null) {
+          console.log(`修正  ${pv.expectedDeltaTokens >= 0 ? '+' : ''}${pv.expectedDeltaTokens} tokens（估算）`);
+        }
+      } else {
+        console.log(`现在 ${p.current.bytes} B / 约 ${p.current.tokens} tokens   →   改后 ${Buffer.byteLength(next, 'utf8')} B`);
+        console.log(`修正 ${pv.cost.delta >= 0 ? '+' : ''}${pv.cost.delta} tokens（估算）`);
+      }
+      console.log(`\n${pv.diffText}\n`);
+      console.log(`缓存代价：${pv.cost.cacheNote}`);
       for (const w of (p.preview.warnings ?? [])) console.log(`⚠️  ${w}`);
       for (const w of p.gate.warnings) console.log(`⚠️  ${w}`);
       if (p.needsConfirm) console.log('⚠️  这是厂商文件写入，必须显式 --confirm');

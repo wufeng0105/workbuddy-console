@@ -44,6 +44,8 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     storeRoot,
     version: resolver.version,
     resolve: resolver.resolve,
+    /** 取不到返回 null 而不是抛错（用于可选锚点，如安装目录相关） */
+    resolveOptional: (key) => { try { return resolver.resolve(key); } catch { return null; } },
     isWorkBuddyRunning,
   };
 

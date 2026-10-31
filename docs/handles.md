@@ -8,6 +8,10 @@
 
 ## 一、提示词层 · 静态
 
+> **P1a 已实现（`src/handles/`）**：`personalization.soul` / `.user` / `.identity` / `.tone-style` / `.custom-prompt` —— 五项走完六步契约。
+> 实现要点：身份文件共用 `identity-file.mjs` 工厂（含 10 000 字符截断约束与模式可达性声明）；
+> JSON 字段共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + 与 collector 的 `trim()` 行为对齐）。
+
 | 把手 | 位置 | 提权 | 升级 | 通道 | 验证策略 | 状态 |
 |---|---|---|---|---|---|---|
 | **SOUL.md**（人设设定） | `~/.workbuddy/user-<uid>-personal/SOUL.md` | 否 | 存活 | 请求尾段 | token 增量法 | ✅ **三件联合实测 +1523（单件未分离）**<br>⚠️ 注入上限 **10 000 字符**（超出静默截断）<br>普通/专家模式**均注入** |

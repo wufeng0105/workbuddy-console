@@ -4,9 +4,19 @@
 
 import { register } from '../core/registry.mjs';
 import { soulHandle } from './personalization.soul.mjs';
+import { userHandle } from './personalization.user.mjs';
+import { identityHandle } from './personalization.identity.mjs';
+import { toneStyleHandle } from './personalization.tone-style.mjs';
+import { customPromptHandle } from './personalization.custom-prompt.mjs';
 
 /** 全部把手（顺序即界面顺序） */
-export const ALL_HANDLES = Object.freeze([soulHandle]);
+export const ALL_HANDLES = Object.freeze([
+  soulHandle,
+  userHandle,
+  identityHandle,
+  toneStyleHandle,
+  customPromptHandle,
+]);
 
 let registered = false;
 

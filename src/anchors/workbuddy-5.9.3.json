@@ -50,6 +50,28 @@
       "optional": true,
       "evidence": "token-delta 的数据来源。结构 <worker-pid>/trace_<hash>.jsonl；span_end/generation 的 toolOutput 内含 usage.prompt_tokens（本机实测）"
     },
+    "templates.style": {
+      "roots": [
+        "C:\\Program Files\\WorkBuddy",
+        "C:\\Program Files\\WorkBuddyAI",
+        "~/AppData/Local/Programs/WorkBuddy"
+      ],
+      "rel": "resources/app.asar.unpacked/resources/templates/style",
+      "kind": "dir",
+      "optional": true,
+      "evidence": "tone-styles.md — style-*.md 七档全文，注入 {{ ToneStyleContent }}。安装目录不在配置根下，故用候选根探测"
+    },
+    "templates.root": {
+      "roots": [
+        "C:\\Program Files\\WorkBuddy",
+        "C:\\Program Files\\WorkBuddyAI",
+        "~/AppData/Local/Programs/WorkBuddy"
+      ],
+      "rel": "resources/app.asar.unpacked/resources/templates",
+      "kind": "dir",
+      "optional": true,
+      "evidence": "A 组模板目录（phase0-recon.md E0-4）。A 组正文本体 = fallback-only 不进 LLM"
+    },
     "memory.user": {
       "glob": "memory/*_memory.md",
       "kind": "file",

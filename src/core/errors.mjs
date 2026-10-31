@@ -48,3 +48,12 @@ export class IntegrityError extends ConsoleError {
 export class ConfirmationRequiredError extends ConsoleError {
   constructor(message, detail) { super('CONFIRMATION_REQUIRED', message, detail); }
 }
+
+/**
+ * 取值非法（如 toneStyle 不在枚举内）。
+ * 必须**拒绝**而不是照写：WorkBuddy 的 collector 对非法枚举会静默返回空串，
+ * 结果是"写成功了但风格消失了"——典型的静默失败。
+ */
+export class InvalidValueError extends ConsoleError {
+  constructor(message, detail) { super('INVALID_VALUE', message, detail); }
+}

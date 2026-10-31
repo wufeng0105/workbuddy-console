@@ -26,10 +26,11 @@ src/
 | `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
 | `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |
 | `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
-| `handles/personalization.soul.mjs` | ✅ 已实现 | 六步 + 注入上限 10 000 字符约束 |
+| `handles/personalization.soul.mjs` / `.user.mjs` / `.identity.mjs` | ✅ 已实现 | 身份文件三件，共用 `identity-file.mjs` 工厂（含 10 000 字符截断与模式可达性） |
+| `handles/personalization.tone-style.mjs` / `.custom-prompt.mjs` | ✅ 已实现 | JSON 字段，共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + `trim()` 对齐） |
 | `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces |
-| 其余把手（USER / IDENTITY / toneStyle / customPrompt / style / C 组） | ⬜ 待写 | P1–P2 |
-| `web/` 前端 | ⬜ 待写 | P0 后半段 |
+| 其余把手（`style-*.md` 内容、C 组提示词、规则矩阵） | ⬜ 待写 | P1c–P2 |
+| `web/` 前端 | ⬜ 待写 | P0c |
 
 ## 硬约束（写代码前必读）
 

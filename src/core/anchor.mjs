@@ -9,13 +9,16 @@
  * 锚点表是**数据**（按 WorkBuddy 版本一份），解析器是**框架**。
  * 升级时只加数据、不改本文件（演进契约）。
  *
- * 锚点条目三种形态：
- *   { dirGlob, file }  目录用 glob 定位（必须唯一命中），文件名固定 —— 文件可不存在
- *   { rel }            相对路径 —— 校验父目录存在；文件可不存在；kind=dir 时目标必须存在
- *   { glob, multi? }   通配定位 —— 默认必须唯一命中；optional 时允许缺席
+ * 锚点条目四种形态：
+ *   { dirGlob, file }        目录用 glob 定位（必须唯一命中），文件名固定 —— 文件可不存在
+ *   { glob, multi? }         通配定位 —— 默认必须唯一命中；optional 时允许缺席
+ *   { roots, rel }           候选**绝对根** + 相对路径（用于安装目录：不在配置根下）；
+ *                            逐个试，全不命中即硬报错并列出试过的路径
+ *   { rel }                  相对配置根 —— 校验父目录存在；文件可不存在；kind=dir 时目标必须存在
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AnchorMissingError } from './errors.mjs';
@@ -172,6 +175,31 @@ export function createResolver({ configRoot, version }) {
           return { ...out, error: `锚点命中多个，拒绝猜测：${hits.map(tildify).join(', ')}` };
         }
         target = hits[0];
+      } else if (entry.roots && entry.rel) {
+        // 候选绝对根（安装目录不在配置根下）：逐个试，全不命中即硬报错。
+        // 额外候选：WORKBUDDY_CONSOLE_INSTALL_DIR（非标准安装位置 / 测试隔离用）
+        const envRoot = process.env.WORKBUDDY_CONSOLE_INSTALL_DIR?.trim();
+        const roots = envRoot ? [envRoot, ...entry.roots] : entry.roots;
+        const tried = [];
+        let hit = null;
+        for (const raw of roots) {
+          const root = String(raw).startsWith('~')
+            ? path.join(os.homedir(), String(raw).slice(1))
+            : String(raw);
+          const t = path.join(root, entry.rel);
+          tried.push(t);
+          let ok = false;
+          try {
+            const st = fs.statSync(t);
+            ok = kind === 'dir' ? st.isDirectory() : st.isFile();
+          } catch { ok = false; }
+          if (ok) { hit = t; break; }
+        }
+        if (!hit) {
+          if (optional) return { ...out, ok: true, path: null, exists: false };
+          return { ...out, error: `候选根全部未命中：${tried.map(tildify).join(' | ')}` };
+        }
+        target = hit;
       } else if (entry.rel) {
         target = path.join(configRoot, entry.rel);
         if (kind === 'dir') {

@@ -433,6 +433,136 @@ await atest('基线与观测模型不同 → 告警（模型不同则静态前�
   ok(cap.warnings.some((w) => /模型不同/.test(w)), `应给出模型不同告警：${JSON.stringify(cap.warnings)}`);
 });
 
+// ══════════════ P1a：个性化五项 ══════════════
+console.log('\n【8】P1a · 个性化五项（SOUL / USER / IDENTITY / toneStyle / customPrompt）');
+
+// 造一个"安装目录"fixture：style 七档
+const installRoot = ensureDir(path.join(fixtureRoot, 'install'));
+const styleDir = ensureDir(path.join(installRoot, 'resources', 'app.asar.unpacked', 'resources', 'templates', 'style'));
+const STYLE_TEXT = {
+  efficient: '高效务实：先答案后背景，列表优先。',
+  creative: `天马行空：${'想象力叙事流，把解题当冒险，用比喻设景，适度 emoji。'.repeat(8)}`,
+};
+for (const [id, text] of Object.entries(STYLE_TEXT)) {
+  fs.writeFileSync(path.join(styleDir, `style-${id}.md`), text, 'utf8');
+}
+process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = installRoot;
+
+const APP_CONFIG = path.join(cfg, 'app', 'app-config.json');
+
+await atest('五项个性化把手全部注册且锚点可解析', async () => {
+  const d = engineB.doctor();
+  const want = [
+    'personalization.soul', 'personalization.user', 'personalization.identity',
+    'personalization.tone-style', 'personalization.custom-prompt',
+  ];
+  const have = d.handles.map((h) => h.id);
+  const missing = want.filter((id) => !have.includes(id));
+  eq(missing.length, 0, `缺把手：${missing.join(',')}`);
+  const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  eq(bad.length, 0, `锚点应全部可解析，失败：${bad.join(',')}`);
+});
+
+await atest('安装目录锚点命中（候选根探测 + 环境变量覆盖）', async () => {
+  const a = engineB.resolver.resolve('templates.style');
+  ok(a.path.includes('style'), `style 目录应命中，实际 ${a.path}`);
+  eq(a.exists, true, '应存在');
+});
+
+await atest('模式可达性已按文件区分（IDENTITY 在专家模式下不注入）', async () => {
+  const list = (await import('./handles/index.mjs')).ALL_HANDLES;
+  const byId = Object.fromEntries(list.map((h) => [h.id, h]));
+  eq(byId['personalization.identity'].modeAvailability.expert, false, 'IDENTITY 专家模式应为不可达');
+  eq(byId['personalization.soul'].modeAvailability.expert, true, 'SOUL 专家模式应可达');
+  eq(byId['personalization.user'].modeAvailability.expert, true, 'USER 专家模式应可达');
+});
+
+console.log('\n   ── toneStyle（JSON 字段 + 枚举守卫）──');
+await atest('toneStyle probe 读到当前取值 efficient', async () => {
+  const p = await engineB.probe('personalization.tone-style');
+  eq(p.state.value, 'efficient', '取值不符');
+  eq(p.state.valueValid, true, '取值应合法');
+  eq(p.state.allowedValues.length, 7, '枚举应为 7 档');
+});
+await atest('非法取值 → 拒绝（拦住"写成功但风格消失"的静默失败）', async () => {
+  await athrowsCode(() => engineB.plan('personalization.tone-style', { next: 'super-cool' }), 'INVALID_VALUE');
+});
+await atest('带尾随换行的取值 → 按 collector 的 trim 行为规范化后接受（不误拒）', async () => {
+  const pl = await engineB.plan('personalization.tone-style', { next: 'creative\r\n' });
+  eq(pl.preview.valueAfter, 'creative', '取值应被规范化');
+  ok(pl.preview.warnings.some((w) => /规范化/.test(w)), `应如实告知已规范化：${JSON.stringify(pl.preview.warnings)}`);
+});
+await atest('换档位 → 期望增量 = 两个 style 文件的 token 差（不是字符串长度差）', async () => {
+  const pl = await engineB.plan('personalization.tone-style', { next: 'creative' });
+  ok(pl.preview.expectedDeltaTokens > 0, `应给出正增量，实际 ${pl.preview.expectedDeltaTokens}`);
+  ok(pl.preview.injectedChars === STYLE_TEXT.creative.length, '注入字符数应等于 style 文件长度');
+  ok(/style/.test(pl.preview.cost.cacheNote) || pl.preview.cost.delta > 0, '应给出版本换档的代价');
+});
+await atest('toneStyle apply 只改该字段，其余键逐字不动', async () => {
+  const before = fs.readFileSync(APP_CONFIG, 'utf8');
+  await engineB.apply('personalization.tone-style', { next: 'creative' });
+  const after = fs.readFileSync(APP_CONFIG, 'utf8');
+  const bj = JSON.parse(before);
+  const aj = JSON.parse(after);
+  eq(aj.personalization.toneStyle, 'creative', '取值应已更新');
+  eq(aj.personalization.customPrompt, bj.personalization.customPrompt, 'customPrompt 不应被动');
+  eq(Object.keys(aj).join(','), Object.keys(bj).join(','), '顶层键不应变化');
+  // 规范 JSON → 允许重序列化；除该值外应逐字一致
+  eq(after, before.replace('"efficient"', '"creative"'), '规范 JSON 下应只有该值变化');
+});
+
+console.log('\n   ── customPrompt（JSON 字段）──');
+await atest('customPrompt probe → plan → apply 走通，且增量 = 字段值本身', async () => {
+  const p0 = await engineB.probe('personalization.custom-prompt');
+  eq(p0.state.value, '', '初始应为空串');
+  const NEXT_CP = '回答尽量简洁，先给结论。';
+  const pl = await engineB.plan('personalization.custom-prompt', { next: NEXT_CP });
+  ok(pl.preview.expectedDeltaTokens > 0, '应给出正增量');
+  ok(pl.preview.warnings.some((w) => /长度上限/.test(w)) === false, '不应误报截断');
+  await engineB.apply('personalization.custom-prompt', { next: NEXT_CP });
+  const after = JSON.parse(fs.readFileSync(APP_CONFIG, 'utf8'));
+  eq(after.personalization.customPrompt, NEXT_CP, '字段应已写入');
+  eq(after.personalization.toneStyle, 'creative', 'toneStyle 不应被动');
+});
+
+console.log('\n   ── JSON 写入的格式保全（纯函数）──');
+await atest('非规范 JSON → 定向替换，其余字节逐字不变', async () => {
+  const { writeField } = await import('./handles/json-field.mjs');
+  const src = '{"a":1,  "personalization":{"toneStyle":"efficient","customPrompt":"x"},"b":[1,2]}';
+  const w = writeField(src, 'personalization', 'toneStyle', 'creative');
+  eq(w.mode, 'targeted', '应走定向替换而非重排');
+  eq(w.text, '{"a":1,  "personalization":{"toneStyle":"creative","customPrompt":"x"},"b":[1,2]}',
+    '其余字节必须逐字不变');
+});
+await atest('规范 JSON → 走重序列化，结果仍逐字可控', async () => {
+  const { writeField } = await import('./handles/json-field.mjs');
+  const src = `${JSON.stringify({ personalization: { toneStyle: 'efficient' } }, null, 2)}\n`;
+  const w = writeField(src, 'personalization', 'toneStyle', 'creative');
+  eq(w.mode, 'reserialize', '规范 JSON 应走重序列化');
+  eq(w.text, src.replace('"efficient"', '"creative"'), '除该值外应逐字一致');
+});
+await atest('字段不存在 → 插入，且不破坏原结构', async () => {
+  const { writeField } = await import('./handles/json-field.mjs');
+  const w = writeField('{"personalization":{"toneStyle":"efficient"}}', 'personalization', 'customPrompt', 'hello');
+  eq(JSON.parse(w.text).personalization.customPrompt, 'hello', '应插入成功');
+  eq(JSON.parse(w.text).personalization.toneStyle, 'efficient', '不应破坏已有字段');
+  eq(w.mode, 'inserted', '应走定向插入（而非整篇重排）');
+});
+
+console.log('\n   ── USER / IDENTITY 走六步 ──');
+await atest('USER.md 六步走通（写入 + 备份 + 还原）', async () => {
+  const NEXT_USER = '- **Name:** 测试者\n';
+  const userPath = path.join(cfg, 'user-1390000000-personal', 'USER.md');
+  const appliedUser = await engineB.apply('personalization.user', { next: NEXT_USER });
+  eq(fs.readFileSync(userPath, 'utf8'), NEXT_USER, '应已写入');
+  engineB.restore(appliedUser.backupId);
+  eq(fs.readFileSync(userPath, 'utf8'), '', '应已还原');
+});
+await atest('IDENTITY.md 的 preview 会提示"专家模式下不注入"', async () => {
+  const pl = await engineB.plan('personalization.identity', { next: '- **Name:** 小助手\n' });
+  ok(pl.preview.warnings.some((w) => /专家模式/.test(w)), `应给出模式告警：${JSON.stringify(pl.preview.warnings)}`);
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);
