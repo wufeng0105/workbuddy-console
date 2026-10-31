@@ -23,6 +23,9 @@ import {
   writeProfile, readProfile, listProfiles, deleteProfile, slugify, PROFILE_HANDLES,
 } from './profiles.mjs';
 import { buildBundle, readBundle, detectDrift } from './replay.mjs';
+import { previewApproval, findApprovalLevel, combineVerdicts, APPROVAL_LEVELS } from './approval.mjs';
+import { applyLevel, detectLevel } from './safety-block.mjs';
+import { readRules } from './rules.mjs';
 import { tildify } from './paths.mjs';
 
 /** @param {object} h */
@@ -558,6 +561,244 @@ export function createEngine({
     };
   }
 
+  // ── P3 · 审批自动同意（编排两个面）─────────────────────────
+
+  /** 当前 C 组活跃模板（用于提示词面） */
+  function activePromptHandle() {
+    const list = registry.list().filter((h) => h.id.startsWith('prompt.welcomemode-'));
+    // 默认取 code 模式；调用方可指定
+    return list[0] ?? null;
+  }
+
+  /** 各提示词模板当前处于哪个档位 */
+  async function approvalState() {
+    const out = { levels: APPROVAL_LEVELS, prompts: [], rules: null };
+    for (const h of registry.list().filter((x) => x.id.startsWith('prompt.welcomemode-'))) {
+      try {
+        const st = await h.probe(ctx);
+        out.prompts.push({
+          handle: h.id,
+          path: tildify(st.path),
+          version: st.version,
+          hasBlock: st.hasPolicy,
+          level: detectLevel(st.text ?? ''),
+        });
+      } catch (e) {
+        out.prompts.push({ handle: h.id, error: `${e.code ?? 'ERR'}: ${e.message}` });
+      }
+    }
+    try {
+      const r = readRules(ctx, 'file');
+      out.rules = {
+        ok: r.ok,
+        ruleCount: r.ok ? r.rules.length : 0,
+        pending: r.ok ? {
+          readAsk: r.rules.filter((x) => x.read === 'ask').length,
+          writeAsk: r.rules.filter((x) => x.write === 'ask').length,
+          deleteAsk: r.rules.filter((x) => x.delete === 'ask').length,
+        } : null,
+      };
+    } catch (e) {
+      out.rules = { ok: false, error: `${e.code ?? 'ERR'}: ${e.message}` };
+    }
+    return out;
+  }
+
+  /**
+   * 预览某档"审批自动同意"要改什么（只读）。
+   * @param {string} level
+   * @param {{promptHandleId?:string}} [opts]
+   */
+  async function planApproval(level, { promptHandleId } = {}) {
+    const lv = findApprovalLevel(level);
+    const pH = promptHandleId ? registry.get(promptHandleId) : activePromptHandle();
+    const promptState = pH ? await pH.probe(ctx) : null;
+    const rules = (() => {
+      try { return readRules(ctx, 'file'); } catch { return { ok: false, rules: [] }; }
+    })();
+
+    const preview = previewApproval({
+      level,
+      rulesProbe: rules.ok ? { rules: rules.rules } : { rules: [] },
+      promptText: promptState?.text ?? '',
+      promptTitle: pH?.title,
+    });
+
+    return {
+      ...preview,
+      levelDesc: lv,
+      promptHandle: pH?.id ?? null,
+      promptPath: promptState ? tildify(promptState.path) : null,
+      promptVersion: promptState?.version ?? null,
+      gate: {
+        appRunning: probeAppState(),
+        warning: '提示词面在 C 组版本目录内；规则面在 settings.json。两项都需要重启 WorkBuddy 才生效。',
+      },
+    };
+  }
+
+  /**
+   * 应用某档"审批自动同意"：**一次备份覆盖两个面**、一条审计、整体可还原。
+   * @param {string} level
+   * @param {{confirm?:boolean, promptHandleId?:string, reason?:string}} [opts]
+   */
+  async function applyApproval(level, { confirm = false, promptHandleId, reason } = {}) {
+    const lv = findApprovalLevel(level);
+    if (level === 'off') {
+      return { level, changed: false, note: '原厂档：不需要任何改动' };
+    }
+
+    const plan = await planApproval(level, { promptHandleId });
+    const pH = plan.promptHandle ? registry.get(plan.promptHandle) : null;
+    const rulesH = registry.get('rules.file');
+
+    // 闸门：两个面都要求应用退出
+    const gateR = gateCheck(rulesH);
+    if (gateR.blocked) throw new GateBlockedError(gateR.reason, { level, face: 'rules' });
+    if (pH) {
+      const gateP = gateCheck(pH);
+      if (gateP.blocked) throw new GateBlockedError(gateP.reason, { level, face: 'prompt' });
+      if (pH.writeClass === 'vendor-file' && !confirm) {
+        throw new ConfirmationRequiredError(
+          `档位 ${level} 会写 C 组提示词模板（厂商文件），需显式确认（--confirm）`,
+          { level, handle: pH.id },
+        );
+      }
+    }
+
+    /** @type {Map<string,{key:string,absPath:string}>} */
+    const backups = new Map();
+    const touched = [];
+
+    // 规则面
+    if (lv.ruleOp) {
+      const a = anchorFor(rulesH);
+      backups.set(a.path, { key: a.key ?? rulesH.target, absPath: a.path });
+      touched.push({ face: 'rules', handle: rulesH.id });
+    }
+    // 提示词面
+    let promptNext = null;
+    if (pH) {
+      const st = await pH.probe(ctx);
+      const applied = applyLevel(st.text ?? '', lv.promptLevel);
+      if (applied.changed) {
+        const a = anchorFor(pH);
+        backups.set(a.path, { key: a.key ?? pH.target, absPath: a.path });
+        promptNext = applied.text;
+        touched.push({ face: 'prompt', handle: pH.id, dropped: applied.dropped });
+      }
+    }
+
+    if (backups.size === 0) {
+      return { level, changed: false, note: '两个面都已是目标状态，无需改动', plan };
+    }
+
+    const manifest = createBackup({
+      storeRoot,
+      actor,
+      reason: reason ?? `approval ${level}（${touched.map((t) => t.face).join('+')}）`,
+      entries: [...backups.values()],
+    });
+
+    const done = [];
+    // 先规则（可靠面），后提示词（不确定面）
+    if (lv.ruleOp) {
+      try {
+        const r = await rulesH.apply(ctx, {
+          next: { ...lv.ruleOp, actions: lv.ruleOp.actions },
+        });
+        done.push({ face: 'rules', ok: true, changed: r.changed ?? null });
+      } catch (e) {
+        done.push({ face: 'rules', ok: false, error: `${e.code ?? 'ERR'}: ${e.message}` });
+      }
+    }
+    if (promptNext != null && pH) {
+      try {
+        await pH.apply(ctx, { next: promptNext });
+        done.push({ face: 'prompt', ok: true });
+      } catch (e) {
+        done.push({ face: 'prompt', ok: false, error: `${e.code ?? 'ERR'}: ${e.message}` });
+      }
+    }
+
+    appendAudit(storeRoot, {
+      event: 'apply-approval',
+      level,
+      backupId: manifest.id,
+      faces: done.map((d) => ({ face: d.face, ok: d.ok })),
+      actor,
+    });
+
+    return {
+      level,
+      title: lv.title,
+      backupId: manifest.id,
+      files: backups.size,
+      done,
+      ok: done.filter((d) => d.ok).length,
+      failed: done.filter((d) => !d.ok).length,
+      plan,
+      /** 明确告诉用户：两个面都需要重启才生效 */
+      restartRequired: true,
+    };
+  }
+
+  /**
+   * 验证某档"审批自动同意" —— 逐面给结论，再合成一个**诚实的三态**。
+   * @param {string} level
+   */
+  async function verifyApproval(level) {
+    const lv = findApprovalLevel(level);
+    const parts = { ruleChanged: Boolean(lv.ruleOp), promptChanged: lv.promptLevel !== 'off' };
+
+    /** 规则面：重启后回读 */
+    let ruleVerdict;
+    if (parts.ruleChanged) {
+      try {
+        const v = await verify('rules.file', {});
+        ruleVerdict = v.verdict;
+      } catch (e) {
+        ruleVerdict = 'undetermined';
+      }
+    }
+
+    /** 提示词面：标记法（只能证明文本进了请求） */
+    let promptVerdict;
+    if (parts.promptChanged) {
+      const pH = activePromptHandle();
+      if (pH) {
+        try {
+          const v = await verify(pH.id, {});
+          promptVerdict = v.verdict;
+        } catch { promptVerdict = 'undetermined'; }
+      }
+    }
+
+    const combined = combineVerdicts({
+      ruleVerdict,
+      promptVerdict,
+      ruleChanged: parts.ruleChanged,
+      promptChanged: parts.promptChanged,
+    });
+
+    appendAudit(storeRoot, {
+      event: 'verify-approval',
+      level,
+      verdict: combined.verdict,
+      reason: combined.reason,
+      actor,
+    });
+
+    return {
+      level,
+      ...combined,
+      caveat:
+        '**"审批自动同意"永远不可能被完全验证。** '
+        + '规则面能可靠验证（重启后回读）；提示词面只能验证"文本进了请求"，'
+        + '无法验证"模型不再自己问" —— 后者取决于模型自身对齐，属上游。',
+    };
+  }
+
   // ── 6. 还原 ────────────────────────────────────────────────
   function restore(backupId, { dryRun = false } = {}) {
     const r = restoreBackup({ storeRoot, id: backupId, dryRun });
@@ -602,5 +843,7 @@ export function createEngine({
     removeProfile: (id) => deleteProfile(storeRoot, id),
     // 版本重放（演进契约）
     captureBundle, checkDrift, replay,
+    // P3 · 审批自动同意
+    approvalState, planApproval, applyApproval, verifyApproval,
   };
 }

@@ -107,6 +107,18 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
       });
     }
 
+    // ── P3 · 审批自动同意 ──
+    if (pathname === '/api/approval' && method === 'GET') return engine.approvalState();
+    if (pathname === '/api/approval/plan' && method === 'POST') {
+      return engine.planApproval(String(body.level ?? ''));
+    }
+    if (pathname === '/api/approval/apply' && method === 'POST') {
+      return engine.applyApproval(String(body.level ?? ''), { confirm: body.confirm === true });
+    }
+    if (pathname === '/api/approval/verify' && method === 'POST') {
+      return engine.verifyApproval(String(body.level ?? ''));
+    }
+
     const m = /^\/api\/handle\/([^/]+)\/(probe|plan|apply|verify)$/.exec(pathname);
     if (m) {
       const id = decodeURIComponent(m[1]);

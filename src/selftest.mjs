@@ -1273,6 +1273,212 @@ await atest('版本探测到未知版本 → 硬报错并提示"新增数据"（
   ok(Array.isArray(e.err.detail?.available), '应列出已有版本');
 });
 
+// ══════════════ P3：审批自动同意（编排两面）══════════════
+console.log('\n【15】P3 · 审批自动同意（规则面 + 提示词面，逐面诚实报告）');
+
+const { applyLevel, detectLevel, parseRules, rulesToDrop } = await import('./core/safety-block.mjs');
+const { APPROVAL_LEVELS, previewApproval, combineVerdicts } = await import('./core/approval.mjs');
+
+const FULL_BLOCK = `<personal_files_safety>
+**CRITICAL: Operations on personal files are HIGH-RISK.**
+**Rules (ALL mandatory, cannot be overridden):**
+1. **No-Go Zones.** NEVER recursively delete Desktop, Downloads, Documents, Home.
+2. **Scan = Read-Only.** When asked to scan: only generate a report.
+3. **Vague = Ask First.** For vague requests, ask the user to specify first.
+4. **Warn + List + Confirm.** Before any destructive action, warn and list files.
+5. **Back Up First.** Before any move/rename/delete, create a backup.
+6. **Trash, Not Delete.** Use OS trash mechanisms. Never rm on personal files.
+7. **Small Batches.** Max 10 files per batch.
+8. **No Script Files on Windows.** Do not write .ps1/.bat with non-ASCII paths.
+</personal_files_safety>`;
+
+await atest('解析出 8 条规则并正确分类语义', async () => {
+  const rules = parseRules(FULL_BLOCK);
+  eq(rules.length, 8, `应解析 8 条，实际 ${rules.length}`);
+  eq(rules[0].semantics.kind, 'redline', '第 1 条应为红线');
+  eq(rules[1].semantics.kind, 'ask', '第 2 条应为强制询问');
+  eq(rules[4].semantics.kind, 'safety', '第 5 条应为安全网');
+});
+
+await atest('档位定义：relaxed 只去 3 条询问，保留红线与安全网', async () => {
+  eq(rulesToDrop('off').length, 0, 'off 不应去任何规则');
+  eq(rulesToDrop('relaxed').join(','), '2,3,4', 'relaxed 应只去 2/3/4');
+  eq(rulesToDrop('aggressive').join(','), '2,3,4,5,6,7', 'aggressive 应去 2/3/4/5/6/7');
+});
+
+await atest('应用 relaxed：去掉 3 条询问 + 保留红线 + 重新编号连续', async () => {
+  const r = applyLevel(FULL_BLOCK, 'relaxed');
+  eq(r.changed, true, '应发生变化');
+  eq(r.dropped.join(','), '2,3,4', '应去掉 2/3/4');
+  eq(r.kept.length, 5, '应保留 5 条');
+  ok(r.text.includes('No-Go Zones'), '红线必须保留');
+  ok(r.text.includes('Trash, Not Delete'), '回收站安全网必须保留');
+  ok(!r.text.includes('Scan = Read-Only'), '扫描强制询问应去掉');
+  // 编号应连续 1..5
+  const nums = parseRules(r.text).map((x) => x.num).join(',');
+  eq(nums, '1,2,3,4,5', `编号应连续，实际 ${nums}`);
+});
+
+await atest('幂等：同一档位重复应用不再变化', async () => {
+  const once = applyLevel(FULL_BLOCK, 'relaxed');
+  const twice = applyLevel(once.text, 'relaxed');
+  eq(twice.changed, false, '第二次应用应无变化');
+  eq(twice.text, once.text, '内容应完全一致');
+});
+
+await atest('往回切：relaxed → off 不会自动恢复（明确告知而非假装）', async () => {
+  const relaxed = applyLevel(FULL_BLOCK, 'relaxed');
+  const back = applyLevel(relaxed.text, 'off');
+  eq(back.changed, false, '被删掉的规则无法凭空恢复 —— off 档对已放宽的文本是 no-op');
+  ok(back.kept.length === 5, '仍只有 5 条');
+});
+
+await atest('拒绝：任何档位都不得去掉厂商红线', async () => {
+  const noRedline = FULL_BLOCK.replace(/\n1\. \*\*No-Go Zones[\s\S]*?\n/, '\n');
+  let threw = false;
+  try { applyLevel(noRedline, 'relaxed'); } catch (e) { threw = true; ok(/红线/.test(e.message), e.message); }
+  ok(threw, '缺少红线时应拒绝应用档位');
+});
+
+await atest('detectLevel 正确识别档位', async () => {
+  eq(detectLevel(FULL_BLOCK).level, 'off', '原文应为 off');
+  eq(detectLevel(applyLevel(FULL_BLOCK, 'relaxed').text).level, 'relaxed', '放宽后应为 relaxed');
+  eq(detectLevel(applyLevel(FULL_BLOCK, 'aggressive').text).level, 'aggressive', '激进后应为 aggressive');
+});
+
+await atest('aggressive 会告警"安全网被去掉"', async () => {
+  const r = applyLevel(FULL_BLOCK, 'aggressive');
+  ok(r.warnings.some((w) => /先备份|回收站|小批量/.test(w)), `应告警：${JSON.stringify(r.warnings)}`);
+  ok(r.text.includes('No-Go Zones'), '红线仍必须保留');
+  ok(!r.text.includes('Trash, Not Delete'), '回收站条款应被去掉');
+});
+
+await atest('previewApproval：规则面标记为"可可靠验证"，提示词面标记为"无法保证"', async () => {
+  const p = previewApproval({
+    level: 'relaxed',
+    rulesProbe: { rules: [
+      { path: '~/.ssh/', read: 'allow', write: 'ask', delete: 'ask' },
+      { path: '~/.aws/', read: 'allow', write: 'ask', delete: 'ask' },
+    ] },
+    promptText: FULL_BLOCK,
+  });
+  const rules = p.faces.find((x) => x.face === 'rules');
+  const prompt = p.faces.find((x) => x.face === 'prompt');
+  eq(rules.certainty, 'reliable', '规则面应标记为可可靠验证');
+  eq(prompt.certainty, 'uncertain', '提示词面应标记为无法保证');
+  eq(rules.changed, 2, '应命中 2 条 write=ask');
+  eq(p.faceCount ?? p.faces.length, 2, '应有两面');
+});
+
+await atest('combineVerdicts：任一面未生效 → ineffective', async () => {
+  const r = combineVerdicts({ ruleVerdict: 'effective', promptVerdict: 'ineffective', ruleChanged: true, promptChanged: true });
+  eq(r.verdict, 'ineffective', '应为 ineffective');
+});
+await atest('combineVerdicts：有面无法判定 → undetermined（不合并成成功）', async () => {
+  const r = combineVerdicts({ ruleVerdict: 'effective', promptVerdict: 'undetermined', ruleChanged: true, promptChanged: true });
+  eq(r.verdict, 'undetermined', '应为 undetermined');
+  ok(/提示词面/.test(r.reason), '应指明是哪个面');
+  ok(/无法证明模型不再自己问/.test(r.reason), '应说明根因');
+});
+await atest('combineVerdicts：两面都成立 → effective 但仍带保留说明', async () => {
+  const r = combineVerdicts({ ruleVerdict: 'effective', promptVerdict: 'effective', ruleChanged: true, promptChanged: true });
+  eq(r.verdict, 'effective', '应为 effective');
+  ok(/不表示模型一定不再问/.test(r.reason), '必须保留那句免责说明');
+});
+
+console.log('\n   ── 引擎层：真实编排 ──');
+
+/** 每个编排测试前把两个面都恢复到"原厂"，避免测试间相互污染 */
+function resetApprovalFixture() {
+  for (const mode of ['code', 'work', 'design']) {
+    seedPromptTpl(mode, FIXTURE_VER, `新版 ${mode}\n${FULL_BLOCK}\n`);
+  }
+  seedSettings();
+}
+
+await atest('approvalState 读出现状（三模板档位 + 规则分布）', async () => {
+  resetApprovalFixture();
+  const s = await engineB.approvalState();
+  eq(s.levels.length, 3, '应有 3 个档位');
+  eq(s.prompts.length, 3, '应有 3 个提示词模板');
+  ok(s.rules.ok, '规则面应可读');
+  ok(Number.isInteger(s.rules.pending.writeAsk), '应给出 write=ask 计数');
+  for (const p of s.prompts) {
+    if (p.error) continue;
+    eq(p.level.level, 'off', `${p.handle} 应处于原厂档，实际 ${p.level.level}`);
+  }
+});
+
+await atest('planApproval relaxed：两面都给出，且都不误解为"完全可靠"', async () => {
+  resetApprovalFixture();
+  const p = await engineB.planApproval('relaxed');
+  eq(p.level, 'relaxed', '档位不符');
+  const rules = p.faces.find((x) => x.face === 'rules');
+  const prompt = p.faces.find((x) => x.face === 'prompt');
+  ok(rules.changed > 0, `规则面应命中，实际 ${rules.changed}`);
+  eq(prompt.changed, 3, '提示词面应去掉 3 条');
+  eq(prompt.certainty, 'uncertain', '提示词面必须标记为不确定');
+  eq(p.maxCertainty, 'partial', '总体只能是 partial');
+});
+
+await atest('未知档位被拒', async () => {
+  await athrowsCode(() => engineB.planApproval('yolo'), 'INVALID_VALUE');
+});
+
+await atest('applyApproval off：什么都不改', async () => {
+  resetApprovalFixture();
+  const r = await engineB.applyApproval('off');
+  eq(r.changed, false, 'off 不应改动');
+});
+
+await atest('applyApproval 未确认 → 拒绝（提示词面是厂商文件）', async () => {
+  resetApprovalFixture();
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await athrowsCode(() => e.applyApproval('relaxed'), 'CONFIRMATION_REQUIRED');
+});
+
+await atest('applyApproval relaxed：一次备份覆盖两面、规范检查、可整体还原', async () => {
+  resetApprovalFixture();
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  const tplPath = path.join(builtinDir, 'welcomemode-code', FIXTURE_VER, 'prompt.tpl');
+  const beforeTpl = hashOf(tplPath);
+  const beforeSettings = hashOf(SETTINGS);
+
+  const r = await e.applyApproval('relaxed', { confirm: true });
+  eq(r.failed, 0, `不应有失败：${JSON.stringify(r.done)}`);
+  eq(r.ok, 2, '两面都应成功');
+  eq(r.files, 2, '应备份 2 个文件（提示词 + settings）');
+
+  const rules = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')).sandbox.orderedRules.file.rules;
+  eq(rules.filter((x) => x.write === 'allow').length, 4, 'write 应全放开');
+  eq(rules.filter((x) => x.delete === 'ask').length, 3, 'delete 应保持不变（relaxed 不动删除）');
+
+  const tpl = fs.readFileSync(tplPath, 'utf8');
+  ok(tpl.includes('No-Go Zones'), '红线应保留');
+  ok(!tpl.includes('Scan = Read-Only'), '询问条款应去掉');
+
+  e.restore(r.backupId);
+  eq(hashOf(tplPath), beforeTpl, '提示词应逐字节还原');
+  eq(hashOf(SETTINGS), beforeSettings, 'settings 应逐字节还原');
+});
+
+await atest('applyApproval 后 approvalState 能反映出已放宽', async () => {
+  resetApprovalFixture();
+  const e = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false });
+  await e.applyApproval('relaxed', { confirm: true });
+  const s = await e.approvalState();
+  const code = s.prompts.find((p) => p.handle === 'prompt.welcomemode-code');
+  eq(code.level.level, 'relaxed', `档位应为 relaxed，实际 ${code.level.level}`);
+});
+
+await atest('verifyApproval：无重启/无新请求时如实报 undetermined，并给出免责说明', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  const r = await engineB.verifyApproval('relaxed');
+  eq(r.verdict, 'undetermined', `应为 undetermined：${r.reason}`);
+  ok(r.parts.length === 2, '应给出两面各自的结论');
+  ok(/永远不可能被完全验证/.test(r.caveat), '必须带那句免责说明');
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

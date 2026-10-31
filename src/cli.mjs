@@ -28,6 +28,13 @@
  *   node src/cli.mjs drift            只读检测：升级后哪些定制没了
  *   node src/cli.mjs replay [--only a,b] [--confirm]   把快照灌回去（一次事务）
  *
+ * P3 · 审批自动同意（编排规则面 + 提示词面）：
+ *   node src/cli.mjs approval                 查看当前状态与可选档位
+ *   node src/cli.mjs approval-plan  <档位>     只读预览：两面各改什么
+ *   node src/cli.mjs approval-apply <档位> [--confirm]
+ *   node src/cli.mjs approval-verify <档位>
+ *   档位：off（原厂）/ relaxed（读写不问、删除仍确认）/ full（读写删都不问）
+ *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
  *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console）
@@ -400,6 +407,86 @@ async function main(argv) {
         for (const s of r.skipped) console.log(`     ${s.id}  ${s.reason}`);
       }
       return undefined;
+    }
+
+    // ── P3 · 审批自动同意 ──────────────────────────────────────
+    case 'approval': {
+      const s = await engine.approvalState();
+      if (json) return out(s, true);
+      console.log('可选档位：');
+      for (const lv of s.levels) console.log(`  ${lv.id.padEnd(9)} ${lv.title}`);
+      console.log('\n当前状态：');
+      for (const p of s.prompts) {
+        if (p.error) { console.log(`  ❌ ${p.handle}  ${p.error}`); continue; }
+        const lv = p.level?.level ?? '?';
+        console.log(`  提示词 ${p.handle.padEnd(26)} 档位=${lv}${p.hasBlock ? '' : '  ⚠️ 无安全段'}`);
+      }
+      if (s.rules?.ok) {
+        const p = s.rules.pending;
+        console.log(`  规则   共 ${s.rules.ruleCount} 条：read=ask ${p.readAsk} / write=ask ${p.writeAsk} / delete=ask ${p.deleteAsk}`);
+      } else {
+        console.log(`  ❌ 规则面不可读：${s.rules?.error ?? '未知'}`);
+      }
+      console.log('\n预览某个档位：node src/cli.mjs approval-plan relaxed');
+      return undefined;
+    }
+
+    case 'approval-plan': {
+      const p = await engine.planApproval(f._[1]);
+      if (json) return out(p, true);
+      console.log(`档位 ${p.level} · ${p.title}`);
+      console.log(`${p.desc}\n`);
+      for (const face of p.faces) {
+        const badge = face.certainty === 'reliable' ? '✅ 可可靠验证'
+          : face.certainty === 'uncertain' ? '⚠️  无法保证' : '· 不涉及';
+        console.log(`── ${face.title}   ${badge}`);
+        console.log(`   ${face.detail}`);
+        if (face.samples?.length) {
+          console.log(`   样例：${face.samples.join(' ')}${face.changed > face.samples.length ? ' …' : ''}`);
+        }
+        if (face.verify) console.log(`   验证：${face.verify}`);
+        if (face.note) console.log(`   ${face.note}`);
+        for (const w of (face.warnings ?? [])) console.log(`   ⚠️  ${w}`);
+        console.log('');
+      }
+      console.log(`提示词目标：${p.promptPath ?? '(无)'}（版本 ${p.promptVersion ?? '-'}）`);
+      console.log(`⚠️  ${p.gate.warning}`);
+      return undefined;
+    }
+
+    case 'approval-apply': {
+      const r = await engine.applyApproval(f._[1], { confirm: f.confirm === true });
+      if (json) return out(r, true);
+      if (!r.changed === false && r.files === 0) {
+        console.log(`✅ ${r.note ?? '无需改动'}`);
+        return undefined;
+      }
+      const badge = r.failed > 0 ? (r.ok > 0 ? '⚠️ ' : '❌') : '✅';
+      console.log(`${badge} 已应用档位 ${r.level}（${r.title}）`);
+      console.log(`   备份 ${r.backupId}（覆盖 ${r.files} 个文件，可整体还原）`);
+      for (const d of r.done) {
+        console.log(d.ok ? `   · ${d.face}` : `   ❌ ${d.face}  ${d.error}`);
+      }
+      console.log('\n⚠️  两个面都需要**重启 WorkBuddy** 才生效。');
+      console.log(`   重启后验证：node src/cli.mjs approval-verify ${r.level}`);
+      if (r.failed > 0) process.exitCode = 2;
+      return undefined;
+    }
+
+    case 'approval-verify': {
+      const r = await engine.verifyApproval(f._[1]);
+      if (json) return out(r, true);
+      console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   档位 ${r.level}`);
+      console.log(r.reason);
+      if (r.parts?.length) {
+        console.log('\n逐面结论：');
+        for (const p of r.parts) {
+          const b = { effective: '✅ 生效', ineffective: '❌ 未生效', undetermined: '⚠️  无法判定' }[p.verdict] ?? p.verdict;
+          console.log(`   ${p.face.padEnd(10)} ${b}`);
+        }
+      }
+      if (r.caveat) console.log(`\n${r.caveat}`);
+      return r.verdict === 'ineffective' ? (process.exitCode = 2) : undefined;
     }
 
     case 'audit': {

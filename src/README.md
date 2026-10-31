@@ -38,6 +38,8 @@ src/
 | `verify/marker.mjs` | ✅ 已实现 | 标记法三态判定（逐条时间过滤 / 无时间戳降级 / 无 apply 记录降级） |
 | `core/trace-raw.mjs` | ✅ 已实现 | trace 原文扫描（标记法用），与 `trace.mjs`（usage 抽取）分工 |
 | `handles/rules.mjs` + `handles/rules-index.mjs` | ✅ 已实现 | 规则矩阵三域：**结构化批量改动作**（from/to/actions/paths）+ **重启后回读**验证 |
+| `core/safety-block.mjs` | ✅ 已实现 | `personal_files_safety` 段落手术：按**语义**（非编号）分级放宽、幂等、红线守卫 |
+| `core/approval.mjs` | ✅ 已实现 | 审批自动同意编排：三档位、双面预览、`combineVerdicts`（诚实三态合成） |
 | `core/rules.mjs` | ✅ 已实现 | 规则读取/统计/批量提升/最小改动写入（`customized` 自动置真） |
 | `verify/readback.mjs` | ✅ 已实现 | 重启后回读两阶段判定（写完只能 undetermined，重启后才 effective） |
 | `web/` 前端 | ✅ 已实现 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
