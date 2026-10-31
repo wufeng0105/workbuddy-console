@@ -87,6 +87,13 @@ Data（数据 · 多变）—— 加把手 / 加版本 = 只加数据
 
 **必填字段**：`id` / `title` / `target` / `writeClass` / `channel` / `privilege` / `upgradeBehavior` / **`verification`**
 
+**可选字段**：`resolveTarget(ctx)` —— **运行时才确定目标**的把手用它覆盖静态锚点。
+
+> 契约补充（P1c 引入）：静态锚点表达不了两类目标 —— ① 同一把手族按参数指向不同文件（`style.*` 七档）；
+> ② 路径含运行时才知道的片段（C 组模板的 build hash 目录，P2）。
+> 引擎统一经 `anchorFor(h)` 取目标：有 `resolveTarget` 就用它，否则回退 `target` 锚点。
+> **实测**：`style.socratic` 的 `anchorPath` 正确指向 `style-socratic.md`。
+
 > ⚠️ **命名注意**：`verification` 是**名词声明**，六步里的 `verify()` 是**动词方法**。
 > 二者曾经同名，导致对象字面量里方法覆盖声明、契约校验必然失败 —— 已由自测回归用例守住（`src/selftest.mjs`）。
 

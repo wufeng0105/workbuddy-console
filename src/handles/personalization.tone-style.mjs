@@ -13,11 +13,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createJsonFieldHandle } from './json-field.mjs';
+import { TONE_STYLE_IDS } from '../core/appconfig.mjs';
 
 /** toneStyle 枚举白名单。证据：authority-snapshot.js `Us = new Set([...])` */
-export const TONE_STYLES = Object.freeze([
-  'professional', 'friendly', 'straightforward', 'creative', 'efficient', 'sarcastic', 'socratic',
-]);
+export const TONE_STYLES = TONE_STYLE_IDS;
 
 const STYLE_ANCHOR = 'templates.style';
 

@@ -16,6 +16,7 @@ import { estimateCost } from './tokens.mjs';
 import { ConfirmationRequiredError, GateBlockedError } from './errors.mjs';
 import * as registry from './registry.mjs';
 import { isWorkBuddyRunning } from './appstate.mjs';
+import { readActiveToneStyle } from './appconfig.mjs';
 import { autoCapture } from '../verify/auto-capture.mjs';
 import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 import {
@@ -71,6 +72,19 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     return g;
   }
 
+  /**
+   * 解析一个把手的实际目标。
+   *
+   * 契约补充：把手可实现 `resolveTarget(ctx)` 覆盖静态锚点，用于"运行时才知道写到哪"的场合
+   *   —— style 档位内容（按 id）、C 组模板（按版本哈希）。
+   * 不实现则回退到 `target` 声明的锚点。
+   * @param {object} h
+   */
+  function anchorFor(h) {
+    if (typeof h.resolveTarget === 'function') return h.resolveTarget(ctx);
+    return resolver.resolve(h.target);
+  }
+
   // ── 1. 探测 ────────────────────────────────────────────────
   async function probe(id) {
     const h = registry.get(id);
@@ -81,7 +95,7 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
   async function plan(id, { next = '' } = {}) {
     const h = registry.get(id);
     const state = await h.probe(ctx);
-    const anchor = resolver.resolve(h.target);
+    const anchor = anchorFor(h);
 
     const preview = typeof h.preview === 'function'
       ? await h.preview(ctx, { next })
@@ -118,7 +132,7 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
       );
     }
 
-    const anchor = resolver.resolve(h.target);
+    const anchor = anchorFor(h);
     const before = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path, 'utf8') : '';
 
     // 期望增量按**截断后**文本计算（把手自己知道注入上限），落进台账供 verify 自动对照
@@ -232,7 +246,17 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
    * @param {{id?:string, name:string, handleIds?:string[]}} p
    */
   async function captureProfile({ id, name, handleIds } = {}) {
-    const ids = handleIds?.length ? handleIds : [...PROFILE_HANDLES];
+    const explicit = Array.isArray(handleIds) && handleIds.length > 0;
+    const ids = explicit ? [...handleIds] : [...PROFILE_HANDLES];
+
+    // 默认档位额外带上**当前生效**的 style 内容把手 ——
+    // 这样"一个专家"才真正等于「人设 + 表达方式」，切档位时两处一起换。
+    if (!explicit) {
+      const activeStyle = readActiveToneStyle(ctx);
+      const sid = activeStyle ? `style.${activeStyle}` : null;
+      if (sid && registry.list().some((h) => h.id === sid)) ids.push(sid);
+    }
+
     const values = {};
     const sources = {};
     for (const hid of ids) {
@@ -308,8 +332,8 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
           { profile: profile.id, handle: hid },
         );
       }
-      const anchor = resolver.resolve(h.target);
-      targets.set(anchor.path, { key: h.target, absPath: anchor.path });
+      const anchor = anchorFor(h);
+      targets.set(anchor.path, { key: anchor.key ?? h.target, absPath: anchor.path });
       const pv = await h.preview(ctx, { next });
       previews.push({ handle: hid, expectedDeltaTokens: pv.expectedDeltaTokens ?? null, warnings: pv.warnings ?? [] });
       planned.push({ h, next });
@@ -422,7 +446,7 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     const handles = registry.list().map((h) => {
       const entry = { ...meta(h), anchorOk: true, anchorPath: null, error: null };
       try {
-        entry.anchorPath = tildify(resolver.resolve(h.target).path);
+        entry.anchorPath = tildify(anchorFor(h).path);
       } catch (e) {
         entry.anchorOk = false;
         entry.error = `${e.code ?? 'ERROR'}: ${e.message}`;

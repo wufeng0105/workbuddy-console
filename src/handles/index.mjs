@@ -8,6 +8,7 @@ import { userHandle } from './personalization.user.mjs';
 import { identityHandle } from './personalization.identity.mjs';
 import { toneStyleHandle } from './personalization.tone-style.mjs';
 import { customPromptHandle } from './personalization.custom-prompt.mjs';
+import { styleHandles } from './styles.mjs';
 
 /** 全部把手（顺序即界面顺序） */
 export const ALL_HANDLES = Object.freeze([
@@ -16,6 +17,7 @@ export const ALL_HANDLES = Object.freeze([
   identityHandle,
   toneStyleHandle,
   customPromptHandle,
+  ...styleHandles,
 ]);
 
 let registered = false;

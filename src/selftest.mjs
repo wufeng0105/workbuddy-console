@@ -99,6 +99,24 @@ function writeFixture() {
 console.log(`\n沙箱 fixture：${tildify(fixtureRoot)}\n（合成内容，未触碰真实用户数据）`);
 writeFixture();
 
+// 安装目录 fixture（style 七档）—— 必须在任何 createEngine 之前就位，
+// 否则 style.* 把手的 resolveTarget 会因锚点未命中而让 doctor 变红。
+const installRoot = ensureDir(path.join(fixtureRoot, 'install'));
+const styleDir = ensureDir(path.join(installRoot, 'resources', 'app.asar.unpacked', 'resources', 'templates', 'style'));
+const STYLE_TEXTS = {
+  creative: `天马行空：${'想象力叙事流，把解题当冒险，用比喻设景，适度 emoji。'.repeat(8)}`,
+  efficient: '高效务实：先答案后背景，列表优先。',
+  friendly: '亲和友善：先共情再确认，结尾鼓励并邀请追问。',
+  professional: '专业严谨：结论先行，量化表达，区分事实与观点。',
+  sarcastic: '毒舌吐槽：讽刺开场但只 roast 想法不 roast 人，收尾再补一刀。',
+  socratic: '启发引导：先问你怎么想，提示分级，最后才给答案。',
+  straightforward: '直言不讳：第一句就是结论，坏主意直说。',
+};
+for (const [id, text] of Object.entries(STYLE_TEXTS)) {
+  fs.writeFileSync(path.join(styleDir, `style-${id}.md`), text, 'utf8');
+}
+process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = installRoot;
+
 const SOUL = path.join(cfg, SOUL_REL);
 const NEXT = `${ORIGINAL_SOUL}\n- 追加：自测标记 WBC-SELFTEST-001\n`;
 
@@ -436,17 +454,7 @@ await atest('基线与观测模型不同 → 告警（模型不同则静态前�
 // ══════════════ P1a：个性化五项 ══════════════
 console.log('\n【8】P1a · 个性化五项（SOUL / USER / IDENTITY / toneStyle / customPrompt）');
 
-// 造一个"安装目录"fixture：style 七档
-const installRoot = ensureDir(path.join(fixtureRoot, 'install'));
-const styleDir = ensureDir(path.join(installRoot, 'resources', 'app.asar.unpacked', 'resources', 'templates', 'style'));
-const STYLE_TEXT = {
-  efficient: '高效务实：先答案后背景，列表优先。',
-  creative: `天马行空：${'想象力叙事流，把解题当冒险，用比喻设景，适度 emoji。'.repeat(8)}`,
-};
-for (const [id, text] of Object.entries(STYLE_TEXT)) {
-  fs.writeFileSync(path.join(styleDir, `style-${id}.md`), text, 'utf8');
-}
-process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = installRoot;
+// 安装目录 fixture 已在 setup 阶段建好（见文件顶部），此处直接复用
 
 const APP_CONFIG = path.join(cfg, 'app', 'app-config.json');
 
@@ -495,7 +503,7 @@ await atest('带尾随换行的取值 → 按 collector 的 trim 行为规范化
 await atest('换档位 → 期望增量 = 两个 style 文件的 token 差（不是字符串长度差）', async () => {
   const pl = await engineB.plan('personalization.tone-style', { next: 'creative' });
   ok(pl.preview.expectedDeltaTokens > 0, `应给出正增量，实际 ${pl.preview.expectedDeltaTokens}`);
-  ok(pl.preview.injectedChars === STYLE_TEXT.creative.length, '注入字符数应等于 style 文件长度');
+  ok(pl.preview.injectedChars === STYLE_TEXTS.creative.length, '注入字符数应等于 style 文件长度');
   ok(/style/.test(pl.preview.cost.cacheNote) || pl.preview.cost.delta > 0, '应给出版本换档的代价');
 });
 await atest('toneStyle apply 只改该字段，其余键逐字不动', async () => {
@@ -630,17 +638,22 @@ await atest('档位接口经 HTTP 全链走通（save → list → plan → appl
   });
   const saved = await (await post('/api/profiles/save', { name: 'HTTP档位', id: 'selftest-http' })).json();
   eq(saved.data.id, 'selftest-http', 'id 不符');
-  eq(Object.keys(saved.data.values).length, 3, '应覆盖 3 个把手');
+  eq(Object.keys(saved.data.values).length, 4, '应覆盖 4 个把手（含当前生效的风格内容）');
 
   const list = await (await fetch(`${BASE}/api/profiles`, { headers: AUTH })).json();
   ok(list.data.some((p) => p.id === 'selftest-http'), '列表应含新档位');
 
   const plan = await (await post('/api/profiles/plan', { id: 'selftest-http' })).json();
-  eq(plan.data.items.length, 3, '预览应覆盖 3 个把手');
+  eq(plan.data.items.length, 4, '预览应覆盖 4 个把手');
+  eq(plan.data.needsConfirm, true, '含厂商文件 → 需要确认');
 
-  const ap = await (await post('/api/profiles/apply', { id: 'selftest-http' })).json();
+  const refused = await post('/api/profiles/apply', { id: 'selftest-http' });
+  eq(refused.status, 400, '未确认应被拒');
+  eq((await refused.json()).error.code, 'CONFIRMATION_REQUIRED', '错误码不符');
+
+  const ap = await (await post('/api/profiles/apply', { id: 'selftest-http', confirm: true })).json();
   ok(ap.data.backupId, '切换应产生备份');
-  eq(ap.data.files, 2, '应覆盖 2 个文件');
+  eq(ap.data.files, 3, '应覆盖 3 个文件');
 
   const v = await (await post('/api/profiles/verify', { id: 'selftest-http' })).json();
   eq(v.data.verdict, 'undetermined', '无会话数据时应如实报 undetermined');
@@ -665,10 +678,11 @@ let profileA;
 await atest('采集档位：从当前实际状态吸回源（chezmoi 的 re-add 语义）', async () => {
   profileA = await engineB.captureProfile({ name: '自测档位A', id: 'selftest-a' });
   eq(profileA.id, 'selftest-a', 'id 不符');
-  eq(Object.keys(profileA.values).length, 3, '应覆盖 3 个把手');
+  eq(Object.keys(profileA.values).length, 4, '应覆盖 4 个把手（3 项个性化 + 当前生效的风格内容）');
   eq(profileA.values['personalization.tone-style'], 'creative', 'toneStyle 应采到当前值');
   eq(profileA.values['personalization.custom-prompt'], 'X-档位的指令', 'customPrompt 应采到当前值');
   eq(profileA.values['personalization.soul'], ORIGINAL_SOUL, 'SOUL 应采到当前内容');
+  eq(profileA.values['style.creative'], STYLE_TEXTS.creative, '应采到当前生效档位的风格全文');
 });
 await atest('档位存进用户数据目录，不在仓库内', async () => {
   const f = path.join(store, 'profiles', 'selftest-a.json');
@@ -681,32 +695,41 @@ await engineB.apply('personalization.tone-style', { next: 'efficient' });
 await engineB.apply('personalization.custom-prompt', { next: 'Y-另一套指令' });
 const ySoul = hashOf(SOUL);
 const yCfg = hashOf(APP_CFG);
+const yStyle = hashOf(path.join(styleDir, 'style-creative.md'));
 
 await atest('档位预览：逐把手差异 + 合计期望增量', async () => {
   const pl = await engineB.planProfile('selftest-a');
-  eq(pl.items.length, 3, '应给出 3 个把手的差异');
+  eq(pl.items.length, 4, '应给出 4 个把手的差异');
   ok(pl.items.every((i) => typeof i.diffText === 'string'), '每项都应有差异文本');
   ok(Number.isFinite(pl.expectedDeltaTokens), '应有合计期望增量');
-  eq(pl.needsConfirm, false, '全部是用户目录把手，不需要确认');
+  eq(pl.needsConfirm, true, '含厂商文件（style 内容）→ 需要确认');
 });
 
 let appliedProfile;
-await atest('切换档位：一次备份覆盖全部文件（两个把手同文件也只备一次）', async () => {
-  appliedProfile = await engineB.applyProfile('selftest-a');
-  ok(appliedProfile.backupId, '缺备份 id');
-  eq(appliedProfile.files, 2, `应覆盖 2 个文件（SOUL.md + app-config.json），实际 ${appliedProfile.files}`);
-  const m = JSON.parse(fs.readFileSync(path.join(store, 'backups', appliedProfile.backupId, 'manifest.json'), 'utf8'));
-  eq(m.entries.length, 2, 'manifest 应含 2 个条目（按绝对路径去重）');
-  const paths = m.entries.map((e) => e.absPath);
-  eq(new Set(paths).size, 2, '不应有重复条目');
+await atest('含厂商文件的档位：未确认 → 整体拒绝，且一个文件都没动', async () => {
+  const soulNow = hashOf(SOUL);
+  const cfgNow = hashOf(APP_CFG);
+  await athrowsCode(() => engineB.applyProfile('selftest-a'), 'CONFIRMATION_REQUIRED');
+  eq(hashOf(SOUL), soulNow, '拒绝后 SOUL.md 不应被改');
+  eq(hashOf(APP_CFG), cfgNow, '拒绝后 app-config.json 不应被改');
 });
-await atest('切换后实际状态 == 档位 A 的内容', async () => {
+await atest('切换档位：一次备份覆盖全部文件（同文件只备一次）', async () => {
+  appliedProfile = await engineB.applyProfile('selftest-a', { confirm: true });
+  ok(appliedProfile.backupId, '缺备份 id');
+  eq(appliedProfile.files, 3, `应覆盖 3 个文件（SOUL.md + app-config.json + style-creative.md），实际 ${appliedProfile.files}`);
+  const m = JSON.parse(fs.readFileSync(path.join(store, 'backups', appliedProfile.backupId, 'manifest.json'), 'utf8'));
+  eq(m.entries.length, 3, 'manifest 应含 3 个条目（按绝对路径去重）');
+  eq(new Set(m.entries.map((e) => e.absPath)).size, 3, '不应有重复条目');
+});
+await atest('切换后实际状态 == 档位 A 的内容（含风格全文）', async () => {
   const tp = await engineB.probe('personalization.tone-style');
   const cp = await engineB.probe('personalization.custom-prompt');
   const sp = await engineB.probe('personalization.soul');
+  const st = await engineB.probe('style.creative');
   eq(tp.state.value, 'creative', 'toneStyle 应回到 creative');
   eq(cp.state.value, 'X-档位的指令', 'customPrompt 应回到 X');
   eq(sp.state.text, ORIGINAL_SOUL, 'SOUL 应回到档位 A 的内容');
+  eq(st.state.text, STYLE_TEXTS.creative, '风格全文应回到档位 A 的内容');
 });
 await atest('切换后台账记录为 apply-profile（含合计期望增量）', async () => {
   const rec = engineB.audit().filter((r) => r.event === 'apply-profile').at(-1);
@@ -715,10 +738,11 @@ await atest('切换后台账记录为 apply-profile（含合计期望增量）',
   eq(rec.backupId, appliedProfile.backupId, '备份引用不符');
   ok(Number.isFinite(rec.expectedDeltaTokens), '应记录合计期望增量');
 });
-await atest('一次还原把整套档位收回切换前状态（两个文件都回）', async () => {
+await atest('一次还原把整套档位收回切换前状态（三个文件都回）', async () => {
   engineB.restore(appliedProfile.backupId);
   eq(hashOf(SOUL), ySoul, 'SOUL.md 应逐字节回到切换前');
   eq(hashOf(APP_CFG), yCfg, 'app-config.json 应逐字节回到切换前');
+  eq(hashOf(path.join(styleDir, 'style-creative.md')), yStyle, 'style-creative.md 应逐字节回到切换前');
 });
 await atest('档位验证：没有可用会话时如实报 undetermined，不编造结论', async () => {
   // 清掉【7】留下的 fixture trace（它们带未来时间戳，会污染本节的会话归属判断）
@@ -735,6 +759,70 @@ await atest('删除档位', async () => {
   const r = engineB.removeProfile('selftest-a');
   eq(r.deleted, true, '应删除');
   eq(engineB.profiles().some((p) => p.id === 'selftest-a'), false, '列表里不应再有');
+});
+
+// ══════════════ P1c：style 档位内容（厂商文件）══════════════
+console.log('\n【11】P1c · style 档位内容把手（安装目录 / 厂商文件 / 升级失效）');
+
+await atest('七个 style 把手全部注册且锚点可解析', async () => {
+  const d = engineB.doctor();
+  const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('style.'));
+  eq(ids.length, 7, `应有 7 个 style 把手，实际 ${ids.length}`);
+  const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  eq(bad.length, 0, `锚点应全部可解析：${bad.join(',')}`);
+});
+
+await atest('resolveTarget 按 id 定位到各自的 style 文件（静态锚点表达不了）', async () => {
+  const h = engineB.doctor().handles.find((x) => x.id === 'style.socratic');
+  ok(h.anchorPath.endsWith('style-socratic.md'), `路径不符：${h.anchorPath}`);
+});
+
+await atest('probe 辨识"是否为当前生效档位"', async () => {
+  const active = await engineB.probe('style.efficient');
+  eq(active.state.isActive, true, 'efficient 应为当前生效档位');
+  eq(active.state.writeAccess, true, 'fixture 文件应可写');
+  const other = await engineB.probe('style.socratic');
+  eq(other.state.isActive, false, 'socratic 未生效');
+  eq(other.state.activeStyle, 'efficient', '应报出生效档位');
+});
+
+await atest('非生效档位：preview 明确告警"改了不影响请求"，期望增量为 0', async () => {
+  const pl = await engineB.plan('style.socratic', { next: 'SOC-新内容' });
+  eq(pl.preview.expectedDeltaTokens, 0, '非生效档位期望增量应为 0');
+  ok(pl.preview.warnings.some((w) => /当前未生效/.test(w)), `应告警：${JSON.stringify(pl.preview.warnings)}`);
+});
+
+await atest('非生效档位：verify 判 undetermined（前置条件不成立），绝不判"未生效"', async () => {
+  const v = await engineB.verify('style.socratic', { baselineTokens: 1000, observedTokens: 1000, expectedDelta: 0 });
+  eq(v.verdict, 'undetermined', `应为 undetermined：${v.reason}`);
+  ok(/当前未生效|前置条件/.test(v.reason), `应说明前置条件：${v.reason}`);
+});
+
+await atest('生效档位：期望增量 = 新旧内容 token 差', async () => {
+  const pl = await engineB.plan('style.efficient', { next: `${STYLE_TEXTS.efficient}追加一句。` });
+  ok(pl.preview.expectedDeltaTokens > 0, `应给出正增量，实际 ${pl.preview.expectedDeltaTokens}`);
+});
+
+await atest('厂商文件：未确认 → 拒绝写入（铁律 5）', async () => {
+  await athrowsCode(() => engineB.apply('style.efficient', { next: 'X' }), 'CONFIRMATION_REQUIRED');
+});
+
+await atest('厂商文件：带确认 → 写入 + 备份 + 逐字节还原', async () => {
+  const p = path.join(styleDir, 'style-efficient.md');
+  const before = hashOf(p);
+  const ap = await engineB.apply('style.efficient', { next: '新的高效档内容', confirm: true });
+  eq(fs.readFileSync(p, 'utf8'), '新的高效档内容', '应已写入');
+  ok(hashOf(p) !== before, '内容应已变化');
+  engineB.restore(ap.backupId);
+  eq(hashOf(p), before, '应逐字节还原');
+});
+
+await atest('档位采集默认带上"当前生效"的 style 把手（专家 = 人设 + 表达方式）', async () => {
+  const p = await engineB.captureProfile({ name: '带风格内容的档位', id: 'selftest-with-style' });
+  const keys = Object.keys(p.values);
+  ok(keys.includes('style.efficient'), `应含 style.efficient，实际 ${keys.join(',')}`);
+  eq(keys.length, 4, `应覆盖 4 个把手（3 + 生效风格），实际 ${keys.length}`);
+  engineB.removeProfile('selftest-with-style');
 });
 
 // ══════════════ 汇总 ══════════════

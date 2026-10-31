@@ -31,7 +31,9 @@ src/
 | `handles/personalization.tone-style.mjs` / `.custom-prompt.mjs` | ✅ 已实现 | JSON 字段，共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + `trim()` 对齐） |
 | `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces / **serve** |
 | `server.mjs` | ✅ 已实现 | 本地控制台服务端：仅回环 + 随机端口 + 一次性 token；前端永不直触文件系统 |
-| 其余把手（`style-*.md` 内容、C 组提示词、规则矩阵） | ⬜ 待写 | P1c–P2 |
+| `handles/style-file.mjs` + `handles/styles.mjs` | ✅ 已实现 | 七档 style 内容（安装目录厂商文件）：`resolveTarget` 参数化定位、生效档位判定、可写性如实报告 |
+| `core/appconfig.mjs` | ✅ 已实现 | app-config 读取 + toneStyle 枚举（避免把手之间互相依赖） |
+| 其余把手（C 组提示词、规则矩阵） | ⬜ 待写 | P2 |
 | `web/` 前端 | ✅ 已实现 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
 
 ## 硬约束（写代码前必读）

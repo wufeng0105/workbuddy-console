@@ -8,9 +8,13 @@
 
 ## 一、提示词层 · 静态
 
-> **P1a 已实现（`src/handles/`）**：`personalization.soul` / `.user` / `.identity` / `.tone-style` / `.custom-prompt` —— 五项走完六步契约。
+> **P1a/P1c 已实现（`src/handles/`）**：`personalization.{soul,user,identity,tone-style,custom-prompt}` + `style.{七档}` —— 共 12 个把手，全部走完六步契约。
 > 实现要点：身份文件共用 `identity-file.mjs` 工厂（含 10 000 字符截断约束与模式可达性声明）；
-> JSON 字段共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + 与 collector 的 `trim()` 行为对齐）。
+> JSON 字段共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + 与 collector 的 `trim()` 行为对齐）；
+> style 内容共用 `style-file.mjs` 工厂（厂商文件 + 逐次确认 + **非生效档位前置条件判定**）。
+>
+> ⚠️ **style 内容的一条静默失败**：编辑**非当前生效**的档位等于什么都没做（`toneStyle` 决定读哪一个文件）。
+> 工具对此 preview 显著告警、verify 判 `undetermined`（前置条件不成立）——**不会**因为实测 Δ=0 就报"未生效"。
 
 | 把手 | 位置 | 提权 | 升级 | 通道 | 验证策略 | 状态 |
 |---|---|---|---|---|---|---|

@@ -45,3 +45,26 @@
 
 **未触碰 WorkBuddy 文件**：采集前后 `app-config.json` 与 `SOUL.md` 的 sha256 均未变（已复核）。
 档位是**源状态**，天然只读 WorkBuddy、只写用户数据目录。
+
+---
+
+## 2026-11-01 · P1c 安装目录写入往返（厂商文件）
+
+目的：证明**第一条真正的厂商文件通路**（安装目录 + 可能需要提权）能写、能还原。
+
+| # | 目标文件 | 操作 | 备份 id | 还原 | 验证 |
+|---|---|---|---|---|---|
+| 4 | `C:\Program Files\WorkBuddy\resources\app.asar.unpacked\resources\templates\style\style-socratic.md` | 写入合成内容（经 CLI，带 `--confirm`） | `20261031T183925Z-508ba5` | ✅ 已还原 | 还原后 sha256 = 改动前 `879C83BB…` **逐字节一致** |
+
+**为什么挑 `style-socratic.md`**：当时生效档位是 `efficient`，改 `socratic` **不影响任何请求**——
+即使中途出错也不改变 WorkBuddy 行为，是风险最小的厂商文件写测试。
+
+**同时验证到的**：
+
+- 未确认的厂商文件写入被拒（`CONFIRMATION_REQUIRED`，铁律 5）✅
+- 当前账号 `NETIS\Administrator` 对安装目录**实际可写**（探针 `writeAccess: true` 如实反映，而非假定）✅
+- `resolveTarget` 按 id 正确定位到各自的 style 文件 ✅
+
+**终态**：该文件逐字节还原；其余六个 style 文件自始至终未被改动。
+
+**遗留**：`upgradeBehavior: 'invalidated'` 仍是**疑失效**（待实测 #6）——升级是否整体替换该目录未复现。
