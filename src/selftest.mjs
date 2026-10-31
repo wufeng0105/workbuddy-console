@@ -563,6 +563,70 @@ await atest('IDENTITY.md 的 preview 会提示"专家模式下不注入"', async
   ok(pl.preview.warnings.some((w) => /专家模式/.test(w)), `应给出模式告警：${JSON.stringify(pl.preview.warnings)}`);
 });
 
+// ══════════════ P0c：控制台服务端（HTTP 冒烟）══════════════
+console.log('\n【9】P0c · 本地控制台服务端（HTTP 冒烟，含鉴权与真实走链）');
+
+const { createConsoleServer } = await import('./server.mjs');
+const consoleApp = createConsoleServer({ configRoot: cfg, storeRoot: store });
+const listened = await consoleApp.listen(0);
+const BASE = `http://127.0.0.1:${listened.port}`;
+const AUTH = { 'X-WBC-Token': consoleApp.token };
+const JSON_CT = { 'Content-Type': 'application/json' };
+
+await atest('无令牌 → 401；正确令牌 → doctor 返回 5 把手', async () => {
+  const r1 = await fetch(`${BASE}/api/doctor`);
+  eq(r1.status, 401, '无令牌应 401');
+  const r2 = await fetch(`${BASE}/api/doctor`, { headers: AUTH });
+  eq(r2.status, 200, '带令牌应 200');
+  const j = await r2.json();
+  eq(j.ok, true, 'ok 应为 true');
+  ok(j.data.handles.length >= 5, `应返回至少 5 个把手，实际 ${j.data.handles.length}`);
+});
+await atest('错误令牌 → 401', async () => {
+  const r = await fetch(`${BASE}/api/doctor`, { headers: { 'X-WBC-Token': 'definitely-wrong-token' } });
+  eq(r.status, 401, '错误令牌应 401');
+});
+await atest('静态首页可访问且含标题', async () => {
+  const r = await fetch(`${BASE}/`);
+  eq(r.status, 200, '首页应 200');
+  const html = await r.text();
+  ok(html.includes('workbuddy-console'), '首页内容不符');
+});
+await atest('未知接口 → 404 且带稳定错误码', async () => {
+  const r = await fetch(`${BASE}/api/nope`, { headers: AUTH });
+  eq(r.status, 404, '应 404');
+  const j = await r.json();
+  eq(j.error.code, 'NOT_FOUND', '错误码不符');
+});
+await atest('probe → plan → apply → verify → restore 经 HTTP 全链走通', async () => {
+  const probe = await (await fetch(`${BASE}/api/handle/personalization.soul/probe`, { headers: AUTH })).json();
+  const next = `${probe.data.state.text}\n- HTTP-SMOKE\n`;
+  const post = (p, body) => fetch(`${BASE}${p}`, { method: 'POST', headers: { ...AUTH, ...JSON_CT }, body: JSON.stringify(body) });
+
+  const plan = await (await post('/api/handle/personalization.soul/plan', { next })).json();
+  ok(plan.data.preview.diff.added >= 1, 'plan 应给出差异');
+
+  const ap = await (await post('/api/handle/personalization.soul/apply', { next })).json();
+  ok(ap.data.backupId, 'apply 应返回备份 id');
+
+  const v = await (await post('/api/handle/personalization.soul/verify', {})).json();
+  eq(v.data.verdict, 'undetermined', '无会话数据时应如实报 undetermined');
+
+  const rs = await (await post('/api/restore', { backupId: ap.data.backupId })).json();
+  eq(rs.data.changed.length, 1, '应还原 1 项');
+  eq(fs.readFileSync(SOUL, 'utf8'), ORIGINAL_SOUL, 'fixture 文件应还原到原文');
+});
+await atest('厂商文件经 HTTP 写入仍需 confirm（铁律 5）', async () => {
+  const r = await fetch(`${BASE}/api/handle/test.vendor/apply`, {
+    method: 'POST', headers: { ...AUTH, ...JSON_CT }, body: JSON.stringify({ next: '{}' }),
+  });
+  eq(r.status, 400, '未确认应被拒（400）');
+  const j = await r.json();
+  eq(j.error.code, 'CONFIRMATION_REQUIRED', '错误码不符');
+});
+
+await consoleApp.close();
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

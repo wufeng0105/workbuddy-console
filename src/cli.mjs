@@ -13,6 +13,7 @@
  *   node src/cli.mjs backups
  *   node src/cli.mjs audit [--limit N]
  *   node src/cli.mjs traces [--limit N]     列出 trace 里的 generation 记录（诊断 token-delta 数据源）
+ *   node src/cli.mjs serve [--port N]       启动本地控制台（仅 127.0.0.1）
  *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
@@ -191,6 +192,21 @@ async function main(argv) {
       if (rows.length === 0) return console.log('（暂无备份）');
       for (const b of rows) console.log(`${b.id}  ${b.createdAt}  ${b.entries} 项  ${b.reason}`);
       return undefined;
+    }
+
+    case 'serve': {
+      const { startConsole } = await import('./server.mjs');
+      const s = await startConsole({
+        root: typeof f.root === 'string' ? f.root : undefined,
+        port: f.port !== undefined ? Number(f.port) : 0,
+      });
+      console.log('workbuddy-console 已启动');
+      console.log(`  WorkBuddy ${s.version}    配置根 ${s.configRoot}`);
+      console.log(`  数据目录 ${s.storeRoot}`);
+      console.log(`\n  控制台  ${s.url}\n`);
+      console.log(`  URL 也落了一份：${s.urlFile}`);
+      console.log('  仅监听 127.0.0.1；令牌随本次启动生成。Ctrl+C 退出。');
+      return undefined; // http server 维持事件循环
     }
 
     case 'traces': {

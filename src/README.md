@@ -28,9 +28,10 @@ src/
 | `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
 | `handles/personalization.soul.mjs` / `.user.mjs` / `.identity.mjs` | ✅ 已实现 | 身份文件三件，共用 `identity-file.mjs` 工厂（含 10 000 字符截断与模式可达性） |
 | `handles/personalization.tone-style.mjs` / `.custom-prompt.mjs` | ✅ 已实现 | JSON 字段，共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + `trim()` 对齐） |
-| `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces |
+| `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces / **serve** |
+| `server.mjs` | ✅ 已实现 | 本地控制台服务端：仅回环 + 随机端口 + 一次性 token；前端永不直触文件系统 |
 | 其余把手（`style-*.md` 内容、C 组提示词、规则矩阵） | ⬜ 待写 | P1c–P2 |
-| `web/` 前端 | ⬜ 待写 | P0c |
+| `web/` 前端 | ✅ 已实现 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
 
 ## 硬约束（写代码前必读）
 

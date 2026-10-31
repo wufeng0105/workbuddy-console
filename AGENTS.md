@@ -53,8 +53,9 @@
 | `docs/verification.md` | 验证策略层、三态输出、**待实测清单** |
 | `docs/handles.md` | 把手清单（含对抗成本与验证策略）——**实际待办** |
 | `docs/recon-amendments.md` | **对冻结侦察资料的修正登记**——读到冲突时**以它为准** |
-| `src/` | 框架骨架（契约接口；实现待写） |
-| `web/` | 前端静态页（待 P0 起） |
+| `src/` | 框架实现：Core（契约 / 锚点 / 备份 / 引擎 / trace）+ 把手 + 验证策略 + CLI + 本地服务端 |
+| `web/` | 控制台前端（原生 ESM，无构建；`node src/cli.mjs serve` 启动） |
+| `docs/ledger.md` | **开发期写操作台账**——动真实 WorkBuddy 文件前后必须回填 |
 | `historicalsource/` | **历史侦察资料（冻结）**——五层地图、证据、脚本。只读参考，不修改 |
 
 ## 引用索引
