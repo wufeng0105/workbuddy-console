@@ -76,6 +76,27 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
       return engine.restore(String(body.backupId ?? ''), { dryRun: body.dryRun === true });
     }
 
+    // ── 专家档位（多把手事务）──
+    if (pathname === '/api/profiles' && method === 'GET') return engine.profiles();
+    if (pathname === '/api/profiles/save' && method === 'POST') {
+      return engine.captureProfile({
+        name: String(body.name ?? ''),
+        id: typeof body.id === 'string' && body.id.trim() ? body.id.trim() : undefined,
+      });
+    }
+    if (pathname === '/api/profiles/plan' && method === 'POST') {
+      return engine.planProfile(String(body.id ?? ''));
+    }
+    if (pathname === '/api/profiles/apply' && method === 'POST') {
+      return engine.applyProfile(String(body.id ?? ''), { confirm: body.confirm === true });
+    }
+    if (pathname === '/api/profiles/verify' && method === 'POST') {
+      return engine.verifyProfile(String(body.id ?? ''));
+    }
+    if (pathname === '/api/profiles/delete' && method === 'POST') {
+      return engine.removeProfile(String(body.id ?? ''));
+    }
+
     const m = /^\/api\/handle\/([^/]+)\/(probe|plan|apply|verify)$/.exec(pathname);
     if (m) {
       const id = decodeURIComponent(m[1]);

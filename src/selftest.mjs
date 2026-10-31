@@ -624,8 +624,118 @@ await atest('厂商文件经 HTTP 写入仍需 confirm（铁律 5）', async () 
   const j = await r.json();
   eq(j.error.code, 'CONFIRMATION_REQUIRED', '错误码不符');
 });
+await atest('档位接口经 HTTP 全链走通（save → list → plan → apply → verify → delete）', async () => {
+  const post = (p, body) => fetch(`${BASE}${p}`, {
+    method: 'POST', headers: { ...AUTH, ...JSON_CT }, body: JSON.stringify(body),
+  });
+  const saved = await (await post('/api/profiles/save', { name: 'HTTP档位', id: 'selftest-http' })).json();
+  eq(saved.data.id, 'selftest-http', 'id 不符');
+  eq(Object.keys(saved.data.values).length, 3, '应覆盖 3 个把手');
+
+  const list = await (await fetch(`${BASE}/api/profiles`, { headers: AUTH })).json();
+  ok(list.data.some((p) => p.id === 'selftest-http'), '列表应含新档位');
+
+  const plan = await (await post('/api/profiles/plan', { id: 'selftest-http' })).json();
+  eq(plan.data.items.length, 3, '预览应覆盖 3 个把手');
+
+  const ap = await (await post('/api/profiles/apply', { id: 'selftest-http' })).json();
+  ok(ap.data.backupId, '切换应产生备份');
+  eq(ap.data.files, 2, '应覆盖 2 个文件');
+
+  const v = await (await post('/api/profiles/verify', { id: 'selftest-http' })).json();
+  eq(v.data.verdict, 'undetermined', '无会话数据时应如实报 undetermined');
+
+  const del = await (await post('/api/profiles/delete', { id: 'selftest-http' })).json();
+  eq(del.data.deleted, true, '应删除成功');
+});
 
 await consoleApp.close();
+
+// ══════════════ P1b：专家档位（多把手事务）══════════════
+console.log('\n【10】P1b · 专家档位（一次切换 = 一次备份 = 一个期望增量）');
+
+const APP_CFG = path.join(cfg, 'app', 'app-config.json');
+const hashOf = (p) => sha256(fs.readFileSync(p));
+
+// 先把现状设成 X 并采集为档位 A
+await engineB.apply('personalization.tone-style', { next: 'creative' });
+await engineB.apply('personalization.custom-prompt', { next: 'X-档位的指令' });
+
+let profileA;
+await atest('采集档位：从当前实际状态吸回源（chezmoi 的 re-add 语义）', async () => {
+  profileA = await engineB.captureProfile({ name: '自测档位A', id: 'selftest-a' });
+  eq(profileA.id, 'selftest-a', 'id 不符');
+  eq(Object.keys(profileA.values).length, 3, '应覆盖 3 个把手');
+  eq(profileA.values['personalization.tone-style'], 'creative', 'toneStyle 应采到当前值');
+  eq(profileA.values['personalization.custom-prompt'], 'X-档位的指令', 'customPrompt 应采到当前值');
+  eq(profileA.values['personalization.soul'], ORIGINAL_SOUL, 'SOUL 应采到当前内容');
+});
+await atest('档位存进用户数据目录，不在仓库内', async () => {
+  const f = path.join(store, 'profiles', 'selftest-a.json');
+  ok(fs.existsSync(f), `档位文件应在 ${f}`);
+  ok(!f.includes('historicalsource'), '不应落在历史目录');
+});
+
+// 把现状改成 Y，再切回档位 A
+await engineB.apply('personalization.tone-style', { next: 'efficient' });
+await engineB.apply('personalization.custom-prompt', { next: 'Y-另一套指令' });
+const ySoul = hashOf(SOUL);
+const yCfg = hashOf(APP_CFG);
+
+await atest('档位预览：逐把手差异 + 合计期望增量', async () => {
+  const pl = await engineB.planProfile('selftest-a');
+  eq(pl.items.length, 3, '应给出 3 个把手的差异');
+  ok(pl.items.every((i) => typeof i.diffText === 'string'), '每项都应有差异文本');
+  ok(Number.isFinite(pl.expectedDeltaTokens), '应有合计期望增量');
+  eq(pl.needsConfirm, false, '全部是用户目录把手，不需要确认');
+});
+
+let appliedProfile;
+await atest('切换档位：一次备份覆盖全部文件（两个把手同文件也只备一次）', async () => {
+  appliedProfile = await engineB.applyProfile('selftest-a');
+  ok(appliedProfile.backupId, '缺备份 id');
+  eq(appliedProfile.files, 2, `应覆盖 2 个文件（SOUL.md + app-config.json），实际 ${appliedProfile.files}`);
+  const m = JSON.parse(fs.readFileSync(path.join(store, 'backups', appliedProfile.backupId, 'manifest.json'), 'utf8'));
+  eq(m.entries.length, 2, 'manifest 应含 2 个条目（按绝对路径去重）');
+  const paths = m.entries.map((e) => e.absPath);
+  eq(new Set(paths).size, 2, '不应有重复条目');
+});
+await atest('切换后实际状态 == 档位 A 的内容', async () => {
+  const tp = await engineB.probe('personalization.tone-style');
+  const cp = await engineB.probe('personalization.custom-prompt');
+  const sp = await engineB.probe('personalization.soul');
+  eq(tp.state.value, 'creative', 'toneStyle 应回到 creative');
+  eq(cp.state.value, 'X-档位的指令', 'customPrompt 应回到 X');
+  eq(sp.state.text, ORIGINAL_SOUL, 'SOUL 应回到档位 A 的内容');
+});
+await atest('切换后台账记录为 apply-profile（含合计期望增量）', async () => {
+  const rec = engineB.audit().filter((r) => r.event === 'apply-profile').at(-1);
+  ok(rec, '应有 apply-profile 记录');
+  eq(rec.profile, 'selftest-a', '档位 id 不符');
+  eq(rec.backupId, appliedProfile.backupId, '备份引用不符');
+  ok(Number.isFinite(rec.expectedDeltaTokens), '应记录合计期望增量');
+});
+await atest('一次还原把整套档位收回切换前状态（两个文件都回）', async () => {
+  engineB.restore(appliedProfile.backupId);
+  eq(hashOf(SOUL), ySoul, 'SOUL.md 应逐字节回到切换前');
+  eq(hashOf(APP_CFG), yCfg, 'app-config.json 应逐字节回到切换前');
+});
+await atest('档位验证：没有可用会话时如实报 undetermined，不编造结论', async () => {
+  // 清掉【7】留下的 fixture trace（它们带未来时间戳，会污染本节的会话归属判断）
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  const v = await engineB.verifyProfile('selftest-a');
+  eq(v.verdict, 'undetermined', `应为 undetermined：${v.reason}`);
+  ok(/会话|新建/.test(v.reason), `应给出可执行的下一步：${v.reason}`);
+});
+await atest('档位切换是事务：厂商文件把手会被整体拒绝（而非部分写入）', async () => {
+  const bad = { id: 'selftest-bad', name: '含厂商文件', values: { 'test.vendor': '{}' } };
+  await athrowsCode(() => engineB.applyProfile(bad), 'CONFIRMATION_REQUIRED');
+});
+await atest('删除档位', async () => {
+  const r = engineB.removeProfile('selftest-a');
+  eq(r.deleted, true, '应删除');
+  eq(engineB.profiles().some((p) => p.id === 'selftest-a'), false, '列表里不应再有');
+});
 
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');

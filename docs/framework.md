@@ -152,6 +152,22 @@ WorkBuddy 升级
     → [restore] 随时可用
 ```
 
+### 7.1 档位 = 多把手事务（已实现）
+
+"专家档位"是本框架上第一个**多把手事务**，规则如下：
+
+| 原则 | 落地 |
+|---|---|
+| **单一用户意图 = 单一事务** | 一次切换改 3 个把手（SOUL / toneStyle / customPrompt），但用户眼里是**一个动作** |
+| **一次备份覆盖全部目标** | `createBackup` 收多个 entry，且**按绝对路径去重**（toneStyle 与 customPrompt 同属 `app-config.json`，只备一次） |
+| **一个期望增量** | 三个把手都在同一条 user-context 尾段通道 → 期望增量 = 各自增量**之和** |
+| **一条审计** | 记 `apply-profile`（含 backupId、覆盖的把手与文件、合计期望增量） |
+| **整体可还原** | `restore <backupId>` 把整套档位收回切换前——**不存在"切到一半"的中间态** |
+| **事务前置校验** | 任一目标被闸门阻断或需确认 → **全部拒绝**，不做部分写入 |
+
+档位本身是**源状态**（source state），存放在用户数据目录 `profiles/`，不进仓库（铁律 4）。
+`captureProfile` 相当于 chezmoi 的 `re-add`：把 WorkBuddy 的**现状吸回源**。
+
 ## 八、目录结构
 
 ```

@@ -21,7 +21,8 @@ src/
 | `core/contracts.mjs` | ✅ 已定 | 契约定义 + `assertHandle()` 校验（**只有接口，无实现**） |
 | `core/anchor.mjs` | ✅ 已实现 | 锚点解析：运行时探测版本；位置不可确定即硬报错 |
 | `core/backup.mjs` | ✅ 已实现 | manifest + sha256 备份仓、还原、预演、漂移报告 |
-| `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份 |
+| `core/profiles.mjs` | ✅ 已实现 | 档位（源状态）存取：原子写、结构校验、损坏可见；**存用户数据目录，不进仓库** |
+| `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份；**档位多把手事务**（一次备份 / 一条审计 / 整体还原） |
 | `core/trace.mjs` | ✅ 已实现 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
 | `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
 | `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |

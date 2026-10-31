@@ -15,6 +15,14 @@
  *   node src/cli.mjs traces [--limit N]     列出 trace 里的 generation 记录（诊断 token-delta 数据源）
  *   node src/cli.mjs serve [--port N]       启动本地控制台（仅 127.0.0.1）
  *
+ * 专家档位（多把手事务）：
+ *   node src/cli.mjs profiles                列出档位
+ *   node src/cli.mjs profile-save <名称> [--id <id>]   采集**当前实际状态**为档位
+ *   node src/cli.mjs profile-plan   <id>     预览切换（逐把手差异 + 合计期望增量）
+ *   node src/cli.mjs profile-apply  <id> [--confirm]
+ *   node src/cli.mjs profile-verify <id>
+ *   node src/cli.mjs profile-rm     <id>
+ *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
  *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console）
@@ -225,6 +233,82 @@ async function main(argv) {
         );
       }
       return undefined;
+    }
+
+    // ── 专家档位 ──────────────────────────────────────────────
+    case 'profiles': {
+      const rows = engine.profiles();
+      if (json) return out(rows, true);
+      if (rows.length === 0) return console.log('（暂无档位。用 profile-save <名称> 把当前状态存为一档）');
+      console.log('id                        名称                 覆盖  创建时间');
+      for (const p of rows) {
+        console.log(`${p.id.padEnd(25)} ${String(p.name).padEnd(20)} ${String(p.covers.length).padStart(3)}  ${p.createdAt ?? ''}`);
+      }
+      return undefined;
+    }
+
+    case 'profile-save': {
+      const name = f._[1];
+      if (!name) throw new ConsoleError('USAGE', '用法：profile-save <名称> [--id <id>]');
+      const p = await engine.captureProfile({ name, id: typeof f.id === 'string' ? f.id : undefined });
+      if (json) return out(p, true);
+      console.log(`✅ 已采集档位 ${p.id}（${p.name}）`);
+      for (const [k, v] of Object.entries(p.values)) {
+        console.log(`   ${String(k).padEnd(32)} ${String(v).length} 字符`);
+      }
+      console.log('\n切换：node src/cli.mjs profile-apply ' + p.id);
+      return undefined;
+    }
+
+    case 'profile-plan': {
+      const pl = await engine.planProfile(f._[1]);
+      if (json) return out(pl, true);
+      console.log(`档位 ${pl.profile.id}（${pl.profile.name}）  →  合计修正 ${pl.expectedDeltaTokens >= 0 ? '+' : ''}${pl.expectedDeltaTokens} tokens（估算）\n`);
+      for (const it of pl.items) {
+        const d = it.expectedDeltaTokens;
+        console.log(`── ${it.title}  [${it.writeClass}]  ${d == null ? '（无法预估增量）' : `${d >= 0 ? '+' : ''}${d} tokens`}`);
+        console.log(`   ${it.anchor}`);
+        console.log(String(it.diffText).split('\n').slice(0, 8).map((l) => `   ${l}`).join('\n'));
+        for (const w of it.warnings) console.log(`   ⚠️  ${w}`);
+        for (const w of it.gate.warnings) console.log(`   ⚠️  ${w}`);
+        console.log('');
+      }
+      if (pl.needsConfirm) console.log('⚠️  含厂商文件把手，apply 需 --confirm');
+      return undefined;
+    }
+
+    case 'profile-apply': {
+      const r = await engine.applyProfile(f._[1], { confirm: f.confirm === true });
+      if (json) return out(r, true);
+      console.log(`✅ 已切换到档位 ${r.profile}`);
+      console.log(`   备份 ${r.backupId}（一次事务覆盖 ${r.files} 个文件；还原：node src/cli.mjs restore ${r.backupId}）`);
+      console.log(`   期望增量合计 ${r.expectedDeltaTokens >= 0 ? '+' : ''}${r.expectedDeltaTokens} tokens`);
+      for (const w of r.written) console.log(`   · ${w.handle}${w.writeMode ? ` (${w.writeMode})` : ''}`);
+      console.log('\n生效验证：在 WorkBuddy 新建会话并发一条消息，然后：');
+      console.log(`   node src/cli.mjs profile-verify ${r.profile}`);
+      return undefined;
+    }
+
+    case 'profile-verify': {
+      const r = await engine.verifyProfile(f._[1]);
+      if (json) return out(r, true);
+      console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   档位 ${r.profile ?? f._[1]}`);
+      console.log(r.reason);
+      if (r.evidence) {
+        const b = r.evidence.baseline;
+        const o = r.evidence.observed;
+        console.log('\n对照证据（自动从 trace 采集）：');
+        console.log(`  基线  ${b.at}  worker=${b.worker}  ${b.promptTokens} tokens  [${b.model}]`);
+        console.log(`  观测  ${o.at}  worker=${o.worker}  ${o.promptTokens} tokens  [${o.model}]`);
+        console.log(`  实测增量  ${o.promptTokens - b.promptTokens >= 0 ? '+' : ''}${o.promptTokens - b.promptTokens} tokens`);
+      }
+      for (const w of (r.warnings ?? [])) console.log(`\n⚠️  ${w}`);
+      return r.verdict === 'ineffective' ? (process.exitCode = 2) : undefined;
+    }
+
+    case 'profile-rm': {
+      const r = engine.removeProfile(f._[1]);
+      return out(json ? r : `✅ 已删除档位 ${r.id}`, false);
     }
 
     case 'audit': {

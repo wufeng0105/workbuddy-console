@@ -57,8 +57,11 @@ function el(tag, attrs = {}, ...kids) {
 
 const $ = (id) => document.getElementById(id);
 
-/** @type {{doctor:any, selected:string|null, probe:any, plan:any, verify:any, backups:any[], draft:string|null}} */
-const S = { doctor: null, selected: null, probe: null, plan: null, verify: null, backups: [], draft: null };
+/** @type {{doctor:any, selected:string|null, probe:any, plan:any, verify:any, backups:any[], draft:string|null, view:'handle'|'profile', profiles:any[], selectedProfile:string|null, profilePlan:any, profileVerify:any}} */
+const S = {
+  doctor: null, selected: null, probe: null, plan: null, verify: null, backups: [], draft: null,
+  view: 'handle', profiles: [], selectedProfile: null, profilePlan: null, profileVerify: null,
+};
 
 /** @param {string} id */
 function handleMeta(id) { return S.doctor?.handles.find((h) => h.id === id) ?? null; }
@@ -81,16 +84,90 @@ function renderList() {
     const cls = h.writeClass === 'vendor-file' ? 'badge vendor' : 'badge';
     box.append(el('button', {
       class: 'handle',
-      'aria-current': String(S.selected === h.id),
+      'aria-current': String(S.view === 'handle' && S.selected === h.id),
       onclick: () => select(h.id),
     },
     el('div', { class: 't' }, h.title, el('span', { class: cls }, h.writeClass === 'vendor-file' ? '厂商文件' : '用户目录')),
     el('div', { class: 's' }, h.anchorOk ? h.anchorPath : `❌ ${h.error}`)));
   }
+  renderProfiles();
+}
+
+// ── 专家档位 ──────────────────────────────────────────────────
+async function loadProfiles() {
+  try { S.profiles = await api('/api/profiles'); } catch { S.profiles = []; }
+}
+
+function renderProfiles() {
+  const box = $('profile-list');
+  if (!box) return;
+  box.className = S.profiles.length ? '' : 'empty';
+  box.textContent = '';
+  if (!S.profiles.length) { box.textContent = '（暂无档位。先把当前人设调成想要的样子，再"存为新档位"）'; return; }
+  for (const p of S.profiles) {
+    box.append(el('button', {
+      class: 'handle',
+      'aria-current': String(S.view === 'profile' && S.selectedProfile === p.id),
+      onclick: () => selectProfile(p.id),
+    },
+    el('div', { class: 't' }, p.name, el('span', { class: 'badge' }, `${p.covers.length} 项`)),
+    el('div', { class: 's' }, p.id)));
+  }
+}
+
+async function selectProfile(id) {
+  S.view = 'profile';
+  S.selectedProfile = id;
+  S.profilePlan = null;
+  S.profileVerify = null;
+  renderList();
+  renderProfileDetail();
+}
+
+function renderProfileDetail() {
+  const p = S.profiles.find((x) => x.id === S.selectedProfile);
+  const body = $('detail-body');
+  $('detail-title').textContent = p ? `档位：${p.name}` : '档位';
+  body.className = '';
+  body.textContent = '';
+  if (!p) { body.append(el('div', { class: 'empty' }, '档位不存在。')); return; }
+
+  const kv = el('dl', { class: 'kv' });
+  const add = (k, v) => kv.append(el('dt', {}, k), el('dd', {}, v));
+  add('id', p.id);
+  add('覆盖', p.covers.join('、'));
+  add('创建', p.createdAt ?? '—');
+  body.append(el('div', { class: 'card' }, el('h3', {}, '档位'), kv));
+
+  const row = el('div', { class: 'row' },
+    el('button', { class: 'primary', onclick: () => doPlanProfile() }, '预览切换'),
+    el('button', { onclick: () => doApplyProfile() }, '切换到这一档'),
+    el('button', { onclick: () => doVerifyProfile() }, '验证生效'),
+    el('button', { class: 'danger', onclick: () => doDeleteProfile() }, '删除档位'));
+  body.append(el('div', { class: 'card' }, el('h3', {}, '操作'), row, el('div', { id: 'msg' })));
+
+  if (S.profilePlan) body.append(renderProfilePlan(S.profilePlan));
+  if (S.profileVerify) body.append(renderVerify(S.profileVerify));
+  body.append(renderBackups());
+}
+
+function renderProfilePlan(pl) {
+  const card = el('div', { class: 'card' },
+    el('h3', {}, `切换预览 · 合计修正 ${pl.expectedDeltaTokens >= 0 ? '+' : ''}${pl.expectedDeltaTokens} tokens（估算）`));
+  for (const it of pl.items) {
+    card.append(el('div', { class: 'muted', style: 'margin-top:8px' },
+      `${it.title}　${it.handle}　${it.expectedDeltaTokens == null ? '（无法预估增量）' : `${it.expectedDeltaTokens >= 0 ? '+' : ''}${it.expectedDeltaTokens} tokens`}`));
+    card.append(el('pre', { class: 'diff', html: colorDiff(it.diffText ?? '') }));
+    for (const w of it.warnings) card.append(el('div', { class: 'warn' }, w));
+    for (const w of (it.gate?.warnings ?? [])) card.append(el('div', { class: 'warn' }, w));
+  }
+  if (pl.needsConfirm) card.append(el('div', { class: 'warn' }, '含厂商文件把手：切换需要在把手页逐次确认。'));
+  return card;
 }
 
 // ── 详情 ──────────────────────────────────────────────────────
 async function select(id) {
+  S.view = 'handle';
   S.selected = id;
   S.plan = null; S.verify = null; S.draft = null;
   renderList();
@@ -330,6 +407,56 @@ async function loadBackups() {
   try { S.backups = await api('/api/backups'); } catch { S.backups = []; }
 }
 
+// ── 档位动作 ──────────────────────────────────────────────────
+async function doSaveProfile() {
+  const name = prompt('新档位名称（例如：代码专家 / 写作专家）');
+  if (!name || !name.trim()) return;
+  try {
+    const p = await api('/api/profiles/save', { method: 'POST', body: { name: name.trim() } });
+    await loadProfiles();
+    renderList();
+    selectProfile(p.id);
+  } catch (e) { alert(`保存失败：${e.message}`); }
+}
+
+async function doPlanProfile() {
+  try {
+    S.profilePlan = await api('/api/profiles/plan', { method: 'POST', body: { id: S.selectedProfile } });
+    S.profileVerify = null;
+    renderProfileDetail();
+  } catch (e) { alert(`预览失败：${e.message}`); }
+}
+
+async function doApplyProfile() {
+  try {
+    const r = await api('/api/profiles/apply', { method: 'POST', body: { id: S.selectedProfile, confirm: false } });
+    S.profilePlan = null;
+    await loadBackups();
+    renderProfileDetail();
+    msg(`已切换：${r.written.length} 个把手；一次备份 ${r.backupId}（覆盖 ${r.files} 个文件，可整体还原）`);
+  } catch (e) { msg(`切换失败 [${e.code ?? 'ERR'}] ${e.message}`, true); }
+}
+
+async function doVerifyProfile() {
+  try {
+    S.profileVerify = await api('/api/profiles/verify', { method: 'POST', body: { id: S.selectedProfile } });
+    renderProfileDetail();
+  } catch (e) { msg(`验证失败 [${e.code ?? 'ERR'}] ${e.message}`, true); }
+}
+
+async function doDeleteProfile() {
+  if (!window.confirm(`删除档位「${S.selectedProfile}」？（只删源状态，不动 WorkBuddy 里的现有内容）`)) return;
+  try {
+    await api('/api/profiles/delete', { method: 'POST', body: { id: S.selectedProfile } });
+    S.selectedProfile = null;
+    S.view = 'handle';
+    await loadProfiles();
+    renderList();
+    const first = S.doctor?.handles?.[0];
+    if (first) await select(first.id);
+  } catch (e) { alert(`删除失败：${e.message}`); }
+}
+
 // ── 启动 ──────────────────────────────────────────────────────
 (async function boot() {
   if (!TOKEN) {
@@ -339,8 +466,10 @@ async function loadBackups() {
   try {
     S.doctor = await api('/api/doctor');
     await loadBackups();
+    await loadProfiles();
     renderTop();
     renderList();
+    $('save-profile').addEventListener('click', doSaveProfile);
     const first = S.doctor.handles[0];
     if (first) await select(first.id);
   } catch (e) {

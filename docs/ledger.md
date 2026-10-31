@@ -34,3 +34,14 @@
 - 未改 C 组插件缓存（属 P2）
 - 未改网关流量、未改 `app.asar`、未改 fuses
 - **未触发真实会话** —— 因此 `verify` 的 `effective` 分支仍未在真实数据上跑过（需要一次真实会话，属交互步骤）
+
+---
+
+## 2026-11-01 · P1b 档位采集（只写用户数据目录）
+
+| # | 目标 | 操作 | 结果 |
+|---|---|---|---|
+| 3 | `~/.workbuddy-console/profiles/real-snapshot.json` | 从**当前真实状态**采集档位「当前状态快照」 | 采到 SOUL 487 字符 / toneStyle `efficient` / customPrompt 空串 |
+
+**未触碰 WorkBuddy 文件**：采集前后 `app-config.json` 与 `SOUL.md` 的 sha256 均未变（已复核）。
+档位是**源状态**，天然只读 WorkBuddy、只写用户数据目录。

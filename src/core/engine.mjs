@@ -17,6 +17,10 @@ import { ConfirmationRequiredError, GateBlockedError } from './errors.mjs';
 import * as registry from './registry.mjs';
 import { isWorkBuddyRunning } from './appstate.mjs';
 import { autoCapture } from '../verify/auto-capture.mjs';
+import { evaluateTokenDelta } from '../verify/token-delta.mjs';
+import {
+  writeProfile, readProfile, listProfiles, deleteProfile, slugify, PROFILE_HANDLES,
+} from './profiles.mjs';
 import { tildify } from './paths.mjs';
 
 /** @param {object} h */
@@ -221,6 +225,186 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     return merged;
   }
 
+  // ── 专家档位（多把手事务）───────────────────────────────────
+
+  /**
+   * 从**当前实际状态**采集一个档位 —— 相当于 chezmoi 的 `re-add`（把现状吸回源）。
+   * @param {{id?:string, name:string, handleIds?:string[]}} p
+   */
+  async function captureProfile({ id, name, handleIds } = {}) {
+    const ids = handleIds?.length ? handleIds : [...PROFILE_HANDLES];
+    const values = {};
+    const sources = {};
+    for (const hid of ids) {
+      const h = registry.get(hid);
+      const st = await h.probe(ctx);
+      values[hid] = st.value !== undefined ? String(st.value ?? '') : String(st.text ?? '');
+      sources[hid] = { path: tildify(st.path), sha256: st.sha256 ?? null, bytes: st.bytes ?? null };
+    }
+    const resolvedId = id?.trim() || slugify(name);
+    return writeProfile(storeRoot, {
+      id: resolvedId,
+      name: name?.trim() || resolvedId,
+      values,
+      sources,
+    });
+  }
+
+  /**
+   * 预览一次档位切换：逐把手差异 + **合计期望增量**。
+   * @param {string|object} profileOrId
+   */
+  async function planProfile(profileOrId) {
+    const profile = typeof profileOrId === 'string' ? readProfile(storeRoot, profileOrId) : profileOrId;
+    const items = [];
+    for (const [hid, next] of Object.entries(profile.values)) {
+      const h = registry.get(hid);
+      const anchor = resolver.resolve(h.target);
+      const gate = gateCheck(h);
+      const st = await h.probe(ctx);
+      const pv = await h.preview(ctx, { next });
+      items.push({
+        handle: hid,
+        title: h.title,
+        writeClass: h.writeClass,
+        anchor: tildify(anchor.path),
+        current: st.value !== undefined ? st.value : `${String(st.text ?? '').length} 字符`,
+        next: st.value !== undefined ? next : `${next.length} 字符`,
+        expectedDeltaTokens: pv.expectedDeltaTokens ?? null,
+        diffText: pv.diffText,
+        warnings: pv.warnings ?? [],
+        gate,
+      });
+    }
+    return {
+      profile: { id: profile.id, name: profile.name },
+      items,
+      expectedDeltaTokens: items.reduce((s, i) => s + (i.expectedDeltaTokens ?? 0), 0),
+      needsConfirm: items.some((i) => i.writeClass === 'vendor-file'),
+      blocked: items.some((i) => i.gate.blocked),
+    };
+  }
+
+  /**
+   * 应用档位：**一次备份覆盖全部目标 → 全部写入 → 一条审计**。
+   * 这是"单一用户意图 = 单一事务"的落地点：切换前后各是一个可还原的整体。
+   * @param {string|object} profileOrId
+   */
+  async function applyProfile(profileOrId, { confirm = false, reason } = {}) {
+    const profile = typeof profileOrId === 'string' ? readProfile(storeRoot, profileOrId) : profileOrId;
+
+    /** @type {Map<string,{key:string,absPath:string}>} 按绝对路径去重（多个字段可能同文件） */
+    const targets = new Map();
+    const planned = [];
+    const previews = [];
+
+    for (const [hid, next] of Object.entries(profile.values)) {
+      const h = registry.get(hid);
+      const gate = gateCheck(h);
+      if (gate.blocked) throw new GateBlockedError(gate.reason, { handle: hid, profile: profile.id });
+      if (h.writeClass === 'vendor-file' && !confirm) {
+        throw new ConfirmationRequiredError(
+          `档位 ${profile.id} 含厂商文件把手 ${hid}，需显式确认（--confirm）`,
+          { profile: profile.id, handle: hid },
+        );
+      }
+      const anchor = resolver.resolve(h.target);
+      targets.set(anchor.path, { key: h.target, absPath: anchor.path });
+      const pv = await h.preview(ctx, { next });
+      previews.push({ handle: hid, expectedDeltaTokens: pv.expectedDeltaTokens ?? null, warnings: pv.warnings ?? [] });
+      planned.push({ h, next });
+    }
+
+    // 铁律 1：**先**一次备份覆盖全部目标，再动任何一个
+    const manifest = createBackup({
+      storeRoot,
+      actor,
+      reason: reason ?? `apply profile ${profile.id}（${targets.size} 文件 / ${planned.length} 把手）`,
+      entries: [...targets.values()],
+    });
+
+    const written = [];
+    for (const { h, next } of planned) {
+      written.push({ handle: h.id, ...(await h.apply(ctx, { next })) });
+    }
+
+    const expectedDeltaTokens = previews.reduce((s, p) => s + (p.expectedDeltaTokens ?? 0), 0);
+    appendAudit(storeRoot, {
+      event: 'apply-profile',
+      profile: profile.id,
+      profileName: profile.name,
+      backupId: manifest.id,
+      handles: planned.map((p) => p.h.id),
+      files: [...targets.values()].map((t) => t.key),
+      expectedDeltaTokens,
+      actor,
+    });
+
+    return {
+      profile: profile.id,
+      backupId: manifest.id,
+      written,
+      expectedDeltaTokens,
+      previews,
+      files: targets.size,
+    };
+  }
+
+  /**
+   * 档位切换后的生效验证 —— 同一套 token-delta。
+   * 期望增量 = 各把手合计（它们都在同一条 user-context 尾段通道里）。
+   * @param {string|object} profileOrId
+   */
+  async function verifyProfile(profileOrId, args = {}) {
+    const id = typeof profileOrId === 'string' ? profileOrId : profileOrId?.id;
+    const lastApply = readAudit(storeRoot)
+      .filter((r) => r.event === 'apply-profile' && r.profile === id)
+      .at(-1);
+
+    const finish = (res) => {
+      appendAudit(storeRoot, {
+        event: 'verify-profile', profile: id, verdict: res.verdict, reason: res.reason, actor,
+      });
+      return res;
+    };
+
+    if (!lastApply) {
+      return finish({
+        verdict: 'undetermined',
+        reason: `档位 ${id} 还没有 apply 记录 —— 先切换一次，再验证`,
+        profile: id,
+        warnings: [],
+      });
+    }
+
+    const applyAtMs = Date.parse(lastApply.at);
+    const capture = autoCapture({
+      configRoot,
+      applyAtMs: Number.isFinite(applyAtMs) ? applyAtMs : Date.now(),
+      expectedDelta: lastApply.expectedDeltaTokens ?? undefined,
+      sessionStartOf,
+    });
+    if (capture.blockedReason) {
+      return finish({
+        verdict: 'undetermined', reason: capture.blockedReason, profile: id,
+        warnings: capture.warnings ?? [], capture,
+      });
+    }
+
+    const result = evaluateTokenDelta({
+      baselineTokens: capture.baselineTokens,
+      observedTokens: capture.observedTokens,
+      expectedDelta: capture.expectedDelta,
+    });
+    return finish({
+      ...result,
+      profile: id,
+      handles: lastApply.handles,
+      evidence: capture.evidence,
+      warnings: capture.warnings ?? [],
+    });
+  }
+
   // ── 6. 还原 ────────────────────────────────────────────────
   function restore(backupId, { dryRun = false } = {}) {
     const r = restoreBackup({ storeRoot, id: backupId, dryRun });
@@ -256,5 +440,12 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     };
   }
 
-  return { resolver, ctx, probe, plan, apply, verify, restore, backups, audit, doctor };
+  return {
+    resolver, ctx,
+    probe, plan, apply, verify, restore, backups, audit, doctor,
+    // 专家档位
+    captureProfile, planProfile, applyProfile, verifyProfile,
+    profiles: () => listProfiles(storeRoot),
+    removeProfile: (id) => deleteProfile(storeRoot, id),
+  };
 }
