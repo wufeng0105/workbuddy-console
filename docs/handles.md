@@ -38,7 +38,7 @@
 
 | 把手 | 位置 | 提权 | 说明 | 状态 |
 |---|---|---|---|---|
-| `sandbox.orderedRules` | `~/.workbuddy/settings.json` | 否 | 三域 × 三动作 × 路径粒度 `allow`/`ask`/`deny`。实测 file 135 条（read allow 133/ask 2；write allow 86/ask 49）、command 0、network 0 | 🟡 **是否被启动 reconciliation 抹掉待实测**<br>⚠️ **托管回压**：`managed` 时 `toManagedOrderedRules` 覆盖本地（见 recon-amendments 新增约束 4）<br>📌 代码旁证：启动 reconciliation **只碰 `extraAllowWrite`**，不触碰 `orderedRules` |
+| `sandbox.orderedRules` | `~/.workbuddy/settings.json` | 否 | 三域 × 三动作 × 路径粒度 `allow`/`ask`/`deny`。实测 file 135 条（**write=ask 49 条 / delete=ask 49 条 / read=ask 2 条**）、command 0、network 0 | ✅ **P2b 已实现**（`rules.file` / `rules.command` / `rules.network`）：结构化批量改动作 + **重启后回读**验证<br>⚠️ **托管回压**：`managed` 时 `toManagedOrderedRules` 覆盖本地 |
 | `sandbox.extraAllowWrite` | 同上 | 否 | **死把手**——启动时 `reconcileDesktopExtraAllowWrite()` 强制重置为内置列表（旁证：列表含 macOS 路径） | ❌ **禁用**（见 recon-amendments 修正 3） |
 | `securityReview.assistedApproval` | settings / 安全中心 | 否 | `enabled` + `mode` ∈ {`silent`, `risk_hint`} | ⬜ 未实测<br>⚠️ **受服务端托管门控**：`enabled && !constraints.assistedApprovalDisabled`，`assistedApprovalDisabled` 来自 `getManagedSecurityPolicy()`，本地不可绕（recon-amendments 新增约束 3）<br>❓ 两档的**语义**（静默放行 / 放行+提示）只有命名与调用点，无文字定义 |
 | `sensitiveProtection` | `settings.json` | 否 | 本机当前 `{"enabled": false}` | ✅ 已读 |

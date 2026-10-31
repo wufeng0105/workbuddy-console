@@ -10,6 +10,7 @@ import { toneStyleHandle } from './personalization.tone-style.mjs';
 import { customPromptHandle } from './personalization.custom-prompt.mjs';
 import { styleHandles } from './styles.mjs';
 import { promptTemplateHandles } from './prompt-templates.mjs';
+import { ruleHandles } from './rules-index.mjs';
 
 /** 全部把手（顺序即界面顺序） */
 export const ALL_HANDLES = Object.freeze([
@@ -20,6 +21,7 @@ export const ALL_HANDLES = Object.freeze([
   customPromptHandle,
   ...styleHandles,
   ...promptTemplateHandles,
+  ...ruleHandles,
 ]);
 
 let registered = false;

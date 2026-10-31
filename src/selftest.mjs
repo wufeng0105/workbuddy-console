@@ -998,6 +998,135 @@ await atest('没改过就验证 → undetermined（不是"未生效"）', async 
   ok(/还没有 apply 记录/.test(v.reason), `应说明原因：${v.reason}`);
 });
 
+// ══════════════ P2b：规则矩阵（重启后回读）══════════════
+console.log('\n【13】P2b · 规则矩阵（结构化操作 / 重启后回读）');
+
+const SETTINGS = path.join(cfg, 'settings.json');
+const RULES_FIXTURE = {
+  file: [
+    { id: 'file-preset-1', source: 'preset', path: '~/.ssh/', isDirectory: true, read: 'ask', write: 'ask', delete: 'ask' },
+    { id: 'file-preset-2', source: 'preset', path: '~/.aws/', isDirectory: true, read: 'allow', write: 'ask', delete: 'ask' },
+    { id: 'file-preset-3', source: 'preset', path: '~/projects/', isDirectory: true, read: 'allow', write: 'ask', delete: 'ask' },
+    { id: 'file-preset-4', source: 'preset', path: '~/notes/', isDirectory: true, read: 'allow', write: 'allow', delete: 'allow' },
+  ],
+  command: [],
+  network: [],
+};
+function seedSettings() {
+  fs.writeFileSync(SETTINGS, `${JSON.stringify({
+    sandbox: {
+      orderedRules: {
+        file: { presetVersion: 4, customized: false, rules: RULES_FIXTURE.file },
+        command: { presetVersion: 1, customized: false, rules: [] },
+        network: { presetVersion: 1, customized: false, rules: [] },
+      },
+    },
+  }, null, 2)}\n`, 'utf8');
+}
+seedSettings();
+
+// 规则把手的闸门是 app-must-be-closed；测试里注入"应用已退出"，否则开发机上
+// WorkBuddy 真在跑，所有写入都会被正确阻断（那是产品行为，不是缺陷）。
+const engineRules = createEngine({
+  configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false,
+});
+
+await atest('三域规则把手注册，doctor 全绿', async () => {
+  const d = engineB.doctor();
+  const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('rules.'));
+  eq(ids.length, 3, `应有 3 个规则把手，实际 ${ids.length}`);
+  const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  eq(bad.length, 0, `锚点应全部可解析：${bad.join(',')}`);
+});
+
+await atest('probe 给出规则数与动作分布', async () => {
+  const p = await engineRules.probe('rules.file');
+  eq(p.state.ruleCount, 4, '规则数不符');
+  eq(p.state.summary.write.ask, 3, 'write=ask 应为 3');
+  eq(p.state.summary.read.ask, 1, 'read=ask 应为 1');
+  eq(p.state.pending.writeAsk, 3, 'pending.writeAsk 不符');
+});
+
+await atest('批量操作：只放开 write，不碰 read/delete', async () => {
+  const pl = await engineRules.plan('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] } });
+  eq(pl.preview.changed, 3, `应命中 3 条，实际 ${pl.preview.changed}`);
+  ok(pl.preview.diffText.includes('~/.ssh/'), 'diff 应列出命中路径');
+});
+
+await atest('批量操作：放开全部动作时给出"删除也会放开"的告警', async () => {
+  const pl = await engineRules.plan('rules.file', { next: { from: 'ask', to: 'allow' } });
+  ok(pl.preview.warnings.some((w) => /删除类操作也会一起放开/.test(w)),
+    `应告警：${JSON.stringify(pl.preview.warnings)}`);
+});
+
+await atest('非法动作被拒', async () => {
+  await athrowsCode(() => engineRules.plan('rules.file', { next: { from: 'ask', to: 'whatever' } }), 'INVALID_VALUE');
+  await athrowsCode(() => engineRules.plan('rules.file', { next: { from: 'ask', to: 'allow', actions: ['rm'] } }), 'INVALID_VALUE');
+});
+
+await atest('空域 + 无命中 → 明确报 NO_RULES_MATCHED（不是静默成功）', async () => {
+  await athrowsCode(
+    () => engineRules.apply('rules.command', { next: { from: 'ask', to: 'allow' } }),
+    'NO_RULES_MATCHED',
+  );
+});
+
+let rulesApply;
+await atest('apply：只改 write，其余动作与格式保持不变', async () => {
+  const before = fs.readFileSync(SETTINGS, 'utf8');
+  rulesApply = await engineRules.apply('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] } });
+  eq(rulesApply.changed, 3, '应改 3 条');
+  const after = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+  const rules = after.sandbox.orderedRules.file.rules;
+  eq(rules.filter((r) => r.write === 'allow').length, 4, '应有 4 条 write=allow');
+  eq(rules.find((r) => r.path === '~/.ssh/').delete, 'ask', 'delete 不应被动');
+  eq(rules.find((r) => r.path === '~/.ssh/').read, 'ask', 'read 不应被动');
+  eq(after.sandbox.orderedRules.file.customized, true, '应标记为已定制');
+  eq(Object.keys(after).join(','), Object.keys(JSON.parse(before)).join(','), '顶层键不应变化');
+});
+
+await atest('规则矩阵：verify 未重启时判 undetermined（并说明必须重启）', async () => {
+  const v = await engineRules.verify('rules.file', {});
+  eq(v.verdict, 'undetermined', `应为 undetermined：${v.reason}`);
+  eq(v.stage, 'after-write', '阶段应为 after-write');
+  ok(/重启/.test(v.reason), `应要求重启：${v.reason}`);
+});
+
+await atest('规则矩阵：重启后仍一致 → effective', async () => {
+  const v = await engineRules.verify('rules.file', { restarted: true });
+  eq(v.verdict, 'effective', `重启后应生效：${v.reason}`);
+  eq(v.stage, 'after-restart', '阶段应为 after-restart');
+});
+
+await atest('规则矩阵：重启后被还原 → ineffective（extraAllowWrite 那类坑的判据）', async () => {
+  // 模拟 WorkBuddy 启动时把规则重置回预设
+  seedSettings();
+  const v = await engineRules.verify('rules.file', { restarted: true });
+  eq(v.verdict, 'ineffective', `被还原时应判 ineffective：${v.reason}`);
+  ok(v.warnings.some((w) => /被还原|抹掉/.test(w)), '应指出这是"被抹掉"而非"没写进去"');
+});
+
+await atest('规则矩阵进还原链：restore 能收回规则改动', async () => {
+  seedSettings();
+  const before = hashOf(SETTINGS);
+  const ap = await engineRules.apply('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] } });
+  ok(hashOf(SETTINGS) !== before, '应已改动');
+  engineB.restore(ap.backupId);
+  eq(hashOf(SETTINGS), before, '应逐字节还原');
+});
+
+await atest('按路径定向：只改指定路径的规则', async () => {
+  seedSettings();
+  const ap = await engineRules.apply('rules.file', {
+    next: { from: 'ask', to: 'allow', actions: ['write'], paths: ['~/.ssh/'] },
+  });
+  eq(ap.changed, 1, '只应改 1 条');
+  const rules = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')).sandbox.orderedRules.file.rules;
+  eq(rules.find((r) => r.path === '~/.ssh/').write, 'allow', '指定路径应被改');
+  eq(rules.find((r) => r.path === '~/.aws/').write, 'ask', '其他路径不应被动');
+  engineB.restore(ap.backupId);
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

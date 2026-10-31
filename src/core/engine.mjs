@@ -36,6 +36,9 @@ function meta(h) {
     upgradeBehavior: h.upgradeBehavior,
     gate: h.gate ?? 'none',
     verification: h.verification,
+    /** 输入形态：text（默认，整篇文本）/ rule-op（结构化操作，如规则矩阵） */
+    inputKind: h.inputKind ?? 'text',
+    ...(h.domain ? { domain: h.domain } : {}),
   };
 }
 
@@ -172,7 +175,16 @@ export function createEngine({
       actor,
     });
 
-    return { handle: h.id, backupId: manifest.id, written, gate: g, verification: h.verification, expectedDeltaTokens };
+    // 把把手自己的结果**展开到顶层**，方便调用方直接读（同时保留 written 原样）
+    return {
+      handle: h.id,
+      backupId: manifest.id,
+      ...written,
+      written,
+      gate: g,
+      verification: h.verification,
+      expectedDeltaTokens,
+    };
   }
 
   // ── 5. 验证（三态，原样透传，不粉饰）────────────────────────

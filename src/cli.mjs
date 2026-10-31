@@ -61,6 +61,30 @@ function readNext(src) {
   return fs.readFileSync(src, 'utf8');
 }
 
+/**
+ * 按把手的 inputKind 准备 next 值。
+ * - `rule-op`：结构化操作，必须解析成对象
+ * - 其余：纯文本
+ * @param {string} src
+ * @param {'text'|'rule-op'} [inputKind]
+ */
+function readNextFor(src, inputKind) {
+  const raw = readNext(src);
+  if (inputKind !== 'rule-op') return raw;
+  let obj;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    throw new ConsoleError(
+      'INVALID_VALUE',
+      `该把手需要结构化操作（JSON），例如 {"from":"ask","to":"allow","actions":["write"]}；`
+      + `解析失败：${e.message}`,
+      { src, rawPreview: raw.slice(0, 200) },
+    );
+  }
+  return obj;
+}
+
 /** @param {any} v @param {boolean} json */
 function out(v, json) {
   if (json) { console.log(JSON.stringify(v, null, 2)); return; }
@@ -123,7 +147,8 @@ async function main(argv) {
     }
 
     case 'plan': {
-      const next = f.set !== undefined ? readNext(f.set) : '';
+      const h = engine.doctor().handles.find((x) => x.id === f._[1]);
+      const next = f.set !== undefined ? readNextFor(f.set, h?.inputKind) : undefined;
       const p = await engine.plan(f._[1], { next });
       if (json) return out({ ...p, preview: { ...p.preview, diff: undefined } }, true);
       console.log(`${p.handle.title}  →  ${p.anchor.path}`);
@@ -135,12 +160,17 @@ async function main(argv) {
         if (pv.expectedDeltaTokens != null) {
           console.log(`修正  ${pv.expectedDeltaTokens >= 0 ? '+' : ''}${pv.expectedDeltaTokens} tokens（估算）`);
         }
+      } else if (pv.op) {
+        // 规则矩阵型把手：展示结构化操作与命中数
+        const a = pv.op.actions.join('/');
+        console.log(`操作  ${a} = ${pv.op.from}  →  ${pv.op.to}${pv.op.paths ? `（限 ${pv.op.paths.length} 个路径）` : ''}`);
+        console.log(`命中  ${pv.changed} 条规则`);
       } else {
-        console.log(`现在 ${p.current.bytes} B / 约 ${p.current.tokens} tokens   →   改后 ${Buffer.byteLength(next, 'utf8')} B`);
+        console.log(`现在 ${p.current.bytes} B / 约 ${p.current.tokens} tokens   →   改后 ${Buffer.byteLength(String(next ?? ''), 'utf8')} B`);
         console.log(`修正 ${pv.cost.delta >= 0 ? '+' : ''}${pv.cost.delta} tokens（估算）`);
       }
       console.log(`\n${pv.diffText}\n`);
-      console.log(`缓存代价：${pv.cost.cacheNote}`);
+      if (!pv.op) console.log(`缓存代价：${pv.cost.cacheNote}`);
       for (const w of (p.preview.warnings ?? [])) console.log(`⚠️  ${w}`);
       for (const w of p.gate.warnings) console.log(`⚠️  ${w}`);
       if (p.needsConfirm) console.log('⚠️  这是厂商文件写入，必须显式 --confirm');
@@ -148,7 +178,8 @@ async function main(argv) {
     }
 
     case 'apply': {
-      const next = f.set !== undefined ? readNext(f.set) : '';
+      const h = engine.doctor().handles.find((x) => x.id === f._[1]);
+      const next = f.set !== undefined ? readNextFor(f.set, h?.inputKind) : undefined;
       const r = await engine.apply(f._[1], { next, confirm: f.confirm === true, reason: typeof f.reason === 'string' ? f.reason : undefined });
       if (json) return out(r, true);
       console.log(`✅ 已写入 ${r.handle}`);
