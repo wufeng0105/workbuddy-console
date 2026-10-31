@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────
+# 本地历史资料目录 —— 绝对不得纳入版本控制、绝对不得推送
+# 内含第三方专有代码副本（客户端反编译产物）、
+# 网络抓包日志与真实会话探针记录。公开仓库必须排除。
+# ─────────────────────────────────────────────────────────────
+historicalsource/
+
+# ── 用户数据（铁律 4：一律放 %USERPROFILE%\.workbuddy-console\，不得入库）──
+profiles/
+backups/
+state/
+.workbuddy-console/
+.local-store/
+
+# ── 工程期常规忽略（技术栈落地后按需细化）──
+node_modules/
+dist/
+build/
+out/
+coverage/
+
+# 本地环境与密钥
+.env
+.env.*
+!.env.example
+*.local
+
+# 日志与临时产物
+*.log
+logs/
+tmp/
+.cache/

@@ -1,0 +1,15 @@
+{
+  "name": "workbuddy-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy 宿主层的个性化配置管理器 + 生效验证器",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:contracts": "node -e \"import('./src/core/contracts.mjs').then(m=>console.log('contracts ok:', m.HANDLE_STEPS.length, 'steps,', m.VERIFY_STRATEGIES.length, 'verify strategies'))\""
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

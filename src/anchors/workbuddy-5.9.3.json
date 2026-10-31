@@ -1,0 +1,55 @@
+{
+  "_note": "锚点表 = 数据。新增 WorkBuddy 版本 = 新增一份本文件，不要改解析器。证据出处见各锚点的 evidence 字段。",
+  "_semantics": "锚点只保证「位置可确定」，不保证「目标已存在」。file 类锚点允许文件缺席（全新安装）；optional 锚点允许整体缺席。",
+  "schemaVersion": 1,
+  "product": "WorkBuddy",
+  "version": "5.9.3",
+  "detectedBy": "plugins/cache/workbuddy-builtin/<plugin>/<版本>-wb.<build>.../ 目录名",
+  "anchors": {
+    "personal.dir": {
+      "glob": "user-*-personal",
+      "kind": "dir",
+      "evidence": "historicalsource/docs/personalization.md E7-2：UI 写入唯一落点"
+    },
+    "personal.soul": {
+      "dirGlob": "user-*-personal",
+      "file": "SOUL.md",
+      "kind": "file",
+      "evidence": "personalization.md — 人设设定落盘；token 增量 +1523 实证进 LLM。文件可缺席（全新安装）"
+    },
+    "personal.user": {
+      "dirGlob": "user-*-personal",
+      "file": "USER.md",
+      "kind": "file",
+      "evidence": "personalization.md E7-2 — 称呼唯一落点"
+    },
+    "personal.identity": {
+      "dirGlob": "user-*-personal",
+      "file": "IDENTITY.md",
+      "kind": "file",
+      "evidence": "personalization.md E7-2 — 名字唯一落点"
+    },
+    "config.appConfig": {
+      "rel": "app/app-config.json",
+      "kind": "file",
+      "evidence": "prompt-layer.md E2-3 存储真身修正 — personalization.toneStyle / customPrompt 在此；settings.json 仅 legacy 兜底"
+    },
+    "config.settings": {
+      "rel": "settings.json",
+      "kind": "file",
+      "evidence": "action-layer.md E5-1 — sandbox.orderedRules 等"
+    },
+    "plugins.cache.builtin": {
+      "rel": "plugins/cache/workbuddy-builtin",
+      "kind": "dir",
+      "evidence": "prompt-layer.md C 组归属 — 版本目录带 build hash，升级即重建"
+    },
+    "memory.user": {
+      "glob": "memory/*_memory.md",
+      "kind": "file",
+      "multi": true,
+      "optional": true,
+      "evidence": "personalization.md — 长期记忆（当前被 cloud_memory_disabled 禁用，本期移出范围，故为可选锚点）"
+    }
+  }
+}
