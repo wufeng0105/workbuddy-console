@@ -16,6 +16,7 @@ import { estimateCost } from './tokens.mjs';
 import { ConfirmationRequiredError, GateBlockedError } from './errors.mjs';
 import * as registry from './registry.mjs';
 import { isWorkBuddyRunning } from './appstate.mjs';
+import { autoCapture } from '../verify/auto-capture.mjs';
 import { tildify } from './paths.mjs';
 
 /** @param {object} h */
@@ -34,9 +35,9 @@ function meta(h) {
 }
 
 /**
- * @param {{configRoot:string, storeRoot:string, version?:string, actor?:string}} opts
+ * @param {{configRoot:string, storeRoot:string, version?:string, actor?:string, sessionStartOf?:Function}} opts
  */
-export function createEngine({ configRoot, storeRoot, version, actor = 'cli' }) {
+export function createEngine({ configRoot, storeRoot, version, actor = 'cli', sessionStartOf }) {
   const resolver = createResolver({ configRoot, version });
   const ctx = {
     configRoot,
@@ -114,6 +115,14 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli' }) 
     const anchor = resolver.resolve(h.target);
     const before = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path, 'utf8') : '';
 
+    // 期望增量按**截断后**文本计算（把手自己知道注入上限），落进台账供 verify 自动对照
+    let expectedDeltaTokens = null;
+    if (typeof h.preview === 'function') {
+      try {
+        expectedDeltaTokens = (await h.preview(ctx, { next })).expectedDeltaTokens ?? null;
+      } catch { /* 预览失败不阻断写入（写入本身仍有备份兜底） */ }
+    }
+
     const manifest = createBackup({
       storeRoot,
       actor,
@@ -132,25 +141,82 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli' }) 
       backupId: manifest.id,
       bytesBefore: Buffer.byteLength(before, 'utf8'),
       bytesAfter: Buffer.byteLength(after, 'utf8'),
+      expectedDeltaTokens,
       gateKind: g.kind,
       actor,
     });
 
-    return { handle: h.id, backupId: manifest.id, written, gate: g, verification: h.verification };
+    return { handle: h.id, backupId: manifest.id, written, gate: g, verification: h.verification, expectedDeltaTokens };
   }
 
   // ── 5. 验证（三态，原样透传，不粉饰）────────────────────────
   async function verify(id, args = {}) {
     const h = registry.get(id);
-    const res = await h.verify(ctx, args);
+
+    const manual = Number.isFinite(args.baselineTokens)
+      || Number.isFinite(args.observedTokens)
+      || Number.isFinite(args.expectedDelta);
+
+    /** @type {any} */
+    let effective = args;
+    let capture = null;
+
+    if (!manual) {
+      // 自动对照：用台账里的 apply 时间戳 + trace 里的 prompt_tokens
+      const lastApply = readAudit(storeRoot)
+        .filter((r) => r.event === 'apply' && r.handle === id)
+        .at(-1);
+
+      if (!lastApply) {
+        capture = { blockedReason: '这个把手还没有 apply 记录 —— 先改一次，再验证', warnings: [] };
+      } else {
+        const applyAtMs = Date.parse(lastApply.at);
+        capture = autoCapture({
+          configRoot,
+          applyAtMs: Number.isFinite(applyAtMs) ? applyAtMs : Date.now(),
+          expectedDelta: lastApply.expectedDeltaTokens ?? undefined,
+          sessionStartOf,
+        });
+      }
+
+      if (capture.blockedReason) {
+        const res = {
+          verdict: 'undetermined',
+          reason: capture.blockedReason,
+          handle: id,
+          warnings: capture.warnings ?? [],
+          capture,
+        };
+        appendAudit(storeRoot, { event: 'verify', handle: id, verdict: res.verdict, reason: res.reason, actor });
+        return res;
+      }
+      effective = {
+        ...args,
+        baselineTokens: capture.baselineTokens,
+        observedTokens: capture.observedTokens,
+        expectedDelta: capture.expectedDelta,
+      };
+    }
+
+    const res = await h.verify(ctx, effective);
+    const merged = {
+      ...res,
+      ...(capture ? { capture, evidence: capture.evidence, warnings: [...(res.warnings ?? []), ...(capture.warnings ?? [])] } : {}),
+    };
+
+    // 说明：**会话归属**已在 auto-capture 层把关 ——
+    // 「会话起点早于改动时间」的会话会被整个排除出观测池，因此不会产生
+    // "旧会话没变 → 误判为未生效"的假阴性。见 docs/verification.md 自动对照流程。
+
     appendAudit(storeRoot, {
       event: 'verify',
       handle: h.id,
-      verdict: res.verdict,
-      reason: res.reason,
+      verdict: merged.verdict,
+      reason: merged.reason,
+      auto: !manual,
       actor,
     });
-    return res;
+    return merged;
   }
 
   // ── 6. 还原 ────────────────────────────────────────────────

@@ -41,8 +41,8 @@ export function evaluateTokenDelta({
     };
   }
 
-  // 预期无变化
-  if (Math.abs(expectedDelta) < MIN_MEANINGFUL) {
+  // 预期无变化（|期望| 在噪声级别）
+  if (Math.abs(expectedDelta) <= SMALL_NOISE) {
     return Math.abs(delta) <= SMALL_NOISE
       ? { verdict: 'effective', reason: `预期无变化，实测 Δ${delta}（在噪声范围内）`, delta, expected: expectedDelta }
       : {
@@ -64,13 +64,18 @@ export function evaluateTokenDelta({
   }
 
   const deviation = Math.abs(delta - expectedDelta) / Math.max(1, Math.abs(expectedDelta));
+  const lowSensitivity = Math.abs(expectedDelta) < MIN_MEANINGFUL
+    ? `（注意：期望增量仅 ${expectedDelta} tokens，判定敏感度低——样本误差占比高）`
+    : '';
+
   if (deviation <= tolerance) {
     return {
       verdict: 'effective',
-      reason: `实测 Δ${delta} ≈ 预期 +${expectedDelta}（偏差 ${(deviation * 100).toFixed(1)}%）${note ? ` · ${note}` : ''}`,
+      reason: `实测 Δ${delta} ≈ 预期 +${expectedDelta}（偏差 ${(deviation * 100).toFixed(1)}%）${lowSensitivity}${note ? ` · ${note}` : ''}`,
       delta,
       expected: expectedDelta,
       deviation,
+      lowSensitivity: Boolean(lowSensitivity),
     };
   }
 

@@ -19,14 +19,17 @@ src/
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | `core/contracts.mjs` | ✅ 已定 | 契约定义 + `assertHandle()` 校验（**只有接口，无实现**） |
-| `core/engine` | ⬜ 待写 | `plan → apply → verify → audit` 执行引擎 |
-| `core/registry` | ⬜ 待写 | 把手注册表（注册时强制过 `assertHandle`） |
-| `core/backup` | ⬜ 待写 | manifest + sha256 备份仓与还原 |
-| `core/drift` | ⬜ 待写 | 漂移引擎（期望 vs 实际） |
-| `core/anchor` | ⬜ 待写 | 锚点解析器（探测失败硬报错，绝不猜） |
-| `handles/*` | ⬜ 待写 | P0 只做 `personalization.soul` 一个 |
-| `anchors/*` | ⬜ 待写 | 首批锚点表：WorkBuddy 5.9.3 |
-| `verify/*` | ⬜ 待写 | `token-delta`（P0 必需）；其余 P2 |
+| `core/anchor.mjs` | ✅ 已实现 | 锚点解析：运行时探测版本；位置不可确定即硬报错 |
+| `core/backup.mjs` | ✅ 已实现 | manifest + sha256 备份仓、还原、预演、漂移报告 |
+| `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份 |
+| `core/trace.mjs` | ✅ 已实现 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
+| `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
+| `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |
+| `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
+| `handles/personalization.soul.mjs` | ✅ 已实现 | 六步 + 注入上限 10 000 字符约束 |
+| `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces |
+| 其余把手（USER / IDENTITY / toneStyle / customPrompt / style / C 组） | ⬜ 待写 | P1–P2 |
+| `web/` 前端 | ⬜ 待写 | P0 后半段 |
 
 ## 硬约束（写代码前必读）
 

@@ -12,6 +12,7 @@
  *   node src/cli.mjs restore <backupId> [--dry-run]
  *   node src/cli.mjs backups
  *   node src/cli.mjs audit [--limit N]
+ *   node src/cli.mjs traces [--limit N]     列出 trace 里的 generation 记录（诊断 token-delta 数据源）
  *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
@@ -148,6 +149,17 @@ async function main(argv) {
       if (json) return out(r, true);
       console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   ${r.handle ?? f._[1]}`);
       console.log(r.reason);
+      if (r.evidence) {
+        const b = r.evidence.baseline;
+        const o = r.evidence.observed;
+        const d = o.promptTokens - b.promptTokens;
+        console.log('\n对照证据（自动从 trace 采集）：');
+        console.log(`  基线  ${b.at}  worker=${b.worker}  ${b.promptTokens} tokens  [${b.model}]`);
+        console.log(`  观测  ${o.at}  worker=${o.worker}  ${o.promptTokens} tokens  [${o.model}]`);
+        console.log(`  实测增量  ${d >= 0 ? '+' : ''}${d} tokens`);
+        console.log(`  已排除非聊天请求（标题生成等）：${r.evidence.excludedNonChat} 条`);
+      }
+      for (const w of (r.warnings ?? [])) console.log(`\n⚠️  ${w}`);
       if (r.hint) console.log(`\n${r.hint}`);
       return r.verdict === 'ineffective' ? (process.exitCode = 2) : undefined;
     }
@@ -168,6 +180,24 @@ async function main(argv) {
       if (json) return out(rows, true);
       if (rows.length === 0) return console.log('（暂无备份）');
       for (const b of rows) console.log(`${b.id}  ${b.createdAt}  ${b.entries} 项  ${b.reason}`);
+      return undefined;
+    }
+
+    case 'traces': {
+      const { readGenerations } = await import('./core/trace.mjs');
+      const recs = readGenerations(configRoot, { limitFiles: f.limit !== undefined ? Number(f.limit) : 80 });
+      if (json) return out(recs, true);
+      if (recs.length === 0) return console.log('（没有读到 generation 记录 —— trace 目录可能为空或结构已变）');
+      const chat = recs.filter((r) => r.isChat).length;
+      console.log(`共 ${recs.length} 条 generation（聊天 ${chat} / 非聊天 ${recs.length - chat}）\n`);
+      console.log('时间                          worker   模型                   prompt  cached  finish');
+      for (const r of recs.slice(-25)) {
+        console.log(
+          `${String(r.at).padEnd(29)} ${String(r.worker).padEnd(8)} ${String(r.model ?? '-').padEnd(21)} `
+          + `${String(r.promptTokens).padStart(6)} ${String(r.cachedTokens ?? '-').padStart(7)}  ${r.finishReason ?? '-'}`
+          + `${r.isChat ? '' : '   ← 非聊天，已排除'}`,
+        );
+      }
       return undefined;
     }
 

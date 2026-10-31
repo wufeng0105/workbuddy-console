@@ -175,8 +175,11 @@ export function createResolver({ configRoot, version }) {
       } else if (entry.rel) {
         target = path.join(configRoot, entry.rel);
         if (kind === 'dir') {
-          // 目录本身就是锚点：必须存在
-          if (!fs.existsSync(target)) return { ...out, error: `目录锚点不存在：${entry.rel}` };
+          // 目录本身就是锚点：默认必须存在；声明 optional 时允许缺席
+          if (!fs.existsSync(target)) {
+            if (optional) return { ...out, ok: true, path: target, exists: false };
+            return { ...out, error: `目录锚点不存在：${entry.rel}` };
+          }
         } else {
           // 文件锚点：只要求父目录可确定；文件可不存在（全新安装）
           const parent = path.dirname(target);

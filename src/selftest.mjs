@@ -291,6 +291,148 @@ await atest('厂商文件写入带确认 → 通过且自动备份', async () =>
   ok(r.backupId, '缺备份 id');
 });
 
+// ══════════════ P0b：token-delta 自动对照 ══════════════
+console.log('\n【7】token-delta 自动对照（P0b：从 trace 自动取基线/观测）');
+
+const tracesDir = path.join(cfg, 'traces');
+
+/** 造一个像样的 trace 文件（结构与本机实测一致） */
+function writeTrace(worker, name, startedAtIso, model, promptTokens, opts = {}) {
+  const dir = ensureDir(path.join(tracesDir, worker));
+  const body = {
+    id: 'chatcmpl-test',
+    object: 'chat.completion',
+    model,
+    choices: [{ index: 0, finish_reason: opts.finishReason ?? 'stop', message: { role: 'assistant', content: 'OK' } }],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: 4,
+      total_tokens: promptTokens + 4,
+      prompt_tokens_details: { cached_tokens: 128 },
+    },
+  };
+  const lines = [
+    JSON.stringify({ type: 'trace_start', traceId: 'T-1' }),
+    JSON.stringify({
+      type: 'span_end',
+      span: {
+        traceId: 'T-1', spanId: `S-${worker}-${name}`, name: 'generation', type: 'llm',
+        status: 'ok', startedAt: startedAtIso, endedAt: startedAtIso,
+        toolOutput: JSON.stringify(body),
+      },
+    }),
+  ];
+  fs.writeFileSync(path.join(dir, name), `${lines.join('\n')}\n`, 'utf8');
+}
+
+const CHAT_MODEL = 'minimax-m3.1-flash';
+const TITLE_MODEL = 'wb-lite';
+
+const applyRec = engine.audit().filter((r) => r.event === 'apply' && r.handle === 'personalization.soul').at(-1);
+const applyAtMs = Date.parse(applyRec.at);
+const EXP = applyRec.expectedDeltaTokens;
+
+await atest('台账记录了期望增量（供自动对照）', async () => ok(EXP > 0, `期望增量应为正，实际 ${EXP}`));
+
+// ── 纯函数：会话选择规则（不依赖文件系统）──
+await atest('pickSessions：取会话**首条**请求（同会话后续轮含累积历史，不可作基线）', async () => {
+  const { pickSessions } = await import('./verify/auto-capture.mjs');
+  const gens = [
+    { worker: 'X', atMs: 100, promptTokens: 1000, isChat: true, finishReason: 'stop', model: CHAT_MODEL },
+    { worker: 'X', atMs: 200, promptTokens: 1400, isChat: true, finishReason: 'stop', model: CHAT_MODEL },
+    { worker: 'Y', atMs: 400, promptTokens: 1100, isChat: true, finishReason: 'stop', model: CHAT_MODEL },
+  ];
+  const p = pickSessions(gens, 300, () => null);
+  eq(p.baselineSession.first.promptTokens, 1000, '基线应取 X 的首条（1000），不是后续轮（1400）');
+  eq(p.observedSession.first.promptTokens, 1100, '观测应取 Y 的首条');
+  eq(p.baselineSession.startSource, 'first-request', '无目录时间时应标注为次优信号');
+});
+await atest('pickSessions：排除非聊天、0 tokens、content_filter 异常样本', async () => {
+  const { pickSessions } = await import('./verify/auto-capture.mjs');
+  const gens = [
+    { worker: 'A', atMs: 100, promptTokens: 1000, isChat: true, finishReason: 'stop', model: CHAT_MODEL },
+    { worker: 'B', atMs: 110, promptTokens: 517, isChat: false, finishReason: 'stop', model: TITLE_MODEL },
+    { worker: 'C', atMs: 120, promptTokens: 0, isChat: true, finishReason: 'content_filter', model: CHAT_MODEL },
+  ];
+  const p = pickSessions(gens, 50, () => null);
+  eq(p.chatCount, 1, '只应剩 1 条可信样本');
+  eq(p.excludedCount, 2, '应记录 2 条被排除');
+});
+
+// ── 端到端：会话起点由注入的时钟决定（避免依赖目录创建时间）──
+const SESS = new Map();
+const startOf = (w) => SESS.get(w) ?? null;
+const engineB = createEngine({ configRoot: cfg, storeRoot: store, sessionStartOf: startOf });
+
+// S1：改动前的会话；首条 1000，后续轮累积到 1400
+SESS.set('111', applyAtMs - 120000);
+writeTrace('111', 'r1.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
+writeTrace('111', 'r2.jsonl', new Date(applyAtMs - 100000).toISOString(), CHAT_MODEL, 1400);
+// S2：改动后新建的会话 → 唯一合法的观测点
+SESS.set('222', applyAtMs + 5000);
+writeTrace('222', 'r1.jsonl', new Date(applyAtMs + 10000).toISOString(), CHAT_MODEL, 1000 + EXP);
+writeTrace('222', 'title.jsonl', new Date(applyAtMs + 11000).toISOString(), TITLE_MODEL, 517);
+// S3：**改动前**就已创建的会话，改动后才发请求 → 内容仍是旧的，绝不可是观测点
+SESS.set('333', applyAtMs - 60000);
+writeTrace('333', 'late.jsonl', new Date(applyAtMs + 20000).toISOString(), CHAT_MODEL, 1000);
+
+await atest('readGenerations 读出全部记录并标记非聊天', async () => {
+  const { readGenerations } = await import('./core/trace.mjs');
+  const recs = readGenerations(cfg);
+  eq(recs.length, 5, `应读到 5 条，实际 ${recs.length}`);
+  eq(recs.filter((r) => !r.isChat).length, 1, '标题生成应为 1 条');
+  eq(recs.filter((r) => r.isChat)[0].cachedTokens, 128, '应读出 cached_tokens');
+});
+
+const autoRes = await engineB.verify('personalization.soul');
+await atest('自动对照 → 取会话首条并判为 effective', async () => {
+  eq(autoRes.verdict, 'effective', `应为 effective：${autoRes.reason}`);
+  eq(autoRes.evidence.basis, 'session-first-request', '应标明以会话首条为基准');
+  eq(autoRes.evidence.observed.promptTokens, 1000 + EXP, '观测 token 不符');
+  eq(autoRes.evidence.excludedSamples, 1, '应记录被排除的样本数');
+});
+await atest('损坏的假阴性：改动前创建的会话即使请求更晚，也不当观测点', async () => {
+  eq(autoRes.evidence.observed.worker, '222', `观测必须来自改动后新建的会话，实际 ${autoRes.evidence.observed.worker}`);
+  ok(autoRes.evidence.observed.sessionStart > autoRes.evidence.baseline.sessionStart, '观测会话起点应晚于基线会话');
+});
+
+await atest('旧会话继续发消息 → 明确要求新建会话（不给含糊结论）', async () => {
+  const { autoCapture } = await import('./verify/auto-capture.mjs');
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.clear();
+  SESS.set('111', applyAtMs - 120000);
+  writeTrace('111', 'r1.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
+  writeTrace('111', 'r2.jsonl', new Date(applyAtMs + 20000).toISOString(), CHAT_MODEL, 1000); // 旧会话续聊，无增量
+  const cap = autoCapture({ configRoot: cfg, applyAtMs, expectedDelta: EXP, sessionStartOf: startOf });
+  ok(cap.blockedReason !== null, '应阻断而不是判"未生效"');
+  ok(/新建/.test(cap.blockedReason), `应指导新建会话：${cap.blockedReason}`);
+});
+
+await atest('改动前没有会话 → undetermined（无法取基线）', async () => {
+  const { autoCapture } = await import('./verify/auto-capture.mjs');
+  const cap = autoCapture({ configRoot: cfg, applyAtMs: 0, expectedDelta: EXP, sessionStartOf: startOf });
+  ok(cap.blockedReason !== null, '应给出阻断原因');
+  ok(/基线/.test(cap.blockedReason), `应说明缺基线：${cap.blockedReason}`);
+});
+
+await atest('无 trace 目录 → undetermined，不崩', async () => {
+  const { autoCapture } = await import('./verify/auto-capture.mjs');
+  const cap = autoCapture({ configRoot: path.join(fixtureRoot, 'fresh'), applyAtMs, expectedDelta: EXP });
+  ok(cap.blockedReason !== null, '应给出阻断原因');
+});
+
+await atest('基线与观测模型不同 → 告警（模型不同则静态前缀不同）', async () => {
+  const { autoCapture } = await import('./verify/auto-capture.mjs');
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.clear();
+  SESS.set('111', applyAtMs - 120000);
+  SESS.set('222', applyAtMs + 5000);
+  writeTrace('111', 'r1.jsonl', new Date(applyAtMs - 115000).toISOString(), CHAT_MODEL, 1000);
+  writeTrace('222', 'r1.jsonl', new Date(applyAtMs + 10000).toISOString(), 'other-model', 1000 + EXP);
+  const cap = autoCapture({ configRoot: cfg, applyAtMs, expectedDelta: EXP, sessionStartOf: startOf });
+  ok(cap.warnings.some((w) => /模型不同/.test(w)), `应给出模型不同告警：${JSON.stringify(cap.warnings)}`);
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

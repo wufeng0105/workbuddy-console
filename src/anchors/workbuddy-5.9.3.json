@@ -44,6 +44,12 @@
       "kind": "dir",
       "evidence": "prompt-layer.md C 组归属 — 版本目录带 build hash，升级即重建"
     },
+    "traces.root": {
+      "rel": "traces",
+      "kind": "dir",
+      "optional": true,
+      "evidence": "token-delta 的数据来源。结构 <worker-pid>/trace_<hash>.jsonl；span_end/generation 的 toolOutput 内含 usage.prompt_tokens（本机实测）"
+    },
     "memory.user": {
       "glob": "memory/*_memory.md",
       "kind": "file",
