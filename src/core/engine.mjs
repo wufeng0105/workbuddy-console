@@ -40,10 +40,14 @@ function meta(h) {
 }
 
 /**
- * @param {{configRoot:string, storeRoot:string, version?:string, actor?:string, sessionStartOf?:Function}} opts
+ * @param {{configRoot:string, storeRoot:string, version?:string, actor?:string, sessionStartOf?:Function, appStateProbe?:()=>true|false|'unknown'}} opts
  */
-export function createEngine({ configRoot, storeRoot, version, actor = 'cli', sessionStartOf }) {
+export function createEngine({
+  configRoot, storeRoot, version, actor = 'cli', sessionStartOf, appStateProbe,
+}) {
   const resolver = createResolver({ configRoot, version });
+  /** 可注入的进程状态探测 —— 让闸门可测试（生产默认查真实进程） */
+  const probeAppState = appStateProbe ?? isWorkBuddyRunning;
   const ctx = {
     configRoot,
     storeRoot,
@@ -51,7 +55,9 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     resolve: resolver.resolve,
     /** 取不到返回 null 而不是抛错（用于可选锚点，如安装目录相关） */
     resolveOptional: (key) => { try { return resolver.resolve(key); } catch { return null; } },
-    isWorkBuddyRunning,
+    isWorkBuddyRunning: probeAppState,
+    /** 把手在 verify 里可能需要查自己的 apply 记录（如标记法的 afterMs） */
+    readAudit: () => readAudit(storeRoot),
   };
 
   /** 边界契约 · 进程互斥闸门 */
@@ -59,7 +65,7 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     const kind = handle.gate ?? 'none';
     const g = { kind, blocked: false, reason: null, warnings: [] };
     if (kind === 'app-must-be-closed') {
-      const r = isWorkBuddyRunning();
+      const r = probeAppState();
       if (r === true) {
         g.blocked = true;
         g.reason = 'WorkBuddy 正在运行：该把手要求在应用退出后写入（拒绝执行，而不是写了不生效）';
@@ -172,16 +178,23 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
   // ── 5. 验证（三态，原样透传，不粉饰）────────────────────────
   async function verify(id, args = {}) {
     const h = registry.get(id);
+    const strategy = h.verification?.strategy;
 
     const manual = Number.isFinite(args.baselineTokens)
       || Number.isFinite(args.observedTokens)
       || Number.isFinite(args.expectedDelta);
 
+    /**
+     * 只有 token-delta 需要"自动对照"（从 trace 取基线/观测）。
+     * 头部通道的 marker-trace-grep 自己会扫 trace，不该被套上 token 逻辑。
+     */
+    const needsAutoCapture = strategy === 'token-delta';
+
     /** @type {any} */
     let effective = args;
     let capture = null;
 
-    if (!manual) {
+    if (needsAutoCapture && !manual) {
       // 自动对照：用台账里的 apply 时间戳 + trace 里的 prompt_tokens
       const lastApply = readAudit(storeRoot)
         .filter((r) => r.event === 'apply' && r.handle === id)
@@ -221,6 +234,7 @@ export function createEngine({ configRoot, storeRoot, version, actor = 'cli', se
     const res = await h.verify(ctx, effective);
     const merged = {
       ...res,
+      strategy,
       ...(capture ? { capture, evidence: capture.evidence, warnings: [...(res.warnings ?? []), ...(capture.warnings ?? [])] } : {}),
     };
 

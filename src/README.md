@@ -33,7 +33,10 @@ src/
 | `server.mjs` | ✅ 已实现 | 本地控制台服务端：仅回环 + 随机端口 + 一次性 token；前端永不直触文件系统 |
 | `handles/style-file.mjs` + `handles/styles.mjs` | ✅ 已实现 | 七档 style 内容（安装目录厂商文件）：`resolveTarget` 参数化定位、生效档位判定、可写性如实报告 |
 | `core/appconfig.mjs` | ✅ 已实现 | app-config 读取 + toneStyle 枚举（避免把手之间互相依赖） |
-| 其余把手（C 组提示词、规则矩阵） | ⬜ 待写 | P2 |
+| `handles/prompt-template.mjs` + `handles/prompt-templates.mjs` | ✅ 已实现 | C 组三模式根模板（请求**头部**通道）：版本哈希定位、标记法验证、闸门 `app-must-be-closed` |
+| `verify/marker.mjs` | ✅ 已实现 | 标记法三态判定（逐条时间过滤 / 无时间戳降级 / 无 apply 记录降级） |
+| `core/trace-raw.mjs` | ✅ 已实现 | trace 原文扫描（标记法用），与 `trace.mjs`（usage 抽取）分工 |
+| 其余把手（规则矩阵） | ⬜ 待写 | P2b |
 | `web/` 前端 | ✅ 已实现 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
 
 ## 硬约束（写代码前必读）

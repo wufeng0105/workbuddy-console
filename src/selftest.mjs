@@ -83,6 +83,10 @@ function writeFixture() {
   ensureDir(path.join(cfg, 'app'));
   ensureDir(path.join(cfg, 'user-1390000000-personal'));
   ensureDir(path.join(cfg, 'plugins', 'cache', 'workbuddy-builtin', 'welcomemode-code', '5.9.3-wb.selftest.g0000.h0000'));
+  // C 组三个模式都要有，否则 prompt.welcomemode-* 的锚点会红、doctor 全绿断言失效
+  for (const mode of ['code', 'work', 'design']) {
+    ensureDir(path.join(cfg, 'plugins', 'cache', 'workbuddy-builtin', `welcomemode-${mode}`, '5.9.3-wb.selftest.g0000.h0000'));
+  }
   fs.writeFileSync(path.join(cfg, 'app', 'app-config.json'),
     JSON.stringify({ personalization: { toneStyle: 'efficient', customPrompt: '' } }, null, 2));
   fs.writeFileSync(path.join(cfg, 'settings.json'),
@@ -151,13 +155,17 @@ test('回归：目标文件缺席时锚点仍可确定（全新安装可用）',
   fs.rmSync(fresh, { recursive: true, force: true });
   ensureDir(path.join(fresh, 'user-0000000000-personal'));
   ensureDir(path.join(fresh, 'app'));
-  ensureDir(path.join(fresh, 'plugins', 'cache', 'workbuddy-builtin', 'welcomemode-code', '5.9.3-wb.selftest.g0000.h0000'));
-  fs.writeFileSync(path.join(fresh, 'plugins', 'cache', 'workbuddy-builtin', 'welcomemode-code', '5.9.3-wb.selftest.g0000.h0000', 'prompt.tpl'), 'x');
+  // 全新安装也有三个 welcomemode 插件（否则 prompt.* 把手必然红灯）
+  for (const mode of ['code', 'work', 'design']) {
+    const d = ensureDir(path.join(fresh, 'plugins', 'cache', 'workbuddy-builtin', `welcomemode-${mode}`, '5.9.3-wb.fresh.g0000.h0000'));
+    fs.writeFileSync(path.join(d, 'prompt.tpl'), 'x', 'utf8');
+  }
   const e2 = createEngine({ configRoot: fresh, storeRoot: store });
   const r = e2.resolver.resolve('personal.soul');
   ok(r.path && r.path.toLowerCase().endsWith('soul.md'), '锚点路径仍应可确定');
   eq(r.exists, false, 'SOUL.md 应报告"不存在"，而不是让锚点报错');
-  ok(e2.doctor().ok, '全新安装下 doctor 应为绿');
+  const bad = e2.doctor().handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  eq(bad.length, 0, `全新安装下 doctor 应为绿，失败：${bad.join(',')}`);
 });
 
 console.log('\n【5】铁律护栏（同步）');
@@ -823,6 +831,171 @@ await atest('档位采集默认带上"当前生效"的 style 把手（专家 = �
   ok(keys.includes('style.efficient'), `应含 style.efficient，实际 ${keys.join(',')}`);
   eq(keys.length, 4, `应覆盖 4 个把手（3 + 生效风格），实际 ${keys.length}`);
   engineB.removeProfile('selftest-with-style');
+});
+
+// ══════════════ P2a：C 组提示词模板（请求头部通道 + 标记法验证）══════════════
+console.log('\n【12】P2a · C 组提示词模板（版本定位 / 头部通道 / 标记法）');
+
+// 造 C 组插件缓存：双版本并存（低版本 + fixture 已有版本），并注入 content_policy 段
+const builtinDir = path.join(cfg, 'plugins', 'cache', 'workbuddy-builtin');
+const FIXTURE_VER = '5.9.3-wb.selftest.g0000.h0000';
+const OLD_VER = '5.8.3-wb.41334564.gdb0e9b51.h4da087921e4a';
+function seedPromptTpl(mode, versionDir, body) {
+  const d = ensureDir(path.join(builtinDir, `welcomemode-${mode}`, versionDir));
+  fs.writeFileSync(path.join(d, 'prompt.tpl'), body, 'utf8');
+}
+const POLICY_TXT = '<personal_files_safety>No-Go Zones / Scan = Read-Only / Vague = Ask First</personal_files_safety>';
+for (const mode of ['code', 'work', 'design']) {
+  seedPromptTpl(mode, OLD_VER, `旧版 ${mode}\n${POLICY_TXT}\n`);
+  seedPromptTpl(mode, FIXTURE_VER, `新版 ${mode}\n${POLICY_TXT}\n`);
+}
+
+await atest('三个提示词模板把手注册，doctor 全绿', async () => {
+  const d = engineB.doctor();
+  const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('prompt.welcomemode-'));
+  eq(ids.length, 3, `应有 3 个模板把手，实际 ${ids.length}`);
+  const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  eq(bad.length, 0, `锚点应全部可解析：${bad.join(',')}`);
+});
+
+await atest('版本定位：挑最高版本目录，双版本并存时不猜', async () => {
+  const p = await engineB.probe('prompt.welcomemode-code');
+  eq(p.state.version, FIXTURE_VER, `应挑最高版本，实际 ${p.state.version}`);
+  eq(p.state.otherVersions.length, 1, '应报告另有 1 个旧版本');
+  eq(p.state.otherVersions[0], OLD_VER, '旧版本应为 5.8.3');
+});
+
+await atest('识别 content_policy / personal_files_safety 段存在', async () => {
+  const p = await engineB.probe('prompt.welcomemode-work');
+  eq(p.state.hasPolicy, true, '应识别到 personal_files_safety 段');
+});
+
+await atest('通道是请求头部，验证策略必须是标记法（不是 token-delta）', async () => {
+  const d = engineB.doctor();
+  const h = d.handles.find((x) => x.id === 'prompt.welcomemode-code');
+  eq(h.channel, 'request-head', '通道应为 request-head');
+  eq(h.verification.strategy, 'marker-trace-grep', '验证策略应为标记法');
+  eq(h.verification.channel, 'request-head', '验证通道应为 request-head');
+});
+
+await atest('闸门：应用运行中/未确认状态下的保护齐备', async () => {
+  const d = engineB.doctor();
+  const h = d.handles.find((x) => x.id === 'prompt.welcomemode-code');
+  eq(h.writeClass, 'vendor-file', '应为厂商文件（逐次确认）');
+  eq(h.upgradeBehavior, 'invalidated', '升级应标记为失效');
+});
+
+await atest('删除安全条款时 preview 显著告警', async () => {
+  const pl = await engineB.plan('prompt.welcomemode-code', { next: '完全没有任何安全条款的提示词\n' });
+  ok(pl.preview.warnings.some((w) => /personal_files_safety/.test(w)),
+    `应告警安全条款被移除：${JSON.stringify(pl.preview.warnings)}`);
+});
+
+await atest('闸门：应用运行时拒绝写入（而不是写了不生效）', async () => {
+  const guarded = createEngine({
+    configRoot: cfg, storeRoot: store, sessionStartOf: startOf,
+    appStateProbe: () => true, // 模拟"WorkBuddy 正在运行"
+  });
+  const g = await athrowsCode(
+    () => guarded.apply('prompt.welcomemode-code', { next: 'x', confirm: true }),
+    'GATE_BLOCKED',
+  );
+  ok(/正在运行|退出/.test(g.message), `闸门信息应说明原因：${g.message}`);
+});
+await atest('闸门放开 + 未确认 → 仍被铁律 5 拦下', async () => {
+  const open = createEngine({
+    configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false,
+  });
+  await athrowsCode(() => open.apply('prompt.welcomemode-code', { next: 'x' }), 'CONFIRMATION_REQUIRED');
+});
+await atest('厂商文件：带确认 → 写入并逐字节还原', async () => {
+  const open = createEngine({
+    configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false,
+  });
+  const tplPath = path.join(builtinDir, 'welcomemode-code', FIXTURE_VER, 'prompt.tpl');
+  const before = hashOf(tplPath);
+  const ap = await open.apply('prompt.welcomemode-code', { next: `新版 code\n${POLICY_TXT}\n追加一行\n`, confirm: true });
+  ok(hashOf(tplPath) !== before, '内容应已变');
+  open.restore(ap.backupId);
+  eq(hashOf(tplPath), before, '应逐字节还原');
+});
+
+console.log('\n   ── 标记法验证（三态）──');
+const { buildMarker, verifyMarker } = await import('./verify/marker.mjs');
+
+await atest('buildMarker 生成可辨识标记', async () => {
+  const m = buildMarker('WBC-PROBE', 'abc123');
+  eq(m, 'WBC-PROBE-abc123', '标记格式不符');
+});
+
+await atest('标记法：没有 trace → undetermined（不判失败）', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  const r = await verifyMarker({ configRoot: cfg, marker: 'WBC-PROBE-abc123' });
+  eq(r.verdict, 'undetermined', `应为 undetermined：${r.reason}`);
+});
+
+await atest('标记法：trace 里出现标记 → effective', async () => {
+  writeTrace('555', 'req.jsonl', new Date().toISOString(), CHAT_MODEL, 1000);
+  const f = path.join(tracesDir, '555', 'req.jsonl');
+  fs.appendFileSync(f, `\n${JSON.stringify({ type: 'span_start', span: { name: 'generation', body: 'HEAD WBC-PROBE-abc123 tail' } })}\n`, 'utf8');
+  const r = await verifyMarker({ configRoot: cfg, marker: 'WBC-PROBE-abc123' });
+  eq(r.verdict, 'effective', `应为 effective：${r.reason}`);
+  ok(r.hits.length >= 1, '应给出命中位置');
+});
+
+await atest('标记法：有请求但无标记 → ineffective（且给出排查方向）', async () => {
+  fs.rmSync(path.join(tracesDir, '555', 'req.jsonl'), { force: true });
+  writeTrace('666', 'req2.jsonl', new Date().toISOString(), CHAT_MODEL, 1000);
+  const r = await verifyMarker({ configRoot: cfg, marker: 'WBC-PROBE-nothere' });
+  eq(r.verdict, 'ineffective', `应为 ineffective：${r.reason}`);
+  ok(r.warnings.some((w) => /闸门|活跃|升级/.test(w)), '应给出排查方向');
+});
+
+await atest('标记法：只有改动前的 trace、且之后无新请求 → undetermined', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true }); // 隔离：清掉前面测试留下的 now 时间戳 trace
+  const oldAt = new Date(Date.now() - 3600_000).toISOString();
+  writeTrace('777', 'old.jsonl', oldAt, CHAT_MODEL, 1000);
+  // 带 startedAt 的行 —— 真实 trace 的 span 行都有时间戳
+  fs.appendFileSync(path.join(tracesDir, '777', 'old.jsonl'),
+    `\n${JSON.stringify({ type: 'span_start', span: { name: 'generation', startedAt: oldAt, body: 'OLD WBC-PROBE-oldonly' } })}\n`, 'utf8');
+  const r = await verifyMarker({
+    configRoot: cfg, marker: 'WBC-PROBE-oldonly', afterMs: Date.now() - 60_000,
+  });
+  eq(r.verdict, 'undetermined', `改动后无新请求应判 undetermined：${r.reason}`);
+  ok(/还没有新请求/.test(r.reason), `应说明还没发新消息：${r.reason}`);
+});
+await atest('标记法：旧 trace 有标记 + 新请求无标记 → ineffective（正确判负）', async () => {
+  const oldAt = new Date(Date.now() - 3600_000).toISOString();
+  // 上面已有 777/old.jsonl（带旧标记）；再加一条"改动后"的新请求
+  writeTrace('777', 'new.jsonl', new Date().toISOString(), CHAT_MODEL, 1000);
+  const r = await verifyMarker({
+    configRoot: cfg, marker: 'WBC-PROBE-oldonly', afterMs: Date.now() - 60_000,
+  });
+  eq(r.verdict, 'ineffective', `确有新请求且无标记时应判 ineffective：${r.reason}`);
+});
+await atest('标记法：有标记但无时间戳 → undetermined（不拿文件 mtime 冒充）', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  writeTrace('888', 'nots.jsonl', new Date().toISOString(), CHAT_MODEL, 1000);
+  fs.appendFileSync(path.join(tracesDir, '888', 'nots.jsonl'),
+    `\n${JSON.stringify({ body: 'UNDATED WBC-PROBE-nots' })}\n`, 'utf8');
+  const r = await verifyMarker({ configRoot: cfg, marker: 'WBC-PROBE-nots', afterMs: Date.now() - 60_000 });
+  eq(r.verdict, 'undetermined', `无法判定时间时应为 undetermined：${r.reason}`);
+  ok(r.warnings.some((w) => /没有时间戳/.test(w)), '应说明原因');
+});
+
+await atest('引擎对头部通道不套用 token-delta 自动对照', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  const v = await engineB.verify('prompt.welcomemode-code', {});
+  eq(v.strategy, 'marker-trace-grep', '应走标记法');
+  ok(!v.capture, '不应产生 token-delta 的 capture');
+});
+
+await atest('没改过就验证 → undetermined（不是"未生效"）', async () => {
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  writeTrace('999', 'x.jsonl', new Date().toISOString(), CHAT_MODEL, 1000);
+  const v = await engineB.verify('prompt.welcomemode-work', {});
+  eq(v.verdict, 'undetermined', `从未 apply 过应判 undetermined，实际 ${v.verdict}：${v.reason}`);
+  ok(/还没有 apply 记录/.test(v.reason), `应说明原因：${v.reason}`);
 });
 
 // ══════════════ 汇总 ══════════════
