@@ -3,7 +3,23 @@
  * 令牌、API、DOM 工具、常量。无框架、无构建。
  */
 
-const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
+// 令牌从 URL 读一次，**立刻从地址栏抹掉**。
+// 为什么：?token= 会留在浏览器历史、可能被截图/分享/扩展读到。
+// 读进内存后用 history.replaceState 清掉，刷新时从 sessionStorage 恢复。
+// 这只是降低暴露面，不是加密——本地工具，威胁模型就是"别让令牌随手可见"。
+const TOKEN = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('token');
+  if (fromUrl) {
+    try { sessionStorage.setItem('wbc-token', fromUrl); } catch { /* 隐私模式忽略 */ }
+    const u = new URL(location.href);
+    u.searchParams.delete('token');
+    history.replaceState(null, '', u.pathname + (u.search === '?' ? '' : u.search) + u.hash);
+    return fromUrl;
+  }
+  try { return sessionStorage.getItem('wbc-token') ?? ''; } catch { return ''; }
+})();
+
+export function hasToken() { return TOKEN.length > 0; }
 
 export async function api(path, opts = {}) {
   const res = await fetch(path, {

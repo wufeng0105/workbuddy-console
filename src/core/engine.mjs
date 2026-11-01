@@ -378,8 +378,16 @@ export function createEngine({
     });
 
     const written = [];
+    const failed = [];
+    // 逐项 try/catch：中途失败时，前面已落盘的写入**必须**在审计里留下记录。
+    // 否则会出现"孤儿备份 + 无台账"——用户看不到自己有东西处于半写状态。
+    // 这与 replay() 的纪律一致：先记录发生了什么，再报告成败。
     for (const { h, next } of planned) {
-      written.push({ handle: h.id, ...(await h.apply(ctx, { next })) });
+      try {
+        written.push({ handle: h.id, ...(await h.apply(ctx, { next })) });
+      } catch (e) {
+        failed.push({ handle: h.id, code: e.code ?? 'ERR', message: e.message });
+      }
     }
 
     const expectedDeltaTokens = previews.reduce((s, p) => s + (p.expectedDeltaTokens ?? 0), 0);
@@ -389,6 +397,9 @@ export function createEngine({
       profileName: profile.name,
       backupId: manifest.id,
       handles: planned.map((p) => p.h.id),
+      written: written.map((w) => w.handle),
+      failed,
+      status: failed.length ? (written.length ? 'partial' : 'failed') : 'ok',
       files: [...targets.values()].map((t) => t.key),
       expectedDeltaTokens,
       actor,
@@ -398,6 +409,8 @@ export function createEngine({
       profile: profile.id,
       backupId: manifest.id,
       written,
+      failed,
+      status: failed.length ? (written.length ? 'partial' : 'failed') : 'ok',
       expectedDeltaTokens,
       previews,
       files: targets.size,
@@ -705,7 +718,7 @@ export function createEngine({
     if (lv.ruleOp) {
       try {
         const r = await rulesH.apply(ctx, {
-          next: { ...lv.ruleOp, actions: lv.ruleOp.actions },
+          next: { ...lv.ruleOp },
         });
         done.push({ face: 'rules', ok: true, changed: r.changed ?? null });
       } catch (e) {

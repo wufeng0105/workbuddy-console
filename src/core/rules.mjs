@@ -130,12 +130,24 @@ export function writeDomainRules(settingsText, domain, rules) {
   if (!span) throw new ConsoleError('SETTINGS_UNWRITABLE', '无法定位域对象范围');
 
   const inner = settingsText.slice(span.start + 1, span.end - 1);
-  const rulesRe = /("rules"\s*:\s*)\[[\s\S]*?\]/;
-  const rm = rulesRe.exec(inner);
+
+  // 定位 rules 数组：先找 `"rules":`，再用**花括号配对**（跳过字符串）找它对应的 `]`。
+  //
+  // 为什么不用 /\[[\s\S]*?\]/ 非贪婪匹配：规则里的 path 可能含 `]`（如 `~/[x]/`），
+  // 非贪婪会在第一个 `]` 处提前收尾，把数组截断——那会写坏 settings.json。
+  // findObjectSpan 会正确跳过字符串内部、并处理嵌套，是这里唯一安全的定位方式。
+  const keyRe = /("rules"\s*:\s*)\[/;
+  const km = keyRe.exec(inner);
   const rulesJson = JSON.stringify(rules);
-  const newInner = rm
-    ? inner.slice(0, rm.index) + rm[1] + rulesJson + inner.slice(rm.index + rm[0].length)
-    : `${inner.replace(/\s+$/, '')},\n  "rules": ${rulesJson}\n`;
+  let newInner;
+  if (km) {
+    const bracketIdx = km.index + km[1].length;
+    const arr = findObjectSpan(inner, bracketIdx);
+    if (!arr) throw new ConsoleError('SETTINGS_UNWRITABLE', '无法定位 rules 数组范围（括号不配对）');
+    newInner = inner.slice(0, bracketIdx) + rulesJson + inner.slice(arr.end);
+  } else {
+    newInner = `${inner.replace(/\s+$/, '')},\n  "rules": ${rulesJson}\n`;
+  }
 
   // 顺带把 customized 也叫醒（若存在该字段）
   const withCustomized = /"customized"\s*:\s*(true|false)/.test(newInner)

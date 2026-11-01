@@ -17,6 +17,7 @@ import { register } from './core/registry.mjs';
 import { assertHandle } from './core/contracts.mjs';
 import { storeRoot as defaultStoreRoot, ensureDir, tildify } from './core/paths.mjs';
 import { sha256 } from './core/backup.mjs';
+import { readAudit } from './core/audit.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -1512,6 +1513,113 @@ await atest('verifyApproval：无重启/无新请求时如实报 undetermined，
   eq(r.verdict, 'undetermined', `应为 undetermined：${r.reason}`);
   ok(r.parts.length === 2, '应给出两面各自的结论');
   ok(/永远不可能被完全验证/.test(r.caveat), '必须带那句免责说明');
+});
+
+// ══════════════ 审计修复回归（2026-11-01 只读审计发现的问题）══════════════
+//
+// 这一节守的是"审计发现 → 修复 → 不再复发"。
+// 每条断言都对应一个真实缺陷，不是假想场景。
+
+await atest('DRIFT_KINDS 覆盖 replay 实际产出的所有漂移 kind', async () => {
+  // 教训：文档写「漂移 5 类」，DRIFT_KINDS 只冻了 4 类，而 replay 实际产出第 5 类
+  // （target-missing）。分类常量与实际产出不同源 = 违反本项目自己的状态契约。
+  const { DRIFT_KINDS } = await import('./core/contracts.mjs');
+  const src = fs.readFileSync(new URL('./core/replay.mjs', import.meta.url), 'utf8');
+  const produced = new Set();
+  for (const m of src.matchAll(/kind:\s*'([a-z-]+)'/g)) produced.add(m[1]);
+  ok(produced.size > 0, '应至少抓到一个 kind');
+  // unchanged / handle-missing 是"无需动作"的结果，不属于漂移分类
+  const ignore = new Set(['unchanged', 'handle-missing']);
+  const real = [...produced].filter((k) => !ignore.has(k));
+  const frozen = new Set(DRIFT_KINDS);
+  const missing = real.filter((k) => !frozen.has(k));
+  eq(missing.length, 0, `这些 kind 产出了但未进 DRIFT_KINDS：${missing.join(', ')}`);
+  ok(real.includes('target-missing'), 'target-missing 必须仍被 replay 产出（否则覆盖检查失去意义）');
+});
+
+await atest('applyProfile 部分失败：仍写审计且带 status/written/failed', async () => {
+  // 教训：原来循环裸 await，第二个把手抛错时第一个已落盘，
+  // 但 appendAudit 在循环之后永不执行 → 孤儿备份 + 无台账。
+  const aFile = path.join(fixtureRoot, 'partial-a.txt');
+  const bFile = path.join(fixtureRoot, 'partial-b.txt');
+  fs.writeFileSync(aFile, 'A');
+  fs.writeFileSync(bFile, 'B');
+
+  register({
+    id: 'test.partial-a',
+    title: '事务测试 A',
+    target: 'test.partial-a',
+    resolveTarget: () => ({ key: 'test.partial-a', path: aFile }),
+    writeClass: 'user-data',
+    channel: 'request-tail',
+    privilege: 'none',
+    upgradeBehavior: 'survives',
+    verification: { strategy: 'token-delta', channel: 'request-tail', baseline: 'session-first', assertion: 'delta-tokens' },
+    async probe() { return { exists: true, path: aFile, text: 'A' }; },
+    async preview() { return { expectedDeltaTokens: 10 }; },
+    async apply() { fs.writeFileSync(aFile, 'A2'); return { changed: true }; },
+  });
+  register({
+    id: 'test.partial-b',
+    title: '事务测试 B',
+    target: 'test.partial-b',
+    resolveTarget: () => ({ key: 'test.partial-b', path: bFile }),
+    writeClass: 'user-data',
+    channel: 'request-tail',
+    privilege: 'none',
+    upgradeBehavior: 'survives',
+    verification: { strategy: 'token-delta', channel: 'request-tail', baseline: 'session-first', assertion: 'delta-tokens' },
+    async probe() { return { exists: true, path: bFile, text: 'B' }; },
+    async preview() { return { expectedDeltaTokens: 20 }; },
+    async apply() { throw Object.assign(new Error('人为失败'), { code: 'BOOM' }); },
+  });
+
+  const eTx = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+  const { writeProfile } = await import('./core/profiles.mjs');
+  const p = writeProfile(store, {
+    id: 'selftest-partial',
+    name: '部分失败档位',
+    values: { 'test.partial-a': 'A2', 'test.partial-b': 'B2' },
+  });
+  const r = await eTx.applyProfile(p.id, { confirm: true });
+
+  eq(r.status, 'partial', `应为 partial，实际 ${r.status}`);
+  eq(r.written.map((w) => w.handle).join(','), 'test.partial-a', '成功项应只有 A');
+  eq(r.failed.map((x) => x.handle).join(','), 'test.partial-b', '失败项应只有 B');
+  ok(r.backupId, '仍必须有备份 id（备份已先做）');
+
+  const au = readAudit(store).filter((x) => x.event === 'apply-profile').at(-1);
+  ok(au, '审计必须存在 —— 这正是"孤儿备份"的防线');
+  eq(au.status, 'partial', '审计必须记下 partial');
+  eq(au.failed.length, 1, '审计里必须有失败清单');
+});
+
+await atest('writeDomainRules 定点替换：path 含 ] 时仍能正确收尾', async () => {
+  // 教训：原来用 /\[[\s\S]*?\]/ 非贪婪匹配，path 含 ']' 会在第一个 ']' 处提前收尾，
+  // 把数组截断 → 写坏 settings.json。改用花括号配对（跳过字符串）。
+  const { writeDomainRules } = await import('./core/rules.mjs');
+  const settings = `{
+    "sandbox": {
+        "orderedRules": {
+            "file": {"presetVersion": 4, "customized": false, "rules": [
+                {"id":"r1","path":"~/[x]/","read":"ask","write":"ask","delete":"ask"}
+            ]},
+            "command": {"rules": []}
+        }
+    },
+    "other": 1
+}`;
+  const rules = [{ id: 'r1', path: '~/[x]/', read: 'allow', write: 'allow', delete: 'ask' }];
+  const res = writeDomainRules(settings, 'file', rules);
+  ok(res.mode === 'targeted', `应走 targeted 分支，实际 ${res.mode}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(res.text);
+  } catch (err) {
+    throw new Error(`写出的 JSON 非法（说明数组被提前截断）：${err.message}`);
+  }
+  eq(parsed.sandbox.orderedRules.file.rules[0].read, 'allow', '规则应已更新');
+  eq(parsed.other, 1, '数组之后的兄弟字段必须完好（截断会吃掉它）');
 });
 
 // ══════════════ 汇总 ══════════════

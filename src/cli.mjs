@@ -222,7 +222,7 @@ async function main(argv) {
         console.log(`  基线  ${b.at}  worker=${b.worker}  ${b.promptTokens} tokens  [${b.model}]`);
         console.log(`  观测  ${o.at}  worker=${o.worker}  ${o.promptTokens} tokens  [${o.model}]`);
         console.log(`  实测增量  ${d >= 0 ? '+' : ''}${d} tokens`);
-        console.log(`  已排除非聊天请求（标题生成等）：${r.evidence.excludedNonChat} 条`);
+        console.log(`  已排除非聊天样本（标题生成 / 其它模型）：${r.evidence.excludedSamples ?? 0} 条`);
       }
       for (const w of (r.warnings ?? [])) console.log(`\n⚠️  ${w}`);
       if (r.hint) console.log(`\n${r.hint}`);
@@ -460,8 +460,9 @@ async function main(argv) {
     case 'approval-apply': {
       const r = await engine.applyApproval(f._[1], { confirm: f.confirm === true });
       if (json) return out(r, true);
-      if (!r.changed === false && r.files === 0) {
-        console.log(`✅ ${r.note ?? '无需改动'}`);
+      // 无改动：applyApproval 会返回 files=0 且不带 backupId
+      if (!r.changed && !r.backupId) {
+        console.log(`✅ ${r.note ?? '无需改动（当前档位与目标一致）'}`);
         return undefined;
       }
       const badge = r.failed > 0 ? (r.ok > 0 ? '⚠️ ' : '❌') : '✅';

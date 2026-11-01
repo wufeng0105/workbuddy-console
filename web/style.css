@@ -4,7 +4,9 @@
    调性：工业化、克制、数据优先。颜色只用来标示状态。
    ══════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+SC:wght@300;400;500;600&display=swap');
+/* 字体：只用系统栈，不引远程。
+   这是本地特权工具 —— 一次外网字体请求与「依赖树越小越容易审计」的姿态相悖，
+   而且离线时会拖慢首屏。Windows 自带的 YaHei / Cascadia Mono 质量足够。 */
 
 :root {
   --bg:        #f6f7f9;
@@ -28,8 +30,8 @@
   --accent:    #2563eb;
   --accent-bg: #eef3fe;
 
-  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
-  --sans: "IBM Plex Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", ui-monospace, Consolas, "Courier New", monospace;
+  --sans: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 
   --r: 6px;
   --shadow: 0 1px 2px rgba(16,21,27,.04), 0 4px 12px rgba(16,21,27,.03);

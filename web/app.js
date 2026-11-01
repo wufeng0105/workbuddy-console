@@ -6,7 +6,7 @@
  */
 
 import {
-  api, el, $, clear, esc, fmtTime, fmtAgo, fmtNum,
+  api, el, $, clear, esc, fmtTime, fmtAgo, fmtNum, hasToken,
   GROUPS, groupOf, VERDICT, EVENT_META, BOUNDARY,
 } from './core.js';
 
@@ -43,7 +43,7 @@ const S = {
 /* ══════════════ 启动 ══════════════ */
 
 async function boot() {
-  if (!new URLSearchParams(location.search).get('token')) {
+  if (!hasToken()) {
     document.body.innerHTML = '<div class="boot-err">缺少会话令牌 —— 请使用启动时打印的带 token 的 URL。</div>';
     return;
   }

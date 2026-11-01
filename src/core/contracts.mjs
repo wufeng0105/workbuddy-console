@@ -32,6 +32,7 @@ export const DRIFT_KINDS = Object.freeze([
   'value-changed',   // 值已变：被外部改动（如 toneStyle）
   'vendor-restored', // 厂商已还原：升级覆盖了定制
   'mode-dependent',  // 模式相关失效：同一文件在不同模式下可达性不同（如 IDENTITY.md 在专家模式不注入）
+  'target-missing',  // 目标文件不存在：升级可能清理了它（由 replay.detectDrift 产出）
 ]);
 
 // ── 契约 3 · 边界 ────────────────────────────────────────────────

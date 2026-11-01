@@ -101,10 +101,7 @@ export function previewApproval({ level, rulesProbe, promptText, promptTitle }) 
     detail: applied.changed
       ? `去掉第 ${applied.dropped.join('/')} 条，保留第 ${applied.kept.join('/')} 条（现档位：${current.level} → ${lv.promptLevel}）`
       : `无需改动（现档位已是 ${current.level}）`,
-    droppedRules: applied.dropped.map((n) => {
-      const r = applied.before.includes(n) ? n : n;
-      return r;
-    }),
+    droppedRules: applied.dropped,
     verify: 'marker-trace-grep（只能证明"文本进了请求"，**证明不了"模型不再问"**）',
     note: '⚠️ 这一面**无法保证**：若"模型问"来自模型自身对齐，改提示词无效。',
     warnings: applied.warnings,
