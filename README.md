@@ -89,7 +89,7 @@ node src/cli.mjs restore <backupId>
 
 **设计阶段。** 契约与文档已定，实现未开始。分期见 `docs/product.md`（竖切优先：先用一个把手把验证器打通）。
 
-## 关于 `historicalsource/`
+## 关于 `recon-baseline/`
 
 该目录是**历史侦察资料（已冻结）**，含对 WorkBuddy 客户端的行为侦察结论、证据与脚本。
 

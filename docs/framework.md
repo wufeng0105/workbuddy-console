@@ -220,7 +220,7 @@ WorkBuddy 升级
 │  ├─ anchors/            锚点表（按 WorkBuddy 版本）
 │  └─ verify/             验证策略实现
 ├─ web/                   前端静态页
-└─ historicalsource/      历史侦察资料（冻结、只读、不进文档引用链以外）
+└─ recon-baseline/      历史侦察资料（冻结、只读、不进文档引用链以外）
 ```
 
 **用户数据不在仓库内**（铁律 4）：
@@ -236,7 +236,7 @@ WorkBuddy 升级
 
 | 决定 | 内容 | 理由 |
 |---|---|---|
-| 后端 | **Node**（原生 ESM，无构建链） | 直接复用侦察期 `historicalsource/scripts/` 的 asar / CDP 能力；Windows 原生 |
+| 后端 | **Node**（原生 ESM，无构建链） | 直接复用侦察期 `recon-baseline/tools/` 的 asar / CDP 能力；Windows 原生 |
 | 前端 | **原生 ESM 单页**，不引框架 | 本地**特权**工具：依赖树越小，越容易审计 |
 | 通信 | 本地回环 + 随机端口 + 一次性 token | 借 WorkBuddy 自己 sidecar 的鉴权模式（`randomBytes(32)` + Bearer） |
 | 部署 | **无部署**——单机单用户 | 不做 Web 服务，绝不监听 `0.0.0.0` |

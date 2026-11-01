@@ -2,7 +2,7 @@
 
 > 本文件是 agent 在本仓库作业的**工程期运行契约**，每次会话自动加载。只写使命、铁律、地图与引用；过程性内容一律外置到 `docs/`。
 >
-> **历史侦察契约已冻结**：`historicalsource/RECON-CONTRACT.md`（不再生效，除非被本文件显式引用）。侦察期的"全权授权"记录随之失效，**不再沿用**。
+> **历史侦察已归档**：`recon-baseline/`（2026-11-01 整理；主线、术语、分篇索引见其 `OUTLINE.md`）。侦察期的"全权授权"记录随之失效，**不再沿用**。
 
 ## 使命
 
@@ -56,18 +56,18 @@
 | `src/` | 框架实现：Core（契约 / 锚点 / 备份 / 引擎 / trace）+ 把手 + 验证策略 + CLI + 本地服务端 |
 | `web/` | 控制台前端（原生 ESM，无构建；`node src/cli.mjs serve` 启动） |
 | `docs/ledger.md` | **开发期写操作台账**——动真实 WorkBuddy 文件前后必须回填 |
-| `historicalsource/` | **历史侦察资料（冻结）**——五层地图、证据、脚本。只读参考，不修改 |
+| `recon-baseline/` | **历史侦察资料（冻结）**——五层地图、证据、脚本。只读参考，不修改 |
 
 ## 引用索引
 
 - **动手前先读**：`docs/product.md` → `docs/framework.md`
 - **遇到与冻结资料冲突**：以 `docs/recon-amendments.md` 为准（**唯一修正入口**；已登记 1 条推翻 + 4 条新增约束 + 2 条数值/证据存疑）
-- **改任何事实性断言前**：核对 `historicalsource/docs/experiments.md` 的**结论修正史**
-  ⚠️ 该文件 `:48` 与 `:85` 仍留有**已被其自身 `:50` 终审覆盖**的中间判定（`customPrompt`「无 LLM 效力」）——**以 `## 结论修正史` 终审段为准：`customPrompt` 与 `toneStyle` 均有效（+1151）**
-- **把手现状与证据**：`historicalsource/docs/` 六篇层 findings
-- **代码级证据**：`historicalsource/evidence/asar-extract`（asar 提取副本，438 文件）
-- **可复用脚本**：`historicalsource/scripts/`（asar 头解析/定位/提取、CONNECT 记录代理、CDP 探针）
-- **历史写操作审计**：`historicalsource/docs/ledger.md`
+- **改任何事实性断言前**：核对 `recon-baseline/findings/10-experiments.md` 的**结论修正史**
+  ⚠️ 整理版已把作废判定就地标注（修正 1「customPrompt / toneStyle 不进 LLM」已作废）——**别引用侦察期原始判断。以 `findings/10-experiments.md` 与 `docs/recon-amendments.md` 为准：`customPrompt` 与 `toneStyle` 均有效**
+- **把手现状与证据**：`recon-baseline/findings/` 六篇层 findings
+- **代码级证据**：`recon-baseline/evidence/asar-extract`（asar 提取副本，438 文件）
+- **可复用脚本**：`recon-baseline/tools/`（asar 头解析/定位/提取、CONNECT 记录代理、CDP 探针）
+- **历史写操作审计**：`recon-baseline/findings/11-ledger.md`
 
 ## 已知踩坑（不得重犯）
 

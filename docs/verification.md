@@ -11,7 +11,7 @@
 - **我们写完文件，不知道它有没有进 LLM**——提示词进了请求**尾段**，而 trace **截断在 20003 字符**
   （`20003` 是**该次观测值，不是代码常量**——全库搜不到。结论靠"尾段必须用 token 增量法"这条**方法论**，不靠这个数字）
 
-侦察期为回答这一个问题付出的代价（留档于 `historicalsource/docs/experiments.md` 修正史 #1）：
+侦察期为回答这一个问题付出的代价（留档于 `recon-baseline/findings/10-experiments.md` 修正史 #1）：
 
 1. 标记写进了**错的存储**（`settings.json` ≠ `app-config.json`）→ 注入从未生效
 2. 用 trace grep 找**尾段**通道 → **天然失明**，误判"不进 LLM"

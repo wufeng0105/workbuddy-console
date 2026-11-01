@@ -4,7 +4,7 @@
 > **这是产品的实际待办**（对应 `product.md` 的分期）。
 >
 > 状态图例：✅ 已实证 ｜ 🟡 部分实证 / 待实测 ｜ ⬜ 未实测 ｜ ❌ 已禁用或移出范围
-> 证据出处均指 `historicalsource/`（冻结的历史侦察资料）。
+> 证据出处均指 `recon-baseline/`（冻结的历史侦察资料）。
 
 ## 一、提示词层 · 静态
 
@@ -57,7 +57,7 @@
 | 人设设定 | `SOUL.md` | ✅ |
 | 长期记忆 | `memory/` + 双开关 | ❌ 禁用 |
 
-> ⚠️ **界面显示的"当前值"才是数据源。** 实测截图回复风格 = **高效务实（`efficient`）**，而 `historicalsource/docs/tone-styles.md` 记的是 `creative`。
+> ⚠️ **界面显示的"当前值"才是数据源。** 实测截图回复风格 = **高效务实（`efficient`）**，而 `recon-baseline/findings/08-tone-styles.md` 记的是 `creative`。
 > **文档是快照，会失真**——工具里的任何"当前值"必须现读。
 
 ## 五、提示词层的具体条款（P2 目标）

@@ -719,7 +719,7 @@ await atest('采集档位：从当前实际状态吸回源（chezmoi 的 re-add 
 await atest('档位存进用户数据目录，不在仓库内', async () => {
   const f = path.join(store, 'profiles', 'selftest-a.json');
   ok(fs.existsSync(f), `档位文件应在 ${f}`);
-  ok(!f.includes('historicalsource'), '不应落在历史目录');
+  ok(!f.includes('recon-baseline'), '不应落在历史目录');
 });
 
 // 把现状改成 Y，再切回档位 A

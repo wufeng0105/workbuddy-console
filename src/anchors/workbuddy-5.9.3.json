@@ -9,7 +9,7 @@
     "personal.dir": {
       "glob": "user-*-personal",
       "kind": "dir",
-      "evidence": "historicalsource/docs/personalization.md E7-2：UI 写入唯一落点"
+      "evidence": "recon-baseline/findings/07-personalization.md E7-2：UI 写入唯一落点"
     },
     "personal.soul": {
       "dirGlob": "user-*-personal",

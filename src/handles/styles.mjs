@@ -1,7 +1,7 @@
 /**
  * 七档 style 内容把手 —— 一个档位一个把手（安装目录的厂商文件）。
  *
- * 中文名对应关系来自 `historicalsource/docs/tone-styles.md`（七档映射表）。
+ * 中文名对应关系来自 `recon-baseline/findings/08-tone-styles.md`（七档映射表）。
  * 与 `personalization.tone-style`（**选哪一档**）区分：这里管的是**每档的内容**。
  */
 
