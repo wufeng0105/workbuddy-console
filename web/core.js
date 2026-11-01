@@ -99,7 +99,7 @@ export const fmtNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n.to
 /** 把手按"心智"分组，不按数据结构 */
 export const GROUPS = [
   { key: 'identity', title: '身份与人格', prefix: 'personalization.', note: '用户目录 · 零提权 · 升级存活' },
-  { key: 'style', title: '风格内容', prefix: 'style.', note: '安装目录 · 需逐次确认 · 升级疑失效' },
+  { key: 'style', title: '风格内容', prefix: 'style.', note: '安装目录 · 原厂参考件 · 升级可能覆盖' },
   { key: 'prompt', title: '提示词模板', prefix: 'prompt.', note: '请求头部通道 · 标记法验证' },
   { key: 'rules', title: '行为规则', prefix: 'rules.', note: '结构化操作 · 需重启生效' },
 ];

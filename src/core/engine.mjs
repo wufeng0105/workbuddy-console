@@ -8,8 +8,10 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createResolver } from './anchor.mjs';
-import { createBackup, restoreBackup, listBackups } from './backup.mjs';
+import { createBackup, restoreBackup, listBackups, sha256 } from './backup.mjs';
 import { appendAudit, readAudit } from './audit.mjs';
 import { diffLines, renderDiff } from './diff.mjs';
 import { estimateCost } from './tokens.mjs';
@@ -929,12 +931,174 @@ export function createEngine({
     };
   }
 
+  // ── 最初基线（版本化账本）──────────────────────────────────
+  // 每个 WorkBuddy 版本一套账：baselines/5.9.3(d4692421).json。
+  // 同版账本捕获一次不可覆盖；升级出新版 → 新版另立一本，旧账永不被动。
+  // 条目三类：text（整文件把手）/ value（json 字段把手，只存字段值）/ file（规则矩阵共享文件）。
+
+  const baselinesDir = () => path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'baselines');
+
+  /** 旧位置（storeRoot/baselines、storeRoot/baseline.json）→ 项目目录 baselines/ 的迁移 */
+  function migrateStoreBaselines(key) {
+    const legacyDir = path.join(storeRoot, 'baselines');
+    const legacyFile = path.join(storeRoot, 'baseline.json');
+    const target = ledgerFile(key);
+    if (fs.existsSync(legacyDir)) {
+      for (const f of fs.readdirSync(legacyDir).filter((x) => x.endsWith('.json'))) {
+        const t = path.join(baselinesDir(), f);
+        if (!fs.existsSync(t)) {
+          fs.mkdirSync(baselinesDir(), { recursive: true });
+          fs.renameSync(path.join(legacyDir, f), t);
+        }
+      }
+      try { fs.rmdirSync(legacyDir); } catch { /* 非空则保留 */ }
+    }
+    if (fs.existsSync(legacyFile) && !fs.existsSync(target)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(legacyFile, 'utf8'));
+        data.versionKey = key;
+        fs.mkdirSync(baselinesDir(), { recursive: true });
+        fs.writeFileSync(target, JSON.stringify(data, null, 2), 'utf8');
+        fs.rmSync(legacyFile);
+      } catch { /* 迁移失败不影响捕获 */ }
+    }
+  }
+
+  /** 版本键：版本(构建哈希)。哈希取自插件缓存目录名（…-wb.x.gd4692421.h… → d4692421）；取不到退化为纯版本号 */
+  function versionKey() {
+    const v = version ?? '?';
+    const ids = registry.list();
+    for (const h of ids.filter((x) => x.id.startsWith('prompt.')).concat(ids)) {
+      try {
+        const p = String(anchorFor(h)?.path ?? '');
+        const m = p.match(/(\d+\.\d+\.\d+)-wb\.[^.]+\.g([0-9a-f]+)\./) ?? p.match(/\.g([0-9a-f]{8,})\./);
+        if (m) return `${m[1] ?? v}(${m[2]})`;
+      } catch { /* 逐把手尝试 */ }
+    }
+    return `${v}`;
+  }
+
+  const ledgerFile = (key) => path.join(baselinesDir(), `${key}.json`);
+
+  function readLedger(key) {
+    try { return JSON.parse(fs.readFileSync(ledgerFile(key), 'utf8')); } catch { return null; }
+  }
+
+  async function captureBaseline() {
+    const key = versionKey();
+    migrateStoreBaselines(key);
+    const file = ledgerFile(key);
+    if (fs.existsSync(file)) {
+      return { ...readLedger(key), note: `账本 ${key} 已存在，未覆盖（同版最初快照不可修改）` };
+    }
+    const entries = {};
+    for (const h of registry.list()) {
+      let st;
+      try { st = await h.probe(ctx); } catch { continue; }
+      if (!st?.exists) continue;
+      if (h.inputKind === 'rule-op') {
+        // 三个规则域共享一个 settings 文件 —— 一份文件级条目，三张卡共用
+        const ekey = `rules:${h.target}`;
+        if (!entries[ekey]) {
+          entries[ekey] = { kind: 'file', anchorKey: h.target, content: st.text ?? '', sha256: sha256(Buffer.from(st.text ?? '', 'utf8')) };
+        }
+        continue;
+      }
+      if (st.value !== undefined && st.value !== null && st.value !== '') {
+        entries[h.id] = { kind: 'value', content: String(st.value), sha256: sha256(Buffer.from(String(st.value), 'utf8')) };
+        continue;
+      }
+      entries[h.id] = { kind: 'text', content: st.text ?? '', sha256: sha256(Buffer.from(st.text ?? '', 'utf8')) };
+    }
+    const out = { versionKey: key, capturedAt: new Date().toISOString(), version: 1, entries };
+    fs.mkdirSync(baselinesDir(), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(out, null, 2), 'utf8');
+    return out;
+  }
+
+  function baselineInfo() {
+    const key = versionKey();
+    const dir = baselinesDir();
+    const ledgers = [];
+    let current = null;
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.json'))) {
+        try {
+          const d = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+          const k = d.versionKey ?? f.replace(/\.json$/, '');
+          const item = { versionKey: k, capturedAt: d.capturedAt, count: Object.keys(d.entries ?? {}).length, isCurrent: k === key };
+          ledgers.push(item);
+          if (item.isCurrent) current = d;
+        } catch { /* 跳过坏文件 */ }
+      }
+    }
+    if (!current) return { available: false, versionKey: key, ledgers };
+    const entries = {};
+    for (const [k, v] of Object.entries(current.entries)) {
+      entries[k] = { kind: v.kind, sha256: v.sha256, chars: v.content ? v.content.length : 0 };
+    }
+    return { available: true, versionKey: key, capturedAt: current.capturedAt, entries, ledgers };
+  }
+
+  /** 还原最初设置：把**当前版本账本**的快照写回。写前必备份（铁律 1）；闸门不满足即拒绝。 */
+  async function restoreBaseline(id) {
+    const key = versionKey();
+    const b = readLedger(key);
+    if (!b) throw new ConsoleError('NO_BASELINE', `当前版本 ${key} 还没有账本——先建立本版账本`);
+    const h = registry.get(id);
+    let entry = b.entries[id];
+    if (!entry && h.inputKind === 'rule-op') entry = b.entries[`rules:${h.target}`];
+    if (!entry) throw new ConsoleError('NO_BASELINE', `把手 ${id} 在 ${key} 账本中没有快照`, { id });
+
+    const g = gateCheck(h);
+    if (g.blocked) throw new GateBlockedError(g.reason, { handle: h.id, gate: g.kind });
+
+    const st = await h.probe(ctx);
+    if (!st?.exists || !st.path) throw new ConsoleError('ANCHOR_MISSING', `把手 ${id} 的锚点当前无法定位`, { id });
+
+    const manifest = createBackup({
+      storeRoot, actor,
+      reason: `restore-baseline ${id}`,
+      entries: [{ key: h.target, absPath: st.path }],
+    });
+
+    let changed = false;
+    if (entry.kind === 'file') {
+      if ((st.text ?? '') !== entry.content) {
+        fs.writeFileSync(st.path, entry.content, 'utf8');
+        changed = true;
+      }
+    } else {
+      const cur = entry.kind === 'value'
+        ? (st.value !== undefined && st.value !== null ? String(st.value) : '')
+        : (st.text ?? '');
+      if (cur !== entry.content) {
+        await h.apply(ctx, { next: entry.content });
+        changed = true;
+      }
+    }
+
+    appendAudit(storeRoot, {
+      event: 'restore',
+      handle: id,
+      anchor: h.target,
+      backupId: manifest.id,
+      bytesBefore: Buffer.byteLength(st.text ?? '', 'utf8'),
+      actor,
+      reason: 'restore-baseline',
+    });
+    return { handle: id, changed, backupId: manifest.id, kind: entry.kind, ledger: key };
+  }
+
   return {
     resolver, ctx,
     probe, plan, apply, verify, restore, backups, audit, doctor,
+    // 最初基线
+    baselineCapture: captureBaseline, baseline: baselineInfo, baselineRestore: restoreBaseline,
     // 专家档位
     captureProfile, planProfile, applyProfile, verifyProfile,
     profiles: () => listProfiles(storeRoot),
+    profileDetail: (id) => readProfile(storeRoot, id),
     removeProfile: (id) => deleteProfile(storeRoot, id),
     // 版本重放（演进契约）
     captureBundle, checkDrift, replay,

@@ -65,6 +65,13 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
   const engine = createEngine({ configRoot, storeRoot, version, actor: 'web' });
   const token = crypto.randomBytes(24).toString('base64url');
 
+  // 启动时补建「最初基线」——只在缺失时捕获，绝不覆盖（不可修改语义）
+  engine.baselineCapture().then((b) => {
+    console.log(b.note ?? `最初基线已就绪（${Object.keys(b.entries ?? {}).length} 项，${b.capturedAt}）`);
+  }).catch((e) => {
+    console.error('最初基线建立失败：', e.message);
+  });
+
   /** @param {string} pathname */
   async function dispatch(pathname, method, body, url) {
     if (pathname === '/api/doctor' && method === 'GET') return engine.doctor();
@@ -76,9 +83,18 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
     if (pathname === '/api/restore' && method === 'POST') {
       return engine.restore(String(body.backupId ?? ''), { dryRun: body.dryRun === true });
     }
+    // ── 最初基线 ──
+    if (pathname === '/api/baseline' && method === 'GET') return engine.baseline();
+    if (pathname === '/api/baseline/capture' && method === 'POST') return engine.baselineCapture();
+    if (pathname === '/api/baseline/restore' && method === 'POST') {
+      return engine.baselineRestore(String(body.id ?? ''));
+    }
 
     // ── 专家档位（多把手事务）──
     if (pathname === '/api/profiles' && method === 'GET') return engine.profiles();
+    if (pathname.startsWith('/api/profiles/') && method === 'GET') {
+      return engine.profileDetail(decodeURIComponent(pathname.slice('/api/profiles/'.length)));
+    }
     if (pathname === '/api/profiles/save' && method === 'POST') {
       return engine.captureProfile({
         name: String(body.name ?? ''),
