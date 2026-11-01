@@ -7,7 +7,7 @@
  */
 
 import {
-  api, el, $, clear, esc, fmtTime, fmtAgo, fmtNum, hasToken,
+  api, el, $, clear, esc, fmtTime, fmtNum, hasToken,
   GROUPS, VERDICT, EVENT_META, BOUNDARY,
 } from './core.js';
 
@@ -102,7 +102,6 @@ function render() {
   const app = $('app');
   clear(app);
   app.append(topnav(), page());
-  renderSwitcherIfProto();
 }
 
 /* ── 壳：顶部横向导航（56px，白底发丝线下边） ── */
@@ -1454,6 +1453,5 @@ function boundaryWork() {
 
 /* ══════════════ 工具 ══════════════ */
 
-function renderSwitcherIfProto() { /* 正式版无切换条 */ }
 
 boot();

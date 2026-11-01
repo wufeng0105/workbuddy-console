@@ -196,8 +196,6 @@ h1, h2, h3 { margin: 0; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
 .dot[data-s="ok"]  { background: var(--ok); }
-.dot[data-s="bad"] { background: var(--bad); }
-.dot[data-s="warn"]{ background: var(--warn); }
 
 /* ══════════════ 总览 · 最近动态（台账表） ══════════════ */
 
@@ -266,7 +264,6 @@ h1, h2, h3 { margin: 0; }
 /* ══════════════ 个性化 · 向导折叠卡（设计稿 customize 页） ══════════════ */
 
 .hero-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.hero-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); padding-top: 6px; flex-shrink: 0; }
 
 .accgroup { margin-bottom: 24px; }
 .sec-row {
@@ -315,52 +312,13 @@ h1, h2, h3 { margin: 0; }
 .acc-sub .mono { font-size: 11.5px; }
 .acc-side { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 
-/* 向导步骤条 */
-.stepper {
-  position: relative;
-  margin: 20px 20px 0; padding: 18px 24px 14px;
-  border: 1px solid var(--line); border-radius: var(--r);
-  display: flex; justify-content: space-between;
-}
-.stepper-line {
-  position: absolute; left: 3.5%; right: 3.5%;
-  top: 33px; height: 2px; background: var(--line);
-}
-.stepper-fill {
-  position: absolute; left: 3.5%; top: 33px; height: 2px;
-  background: var(--accent); transition: width .2s;
-}
-.stepper-item {
-  position: relative; z-index: 1;
-  display: flex; flex-direction: column; align-items: center; gap: 8px;
-}
-.stepper-dot {
-  width: 32px; height: 32px; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-family: var(--mono); font-size: 13px; font-weight: 500;
-  background: var(--gray-bg); border: 1px solid #dce3ee; color: var(--ink-2);
-}
-.stepper-item[data-s="cur"] .stepper-dot {
-  background: var(--accent); border-color: var(--accent); color: #fff;
-  font-weight: 600; box-shadow: 0 0 0 4px var(--accent-bg);
-}
-.stepper-item[data-s="done"] .stepper-dot {
-  background: var(--ok); border-color: var(--ok); color: #fff;
-}
-.stepper-label { font-size: 13px; color: var(--ink-2); }
-.stepper-item[data-s="cur"] .stepper-label,
-.stepper-item[data-s="done"] .stepper-label { color: var(--ink); font-weight: 500; }
-.stepper-sub { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
-
-/* 步骤内容区 */
+/* 展开卡内容区 */
 .wiz-body { padding: 20px; }
 .step-title {
   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
   font-size: 14px; font-weight: 600; margin-bottom: 12px;
 }
 .step-title .note { font-size: 12px; font-weight: 400; color: var(--ink-3); }
-.step-block { padding-top: 4px; }
-.step-block + .step-block { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line-2); }
 .step-foot-note { font-size: 12px; color: var(--ink-3); }
 
 /* ══════════════ 档位 · 卡墙（设计稿 profiles 页） ══════════════ */
@@ -517,13 +475,7 @@ h1, h2, h3 { margin: 0; }
 
 @media (max-width: 760px) {
   .hero-row { flex-direction: column; }
-  .stepper-label, .stepper-sub { display: none; }
 }
-
-
-
-
-
 
 .empty { color: var(--ink-3); padding: 60px 0; text-align: center; font-size: 13px; }
 
@@ -546,12 +498,9 @@ h1, h2, h3 { margin: 0; }
   padding: 8px 13px; margin-bottom: 7px; border-radius: 0 var(--r-sm) var(--r-sm) 0;
   color: var(--warn-ink); font-size: 12px; line-height: 1.6;
 }
-.warn-soft { border-left-color: var(--ink-4); background: var(--hover); color: var(--ink-2); }
 .hint { color: var(--ink-3); font-size: 11.5px; margin-top: 10px; line-height: 1.6; }
-.ok-line { color: var(--ok); font-size: 12.5px; }
+
 .warn-t { color: var(--warn); }
-.bad-t { color: var(--bad); }
-.ok-t { color: var(--ok); }
 
 .callout {
   background: var(--accent-bg); border-left: 3px solid var(--accent);
@@ -619,7 +568,6 @@ h1, h2, h3 { margin: 0; }
 .plan-line code { font-size: 12px; color: var(--ink); }
 .plan-line code.hl { color: var(--accent); font-weight: 500; }
 .plan-line code.bad { color: var(--bad); }
-.arrow { color: var(--ink-4); }
 
 /* 三态验证 —— 三件套缺一不可，无法判定永不显示为成功 */
 .verdict {
