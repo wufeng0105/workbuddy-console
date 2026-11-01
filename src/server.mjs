@@ -156,13 +156,6 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
 
     try {
       // ── 静态页 ──
-      // 【原型】UI 重构选型用，选完即删。只在非 production 挂载。
-      if (req.method === 'GET' && (pathname === '/prototype' || pathname === '/prototype/')) {
-        const html = fs.readFileSync(path.join(WEB_DIR, 'prototype', 'index.html'), 'utf8');
-        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
-        res.end(html);
-        return;
-      }
       if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
         const html = fs.readFileSync(path.join(WEB_DIR, 'index.html'), 'utf8');
         res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
@@ -255,11 +248,6 @@ export async function startConsole({ root, port } = {}) {
     ``,
     `# 控制台`,
     url,
-    ``,
-    `# UI 原型（选型用，选完即删）`,
-    `http://127.0.0.1:${actual}/prototype?variant=A&token=${token}`,
-    `http://127.0.0.1:${actual}/prototype?variant=B&token=${token}`,
-    `http://127.0.0.1:${actual}/prototype?variant=C&token=${token}`,
   ];
   fs.writeFileSync(urlFile, `${lines.join('\n')}\n`, 'utf8');
 

@@ -20,7 +20,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { stateDir, ensureDir } from './paths.mjs';
-import { ConsoleError } from './errors.mjs';
 
 export const BUNDLE_SCHEMA_VERSION = 1;
 

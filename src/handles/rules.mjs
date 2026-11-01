@@ -17,7 +17,7 @@
 
 import fs from 'node:fs';
 import { sha256 } from '../core/backup.mjs';
-import { diffLines, renderDiff } from '../core/diff.mjs';
+import { diffLines } from '../core/diff.mjs';
 import { ConsoleError } from '../core/errors.mjs';
 import { readRules, summarize, promoteRules, writeDomainRules } from '../core/rules.mjs';
 import { recordAfterWrite, evaluateReadback } from '../verify/readback.mjs';
