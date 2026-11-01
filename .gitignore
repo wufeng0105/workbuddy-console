@@ -15,8 +15,6 @@ state/
 # ── 基线账本（项目目录内维护，但含个人 SOUL/USER 内容与厂商模板 —— 同铁律 4 理由不得入库）──
 baselines/
 
-# ── 设计稿产物（Stitch 生成的 PNG/HTML，4MB 级，账本 md/json 保留入库）──
-.stitch2/designs/
 
 # ── 工程期常规忽略（技术栈落地后按需细化）──
 node_modules/

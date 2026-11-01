@@ -1,9 +1,9 @@
 /* ══════════════════════════════════════════════════════════
    workbuddy-console · 任务工作台（需求侧重构版）
    壳：顶部横向导航 56px + 居中内容 max-width 1200px。
-   令牌来源：.stitch2/designs/*.html（Stitch 项目 1592204686457848283 之重构稿，
-   逐值提取）；Tailwind CDN / Google Fonts 已剔除 —— 本地工具不引远程资源，
-   Inter → 系统字体栈，JetBrains Mono → Cascadia Mono。
+   令牌来源：Stitch 需求侧设计稿逐值提取（git 历史 c89b8e5 前的
+   .stitch2/designs/ 为原始出处）；Tailwind CDN / Google Fonts 已剔除
+   —— 本地工具不引远程资源，Inter → 系统字体栈，JetBrains Mono → Cascadia Mono。
    ══════════════════════════════════════════════════════════ */
 
 :root {
