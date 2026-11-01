@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>workbuddy-console · UI 原型</title>
+<link rel="stylesheet" href="/static/prototype/proto.css">
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import { mountSwitcher } from '/static/prototype/shared.js';
+import { renderA } from '/static/prototype/variant-a.js';
+import { renderB } from '/static/prototype/variant-b.js';
+import { renderC } from '/static/prototype/variant-c.js';
+
+const VARIANTS = ['A', 'B', 'C'];
+const NAMES = { A: '体检台', B: '工作面', C: '流水账' };
+const RENDER = { A: renderA, B: renderB, C: renderC };
+
+const params = new URLSearchParams(location.search);
+const v = VARIANTS.includes(params.get('variant')) ? params.get('variant') : 'A';
+
+document.documentElement.dataset.variant = v;
+const root = document.getElementById('root');
+root.className = `v-${v.toLowerCase()}`;
+
+await RENDER[v](root);
+mountSwitcher(VARIANTS, v, NAMES);
+</script>
+</body>
+</html>

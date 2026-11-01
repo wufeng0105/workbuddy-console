@@ -68,6 +68,7 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
   /** @param {string} pathname */
   async function dispatch(pathname, method, body, url) {
     if (pathname === '/api/doctor' && method === 'GET') return engine.doctor();
+    if (pathname === '/api/overview' && method === 'GET') return engine.overview();
     if (pathname === '/api/backups' && method === 'GET') return engine.backups();
     if (pathname === '/api/audit' && method === 'GET') {
       return engine.audit(Number(url.searchParams.get('limit') ?? 50));
@@ -155,6 +156,13 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
 
     try {
       // ── 静态页 ──
+      // 【原型】UI 重构选型用，选完即删。只在非 production 挂载。
+      if (req.method === 'GET' && (pathname === '/prototype' || pathname === '/prototype/')) {
+        const html = fs.readFileSync(path.join(WEB_DIR, 'prototype', 'index.html'), 'utf8');
+        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
+        res.end(html);
+        return;
+      }
       if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
         const html = fs.readFileSync(path.join(WEB_DIR, 'index.html'), 'utf8');
         res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
@@ -230,12 +238,30 @@ export async function startConsole({ root, port } = {}) {
   const app = createConsoleServer({ configRoot, storeRoot });
   const { url, port: actual } = await app.listen(port ?? 0);
   const d = app.describe();
+  /** 令牌在 createConsoleServer 的作用域里，这里从 app 取 */
+  const token = app.token;
 
   // 把带令牌的 URL 落一份，便于重开控制台（该文件含令牌，只在用户数据目录内）
+  //
+  // 为什么要落"全部入口"而不只是首页：
+  //   令牌每次启动都变，人手抄链接必然出错（已发生过一次：贴了上一轮的旧令牌，
+  //   页面打开全是 401）。所以把**每种可用地址**都写进文件，用完直接复制。
   const dir = path.join(storeRoot, 'state');
   fs.mkdirSync(dir, { recursive: true });
   const urlFile = path.join(dir, 'console-url.txt');
-  fs.writeFileSync(urlFile, `${url}\n`, 'utf8');
+  const lines = [
+    `# workbuddy-console · 启动于 ${new Date().toISOString()}`,
+    `# 令牌随每次启动变化；本文件每次启动重写`,
+    ``,
+    `# 控制台`,
+    url,
+    ``,
+    `# UI 原型（选型用，选完即删）`,
+    `http://127.0.0.1:${actual}/prototype?variant=A&token=${token}`,
+    `http://127.0.0.1:${actual}/prototype?variant=B&token=${token}`,
+    `http://127.0.0.1:${actual}/prototype?variant=C&token=${token}`,
+  ];
+  fs.writeFileSync(urlFile, `${lines.join('\n')}\n`, 'utf8');
 
   return { app, url, port: actual, urlFile, ...d };
 }

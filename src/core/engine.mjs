@@ -799,6 +799,88 @@ export function createEngine({
     };
   }
 
+  /**
+   * 总览 —— 一次聚合，供 UI 首屏用（避免 4 次往返）。
+   * 设计原则：能给"未知"就给"未知"，绝不猜。
+   */
+  async function overview() {
+    const d = doctor();
+    const drift = await checkDrift();
+
+    /** 定制清单：用重放包的 sha 判断"改过没"；无包 = 未知 */
+    const bundle = readBundle(storeRoot);
+    const customized = [];
+    const unknown = [];
+    for (const h of registry.list()) {
+      const entry = bundle?.entries?.[h.id];
+      if (!entry) { unknown.push({ id: h.id, title: h.title, reason: '没有重放包基线，无法判断是否被改过' }); continue; }
+      try {
+        const st = await h.probe(ctx);
+        const nowSha = st.sha256 ?? null;
+        if (nowSha && entry.sha256 && nowSha !== entry.sha256) {
+          customized.push({ id: h.id, title: h.title, path: tildify(st.path) });
+        }
+      } catch {
+        unknown.push({ id: h.id, title: h.title, reason: '探测失败' });
+      }
+    }
+
+    /** 待处理：需要重放 / 锚点失效 */
+    const todos = [];
+    if (drift.ok && drift.needReplay.length) {
+      todos.push({
+        kind: 'replay',
+        severity: 'warn',
+        title: `${drift.needReplay.length} 项定制在升级后不见了`,
+        detail: drift.needReplay.join('、'),
+        action: 'replay',
+      });
+    }
+    const badAnchor = d.anchors.filter((a) => !a.ok);
+    if (badAnchor.length) {
+      todos.push({
+        kind: 'anchor',
+        severity: 'error',
+        title: `${badAnchor.length} 个锚点失效`,
+        detail: badAnchor.map((a) => a.key).join('、'),
+        action: 'doctor',
+      });
+    }
+
+    const recent = readAudit(storeRoot, { limit: 12 }).reverse();
+    const backups = listBackups(storeRoot).slice(0, 8);
+
+    return {
+      version: d.version,
+      configRoot: d.configRoot,
+      storeRoot: d.storeRoot,
+      health: { ok: d.ok, anchors: d.anchors.length, anchorFailures: badAnchor.length, handles: d.handles.length },
+      gate: { appRunning: probeAppState(), note: '应用运行中时，要求停机的把手会拒绝写入' },
+      drift: drift.ok
+        ? {
+          available: true,
+          bundleCreatedAt: drift.bundleCreatedAt,
+          bundleVersion: drift.bundleVersion,
+          currentVersion: drift.currentVersion,
+          versionChanged: drift.versionChanged,
+          needReplay: drift.needReplay.length,
+          results: drift.results,
+        }
+        : { available: false, reason: drift.reason },
+      customized,
+      unknown,
+      todos,
+      recent,
+      backups,
+      counts: {
+        handles: registry.list().length,
+        profiles: listProfiles(storeRoot).length,
+        backups: listBackups(storeRoot).length,
+        audit: readAudit(storeRoot).length,
+      },
+    };
+  }
+
   // ── 6. 还原 ────────────────────────────────────────────────
   function restore(backupId, { dryRun = false } = {}) {
     const r = restoreBackup({ storeRoot, id: backupId, dryRun });
@@ -845,5 +927,7 @@ export function createEngine({
     captureBundle, checkDrift, replay,
     // P3 · 审批自动同意
     approvalState, planApproval, applyApproval, verifyApproval,
+    // 总览
+    overview,
   };
 }
