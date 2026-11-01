@@ -42,6 +42,9 @@ const S = {
   approvalPlan: null,
   approvalVerify: null,
 
+  // 档位页
+  profileExpanded: null,   // 展开的档位 id（null = 全部收起）
+
   // 守护
   replaySel: null,         // 漂移检测结果里勾选的把手 id 列表
 
@@ -1020,14 +1023,14 @@ function profilesWork() {
       el('p', {}, '把 SOUL + 风格 + 指令存成一套，一键整体切换——一次备份、一条审计、整体还原。')),
     el('button', { class: 'btn btn-primary', onclick: saveProfile }, '＋ 把当前状态存为新档位')));
 
-  // 卡墙
-  const wall = el('section', { class: 'pw-grid' });
+  // 长条折叠卡（与个性化一致：收起一行看清，展开看详情与操作）
+  const strips = el('section', {});
   if (!S.profiles.length) {
-    wall.append(el('div', { class: 'empty' },
+    strips.append(el('div', { class: 'empty' },
       '还没有档位。先在「个性化」把人设调成想要的样子，再点右上角「存为新档位」。'));
   }
-  for (const p of S.profiles) wall.append(profileCard(p, lastApplied, S.profileDetails[p.id]));
-  wrap.append(wall);
+  S.profiles.forEach((p, i) => strips.append(profileStrip(p, i + 1, lastApplied, S.profileDetails[p.id])));
+  wrap.append(strips);
 
   // 切换预览面板
   if (S.profilePlan) {
@@ -1070,7 +1073,7 @@ function profilesWork() {
       el('span', { class: 'boundary-warn' }, '⚠'),
       el('div', {},
         el('strong', {}, '生效判定须知　'),
-        '切换后需在 WorkBuddy 新建会话并发一条消息，再点「验证生效」——无新会话时如实显示「无法判定」，不会误报「未生效」。')),
+        '切换后需在 WorkBuddy 新建会话并发一条消息才会生效——无新会话时如实显示「无法判定」，不会误报「未生效」。')),
     lastApplied
       ? el('a', {
         href: '#', class: 'boundary-go',
@@ -1078,31 +1081,12 @@ function profilesWork() {
       }, el('span', {}, '验证最近切换的档'), el('span', { class: 'mono' }, '→'))
       : null));
 
-  // 底部状态条
-  wrap.append(el('section', { class: 'health', style: { marginTop: '24px' } },
-    el('div', { class: 'hs-item' },
-      el('span', {}, '最近切换'),
-      el('span', { class: 'pill pill-mono pill-idle' }, lastApplied?.profile ?? '—')),
-    el('span', { class: 'hs-sep' }),
-    el('div', { class: 'hs-item' },
-      el('span', {}, '切换时间'),
-      el('span', { class: 'pill pill-mono pill-idle' }, lastApplied ? fmtTime(lastApplied.at) : '—')),
-    el('span', { class: 'hs-sep' }),
-    el('div', { class: 'hs-item' },
-      el('span', {}, '备份保障'),
-      el('span', { class: 'hs-run' }, el('span', { class: 'dot', 'data-s': 'ok' }), '切换自动整体备份')),
-    el('span', { class: 'hs-sep' }),
-    el('div', { class: 'hs-item' },
-      el('a', {
-        href: '#guard', class: 'boundary-go',
-        onclick: (e) => { e.preventDefault(); S.nav = 'guard'; render(); },
-      }, el('span', {}, '查看台账'), el('span', { class: 'mono' }, '→')))));
-
   return wrap;
 }
 
-function profileCard(p, lastApplied, detail) {
+function profileStrip(p, idx, lastApplied, detail) {
   const active = lastApplied?.profile === p.id;
+  const open = S.profileExpanded === p.id;
   // 引擎存的是扁平字符串表：values[handleId] = 内容（engine.mjs:295）
   const v = detail?.values ?? {};
   const valOf = (pid) => (typeof v[pid] === 'string' ? v[pid] : '');
@@ -1110,36 +1094,56 @@ function profileCard(p, lastApplied, detail) {
   const styleId = p.covers.find((c) => c.includes('tone'));
   const promptId = p.covers.find((c) => c.includes('prompt'));
   const full = p.covers.length >= S.handles.filter((h) => h.id.startsWith('personalization.')).length;
+  const styleVal = styleId ? valOf(styleId) : '';
 
-  const card = el('div', { class: 'pw-card', 'data-active': String(active) });
-  card.append(
-    el('div', { class: 'pw-title-row' },
-      el('span', { class: 'pw-title' }, p.name),
-      active
-        ? el('span', { class: 'pill pill-ok' }, '✓ 最近切换')
-        : el('span', { class: 'pill pill-idle' }, '未激活')),
-    el('div', { class: 'pw-id' }, `id: ${p.id}`),
-    el('div', { class: 'pw-label' }, 'SOUL 人设'),
-    el('div', { class: 'pw-quote' },
-      soulId && valOf(soulId) ? excerpt(valOf(soulId)) : el('span', { class: 'empty-q' }, '（未收录）')),
-    el('div', { class: 'pw-label' }, '风格'),
-    styleId && valOf(styleId)
-      ? el('span', { class: 'pw-style-pill' }, valOf(styleId))
-      : el('span', { class: 'pw-quote' }, el('span', { class: 'empty-q' }, '（未收录）')),
-    el('div', { class: 'pw-label' }, '指令'),
-    el('div', { class: 'pw-quote' },
-      promptId && valOf(promptId) ? excerpt(valOf(promptId)) : el('span', { class: 'empty-q' }, '（未收录）')),
-    el('div', { class: 'pw-covers' },
-      el('span', {}, `覆盖 ${p.covers.length} 项把手`),
-      el('span', { class: full ? 'full' : 'dim' }, full ? '完整覆盖' : '标准套')),
-    el('div', { class: 'pw-chips' },
-      ...p.covers.map((c) => el('span', { class: 'chip' }, c.split('.').slice(1).join('.') || c))),
-    el('div', { class: 'pw-foot' },
-      active
-        ? el('button', { class: 'btn btn-primary', onclick: () => doVerifyProfile(p.id) }, '✓ 验证这一档')
-        : el('button', { class: 'btn', onclick: () => doPlanProfile(p.id) }, '切换到这一档'),
-      el('button', { class: 'btn btn-danger', onclick: () => doDeleteProfile(p.id) }, '删除')));
-  return card;
+  const toggle = () => { S.profileExpanded = open ? null : p.id; render(); };
+
+  const head = el('div', { class: 'acc-head', onclick: open ? null : toggle },
+    el('div', { class: 'acc-id' },
+      el('div', { class: 'acc-num' }, String(idx)),
+      el('div', { class: 'acc-titles' },
+        el('div', { class: 'acc-title-row' },
+          el('h2', { class: 'acc-title' }, p.name),
+          el('span', { class: 'pill pill-mono pill-idle' }, p.id),
+          active
+            ? el('span', { class: 'pill pill-ok' }, '✓ 最近切换')
+            : el('span', { class: 'pill pill-idle' }, '未激活')),
+        el('div', { class: 'acc-sub' },
+          `覆盖 ${p.covers.length} 项把手（${p.covers.map((c) => c.split('.').slice(1).join('.') || c).join(' / ')}）`
+          + (styleVal ? ` · 风格 ${styleVal}` : ' · 未设风格')))),
+    el('div', { class: 'acc-side' },
+      open ? el('span', { class: 'pill pill-ok' }, el('span', { class: 'pill-dot' }), '已展开') : null,
+      open
+        ? el('button', { class: 'btn btn-xs', onclick: () => { S.profileExpanded = null; render(); } }, '收起')
+        : el('span', { class: 'task-go' }, el('span', {}, '详情'), el('span', { class: 'mono' }, '→'))));
+
+  const strip = el('div', { class: 'acc', 'data-open': String(open), 'data-active': String(active) }, head);
+  if (open) {
+    const body = el('div', { class: 'wiz-body' });
+    body.append(
+      el('div', { class: 'pw-label' }, 'SOUL 人设'),
+      el('div', { class: 'pw-quote' },
+        soulId && valOf(soulId) ? excerpt(valOf(soulId), 200) : el('span', { class: 'empty-q' }, '（未收录）')),
+      el('div', { class: 'pw-label' }, '风格'),
+      styleVal
+        ? el('div', {}, el('span', { class: 'pw-style-pill' }, styleVal))
+        : el('div', { class: 'pw-quote' }, el('span', { class: 'empty-q' }, '（未收录）')),
+      el('div', { class: 'pw-label' }, '指令'),
+      el('div', { class: 'pw-quote' },
+        promptId && valOf(promptId) ? excerpt(valOf(promptId), 200) : el('span', { class: 'empty-q' }, '（未收录）')),
+      el('div', { class: 'pw-covers' },
+        el('span', {}, `覆盖 ${p.covers.length} 项把手`),
+        el('span', { class: full ? 'full' : 'dim' }, full ? '完整覆盖' : '标准套')),
+      el('div', { class: 'pw-chips' },
+        ...p.covers.map((c) => el('span', { class: 'chip' }, c.split('.').slice(1).join('.') || c))),
+      el('div', { class: 'row' },
+        active
+          ? el('button', { class: 'btn btn-primary', onclick: () => doVerifyProfile(p.id) }, '✓ 验证这一档')
+          : el('button', { class: 'btn btn-primary', onclick: () => doPlanProfile(p.id) }, '切换到这一档'),
+        el('button', { class: 'btn btn-danger', onclick: () => doDeleteProfile(p.id) }, '删除')));
+    strip.append(body);
+  }
+  return strip;
 }
 
 async function saveProfile() {
