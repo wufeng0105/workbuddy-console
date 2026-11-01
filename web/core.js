@@ -92,10 +92,6 @@ export const GROUPS = [
   { key: 'rules', title: '行为规则', prefix: 'rules.', note: '结构化操作 · 需重启生效' },
 ];
 
-export function groupOf(h) {
-  return GROUPS.find((g) => h.id.startsWith(g.prefix)) ?? { key: 'other', title: '其他', note: '' };
-}
-
 export const VERDICT = {
   effective: { label: '生效', mark: '✓' },
   ineffective: { label: '未生效', mark: '✕' },

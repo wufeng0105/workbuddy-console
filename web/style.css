@@ -325,6 +325,7 @@ h1, h2, h3 { margin: 0; }
 
 /* ══════════════ 档位 · 长条折叠卡（复用 .acc 组件） ══════════════ */
 
+.pw-label { font-size: 11px; color: var(--ink-3); margin: 12px 0 6px; letter-spacing: .04em; }
 .pw-quote {
   background: var(--page); border: 1px solid var(--line);
   border-radius: var(--r-sm); padding: 10px 12px;
@@ -481,18 +482,6 @@ h1, h2, h3 { margin: 0; }
 
 /* ══════════════ 工作面组件（旧域沿用，按新令牌重上色） ══════════════ */
 
-.kv {
-  display: grid; grid-template-columns: 108px 1fr; gap: 6px 16px;
-  margin: 0; font-family: var(--mono); font-size: 11.5px;
-  background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--r); padding: 14px 16px;
-}
-.kv dt { color: var(--ink-3); }
-.kv dd { margin: 0; color: var(--ink-2); word-break: break-all; line-height: 1.55; }
-.kv dd.warn { color: var(--warn); }
-.kv dd.bad { color: var(--bad); }
-.kv dd.dim { color: var(--ink-3); }
-
 .warn {
   border-left: 3px solid var(--warn); background: var(--warn-bg);
   padding: 8px 13px; margin-bottom: 7px; border-radius: 0 var(--r-sm) var(--r-sm) 0;
@@ -523,7 +512,6 @@ h1, h2, h3 { margin: 0; }
 .btn-danger { color: var(--bad); border-color: var(--bad-line); }
 .btn-danger:hover { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
 .btn-quiet { color: var(--ink-3); }
-.btn-wide { width: 100%; }
 .btn-xs { padding: 3px 9px; font-size: 11px; }
 
 .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: nowrap; }
@@ -618,9 +606,6 @@ h1, h2, h3 { margin: 0; }
   padding: 1px 6px; border: 1px solid var(--line);
   color: var(--ink-3); border-radius: 2px; white-space: nowrap;
 }
-.chip[data-risk="vendor"] { color: var(--warn); border-color: var(--warn-line); background: var(--warn-bg); }
-.chip-mod { color: var(--accent); border-color: var(--accent-line); background: var(--accent-bg); }
-.chip-bad { color: var(--bad); border-color: var(--bad-line); background: var(--bad-bg); }
 .tag {
   font-family: var(--mono); font-size: 10px;
   padding: 1px 7px; border-radius: 2px; border: 1px solid var(--line); color: var(--ink-3);
@@ -634,6 +619,7 @@ h1, h2, h3 { margin: 0; }
   border: 1px solid var(--line); border-radius: var(--r);
   padding: 13px 15px; background: var(--surface);
 }
+.face-idle { }
 .face-ok { border-color: var(--ok-line); background: linear-gradient(180deg, var(--ok-bg), var(--surface) 60%); }
 .face-warn { border-color: var(--warn-line); background: linear-gradient(180deg, var(--warn-bg), var(--surface) 60%); }
 .face-h { font-size: 12.5px; font-weight: 500; margin-bottom: 7px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

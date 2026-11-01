@@ -1041,7 +1041,7 @@ export function createEngine({
   }
 
   /** 还原最初设置：把**当前版本账本**的快照写回。写前必备份（铁律 1）；闸门不满足即拒绝。 */
-  async function restoreBaseline(id) {
+  async function restoreBaseline(id, { confirm = false } = {}) {
     const key = versionKey();
     const b = readLedger(key);
     if (!b) throw new ConsoleError('NO_BASELINE', `当前版本 ${key} 还没有账本——先建立本版账本`);
@@ -1052,6 +1052,9 @@ export function createEngine({
 
     const g = gateCheck(h);
     if (g.blocked) throw new GateBlockedError(g.reason, { handle: h.id, gate: g.kind });
+    if (h.writeClass === 'vendor-file' && !confirm) {
+      throw new ConfirmationRequiredError(`把手 ${id} 写入的是厂商文件，需显式确认`, { handle: h.id, target: h.target });
+    }
 
     const st = await h.probe(ctx);
     if (!st?.exists || !st.path) throw new ConsoleError('ANCHOR_MISSING', `把手 ${id} 的锚点当前无法定位`, { id });

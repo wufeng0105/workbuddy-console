@@ -87,7 +87,7 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
     if (pathname === '/api/baseline' && method === 'GET') return engine.baseline();
     if (pathname === '/api/baseline/capture' && method === 'POST') return engine.baselineCapture();
     if (pathname === '/api/baseline/restore' && method === 'POST') {
-      return engine.baselineRestore(String(body.id ?? ''));
+      return engine.baselineRestore(String(body.id ?? ''), { confirm: body.confirm === true });
     }
 
     // ── 专家档位（多把手事务）──

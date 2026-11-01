@@ -29,7 +29,6 @@ const S = {
   expanded: undefined,     // customize 展开的把手 id（null = 用户已收起；undefined = 尚未进过该页）
 
   // 当前把手的工作面状态
-  probe: null,
   busy: false,
   flash: null,             // { type:'ok'|'err', text }
 
@@ -66,6 +65,8 @@ async function boot() {
     const v = sessionStorage.getItem('wbc-expanded');
     if (v !== null) S.expanded = JSON.parse(v);
   } catch { /* 隐私模式忽略 */ }
+  // 展开卡与写入目标必须同源：恢复展开态后同步把手指针（否则刷新后「应用」会写错把手）
+  if (S.expanded && S.handles.some((h) => h.id === S.expanded)) S.handleId = S.expanded;
   try {
     await reloadAll();
     render();
@@ -168,7 +169,7 @@ function homeWork() {
   // 页头问候
   wrap.append(el('section', { class: 'hero' },
     el('h1', {}, '今天要做什么？'),
-    el('p', {}, '所有改动都会自动备份，并可验证是否真的生效——先选一件事开始。')));
+    el('p', {}, '所有改动都会自动备份，可逐字节还原——先选一件事开始。')));
 
   // 任务卡 2×2 —— 点击整卡直达对应域
   const card = (opts) => el('div', {
@@ -189,7 +190,7 @@ function homeWork() {
     card({
       nav: 'customize', ico: '✎', title: '修改个性化设置',
       badge: el('span', { class: 'pill pill-blue' }, '最高频'),
-      desc: '人设、称呼、名字、回复风格、指令——改完用 token 增量证明它真的进了模型',
+      desc: '人设、称呼、名字、回复风格、指令——改完自动备份，随时一键还原',
     }),
     card({
       nav: 'profiles', ico: '◐', title: '切换整套人设',
@@ -294,7 +295,7 @@ async function probeOne(id) {
   return S.probes[id];
 }
 
-/** 参考件「校验」：给出明确结论 —— 锚点 + 内容与本地基线对照，并把结果驱动「拉取」可用性 */
+/** 参考件「校验」：给出明确结论 —— 锚点 + 内容与参考件基线对照，并把结果驱动「拉取」可用性 */
 async function verifyReference(h) {
   const pr = await probeOne(h.id);
   await reloadAll();                       // 刷新锚点状态与基线对照（customized 列表）
@@ -309,25 +310,25 @@ async function verifyReference(h) {
     type = 'err';
     msg = `校验 ${cur.title}：锚点失效 —— 文件位置或名称与预期不符（升级可能移动了目录）`;
   } else if (!hasBaseline) {
-    msg = `校验 ${cur.title}：锚点正常，文件可读（${fmtNum(pr.state?.text?.length ?? 0)} 字符）；尚无本地基线可对照 —— 点「拉取」存一份`;
+    msg = `校验 ${cur.title}：锚点正常，文件可读（${fmtNum(pr.state?.text?.length ?? 0)} 字符）；尚无参考件基线可对照 —— 点「拉取」存一份`;
   } else if (differs) {
-    msg = `校验 ${cur.title}：内容与本地基线有变动 —— 升级覆盖过属正常：点「拉取」把新版存为基线，或「还原」写回基线版本`;
+    msg = `校验 ${cur.title}：内容与参考件基线有变动 —— 升级覆盖过属正常：点「拉取」把新版存为基线，或「还原」写回基线版本`;
   } else {
-    msg = `校验 ${cur.title}：锚点正常，内容与本地基线一致（${fmtNum(pr.state?.text?.length ?? 0)} 字符）`;
+    msg = `校验 ${cur.title}：锚点正常，内容与参考件基线一致（${fmtNum(pr.state?.text?.length ?? 0)} 字符）`;
   }
   S.flash = { type, text: msg };
   render();
   window.scrollTo(0, 0);
 }
 
-/** 参考件「拉取」：把 WorkBuddy 当前安装目录里的原厂内容存进本地基线（重放包）。
+/** 参考件「拉取」：把 WorkBuddy 当前安装目录里的原厂内容存进参考件基线（重放包）。
  *  由「校验」结果驱动可用性：无基线或校验变动才可点；拉取后清空校验态（再校验即一致）。 */
 async function pullLatest(handleId) {
   try {
     const r = await api('/api/bundle', { method: 'POST', body: {} });
     const n = Object.keys(r.bundle?.entries ?? {}).length;
     const skipped = r.skipped?.length ?? 0;
-    S.flash = { type: 'ok', text: `已把当前内容存为本地基线：收录 ${n} 项${skipped ? `（跳过 ${skipped} 项无需重放）` : ''}` };
+    S.flash = { type: 'ok', text: `已把当前内容存为参考件基线：收录 ${n} 项${skipped ? `（跳过 ${skipped} 项无需重放）` : ''}` };
     S.styleCheck = {};
     if (handleId) await probeOne(handleId);
     await reloadAll();
@@ -337,7 +338,7 @@ async function pullLatest(handleId) {
   render();
 }
 
-/** 参考件还原：从本地基线把该把手的快照逐字节写回（无基线则如实报错） */
+/** 参考件还原：从参考件基线把该把手的快照逐字节写回（无基线则如实报错） */
 async function restoreReference(h) {
   try {
     const r = await api('/api/replay', { method: 'POST', body: { only: [h.id], confirm: true } });
@@ -349,7 +350,7 @@ async function restoreReference(h) {
     S.flash = {
       type: 'err',
       text: e.code === 'NO_BUNDLE'
-        ? '还没有本地基线——点「拉取最新版」先存一份原厂内容，才能还原。'
+        ? '还没有参考件基线——点「拉取」先存一份，才能还原。'
         : `还原失败 [${e.code ?? 'ERR'}] ${e.message}`,
     };
   }
@@ -373,7 +374,7 @@ function customizeWork() {
   const bl = S.baseline;
   wrap.append(el('section', { class: 'hero' },
     el('h1', {}, '个性化设置'),
-    el('p', {}, '每个把手：改动自动备份、验证通过才算数——可逐字节还原。'),
+    el('p', {}, '每个把手：改动自动备份、随时一键还原。'),
     bl?.available
       ? el('p', {
         class: 'dim',
@@ -428,7 +429,7 @@ function accCard(h, idx) {
     const chars = typeof st.text === 'string' ? st.text.length : null;
     const sha = st.sha256 ? st.sha256.slice(0, 6) : null;
     const drift = S.overview?.drift;
-    const baseline = drift?.available ? `本地基线已存 ${fmtTime(drift.bundleCreatedAt)}` : '尚无本地基线';
+    const baseline = drift?.available ? `参考件基线已存 ${fmtTime(drift.bundleCreatedAt)}` : '尚无参考件基线';
     const sub = !pr
       ? '读取中…'
       : st.writeAccess === false
@@ -442,9 +443,9 @@ function accCard(h, idx) {
     const baselineMissing = !drift?.available;
     const checkState = S.styleCheck?.[h.id];
     const pullEnabled = baselineMissing || checkState === 'changed';
-    const pullTitle = baselineMissing ? '还没有本地基线，点击建立'
-      : checkState === 'changed' ? '内容与基线有变动——把当前 WorkBuddy 内容存为新基线'
-        : checkState === 'match' ? '内容与本地基线一致，无需拉取'
+    const pullTitle = baselineMissing ? '还没有参考件基线，点击建立'
+      : checkState === 'changed' ? '内容与参考件基线有变动——把当前 WorkBuddy 内容存为新基线'
+        : checkState === 'match' ? '内容与参考件基线一致，无需拉取'
           : '先点「校验」——一致则无需拉取，变动后才可拉取';
     const pullBtn = el('button', {
       class: 'btn btn-xs',
@@ -515,7 +516,7 @@ function accCard(h, idx) {
   const expand = () => {
     if (S.expanded === h.id) return;
     S.expanded = h.id; S.handleId = h.id;
-    S.probe = null; S.flash = null;
+    S.flash = null;
     saveExpanded();
     render();
     loadProbe();
@@ -555,16 +556,21 @@ function wizBody(h, st) {
 
 /* ══════════════ 工作面：把手（customize 向导卡内复用） ══════════════ */
 
-function currentHandle() { return S.handles.find((h) => h.id === S.handleId) ?? null; }
+function currentHandle() {
+  // 展开卡优先——「应用」的写入目标必须是用户正在编辑的那张卡，而不是指针恰好停在的把手
+  const id = S.expanded ?? S.handleId;
+  return S.handles.find((h) => h.id === id)
+    ?? S.handles.find((h) => h.id === S.handleId)
+    ?? null;
+}
 
 async function loadProbe() {
   const h = currentHandle();
   if (!h) return;
   try {
-    S.probe = await api(`/api/handle/${encodeURIComponent(h.id)}/probe`);
-    S.probes[h.id] = S.probe;
+    S.probes[h.id] = await api(`/api/handle/${encodeURIComponent(h.id)}/probe`);
   } catch (e) {
-    S.probe = null;
+    S.probes[h.id] = null;
     S.flash = { type: 'err', text: `探测失败：${e.message}` };
   }
   render();
@@ -577,11 +583,10 @@ function editorArea(h, st) {
   // 规则矩阵：结构化操作
   if (h.inputKind === 'rule-op') return rulesEditor(h, st);
 
-  // 枚举：下拉
+  // 枚举：下拉（选中值留在 DOM 里，点「应用」才提交；不要在 change 里 render——会按旧值重建下拉）
   if (st.allowedValues) {
     const sel = el('select', { class: 'input', id: 'editor' });
     for (const v of st.allowedValues) sel.append(el('option', { value: v, selected: v === st.value ? '' : null }, v));
-    sel.addEventListener('change', () => { render(); });
     const row = el('div', { class: 'row' }, sel);
     row.append(actions(h, () => $('editor').value));
     box.append(row);
@@ -629,9 +634,6 @@ function rulesEditor(h, st) {
     el('span', { class: 'dim' }, '把'), from, el('span', { class: 'dim' }, '改成'), to,
     el('span', { class: 'dim' }, '作用动作：'), acts));
 
-  box.append(el('div', { class: 'row' },
-    ...['read', 'write', 'delete'].map((a) => null)));
-
   const getOp = () => {
     const actions = ['read', 'write', 'delete'].filter((a) => $(`act-${a}`)?.checked);
     return { from: $('editor-from')?.value ?? from.value, to: to.value, actions };
@@ -654,8 +656,8 @@ function lastBaselineEntryFor(h) {
 
 function actions(h, getNext) {
   const row = el('div', { class: 'row' });
-  // 最小按钮集：应用（备份→写入）/ 还原最初设置（基线写回，坏改的保险）
-  row.append(el('button', { class: 'btn btn-primary', onclick: () => doApply(getNext) }, '应用'));
+  // 最小按钮集：应用（备份→写入）/ 还原最初设置（基线写回，坏改的保险）；写入中禁用防双击双写
+  row.append(el('button', { class: 'btn btn-primary', disabled: S.busy ? '' : null, onclick: () => doApply(getNext) }, '应用'));
   const be = lastBaselineEntryFor(h);
   row.append(el('button', {
     class: 'btn btn-quiet',
@@ -680,7 +682,7 @@ function colorDiff(text) {
   }).join('\n');
 }
 
-function verifyView(v, expected = null) {
+function verifyView(v) {
   const box = el('div', {});
   const meta = VERDICT[v.verdict] ?? { label: v.verdict, mark: '·' };
   box.append(el('div', { class: 'verdict verdict-' + v.verdict },
@@ -691,17 +693,6 @@ function verifyView(v, expected = null) {
   const delta = v.evidence
     ? (v.evidence.observed?.promptTokens ?? 0) - (v.evidence.baseline?.promptTokens ?? 0)
     : null;
-
-  // 期望 Δ（apply 内部估算）与实测 Δ 对照 —— token-delta 验证的判据核心
-  if (expected != null && delta != null) {
-    box.append(el('div', { class: 'plan-line' },
-      el('span', { class: 'dim' }, '判据对照'),
-      el('code', {}, `期望 Δ${expected >= 0 ? '+' : ''}${expected}`),
-      el('code', { class: delta > 0 ? 'hl' : 'bad' }, `实测 Δ${delta >= 0 ? '+' : ''}${delta}`),
-      Math.sign(delta) === Math.sign(expected) && Math.abs(delta - expected) <= Math.max(20, Math.abs(expected) * 0.5)
-        ? el('span', { class: 'tag tag-ok' }, '方向与量级一致')
-        : el('span', { class: 'tag tag-warn' }, '与期望偏差较大 · 看下方证据')));
-  }
 
   if (v.evidence) {
     const t = el('table', { class: 'evt' },
@@ -749,7 +740,7 @@ async function doApply(getNext) {
       method: 'POST',
       body: { next, confirm: vendor },
     });
-    S.flash = { type: 'ok', text: `已写入 ${r.handle}　备份 ${r.backupId}（还原最初设置可一键回到最初）` };
+    S.flash = { type: 'ok', text: `已写入 ${r.handle}　备份 ${r.backupId}（点「还原」回到最初）` };
     await reloadAll();
     await loadProbeQuiet();
     render();
@@ -778,7 +769,7 @@ async function doCaptureBaseline() {
 async function doRestoreBaseline(h) {
   S.busy = true; S.flash = null;
   try {
-    const r = await api('/api/baseline/restore', { method: 'POST', body: { id: h.id } });
+    const r = await api('/api/baseline/restore', { method: 'POST', body: { id: h.id, confirm: true } });
     S.flash = r.changed
       ? { type: 'ok', text: `已还原 ${h.title} 到最初设置　备份 ${r.backupId}` }
       : { type: 'ok', text: `${h.title} 与最初基线一致，无需改动` };
@@ -795,8 +786,7 @@ async function loadProbeQuiet() {
   const h = currentHandle();
   if (!h) return;
   try {
-    S.probe = await api(`/api/handle/${encodeURIComponent(h.id)}/probe`);
-    S.probes[h.id] = S.probe;
+    S.probes[h.id] = await api(`/api/handle/${encodeURIComponent(h.id)}/probe`);
   } catch { /* ignore */ }
 }
 
@@ -832,14 +822,17 @@ function approvalWork() {
       el('p', {}, '一个目标，两面：规则面可可靠验证；提示词面只能降低概率——两面如实区分。'))));
 
   // 双面可信度卡（当前状态，全部实时数据）
-  const pending = a.rules?.pending ?? {};
+  const pending = a.rules?.pending;
+  const rulesBroken = !a.rules?.pending;
   const faces = el('section', { class: 'faces', style: { margin: '0 0 24px' } });
   faces.append(el('div', { class: 'face face-ok' },
     el('div', { class: 'face-h' }, '规则面 · 宿主弹窗审批', el('span', { class: 'badge badge-ok' }, '✓ 可可靠验证')),
     el('div', { class: 'face-b ap-num' },
-      el('span', {}, el('span', { class: 'k' }, 'read= '), el('span', { class: 'v' }, `ask ${pending.readAsk ?? 0}`)),
-      el('span', {}, el('span', { class: 'k' }, 'write= '), el('span', { class: 'v' }, `ask ${pending.writeAsk ?? 0}`)),
-      el('span', {}, el('span', { class: 'k' }, 'delete= '), el('span', { class: 'v' }, `ask ${pending.deleteAsk ?? 0}`))),
+      pending
+        ? [el('span', {}, el('span', { class: 'k' }, 'read= '), el('span', { class: 'v' }, `ask ${pending.readAsk ?? 0}`)),
+           el('span', {}, el('span', { class: 'k' }, 'write= '), el('span', { class: 'v' }, `ask ${pending.writeAsk ?? 0}`)),
+           el('span', {}, el('span', { class: 'k' }, 'delete= '), el('span', { class: 'v' }, `ask ${pending.deleteAsk ?? 0}`))]
+        : '规则面暂不可读——重进页面或查服务端日志'),
     el('div', { class: 'face-n' }, '✓ 重启后回读可验证：规则是否被启动逻辑抹掉。')));
   faces.append(el('div', { class: 'face face-warn' },
     el('div', { class: 'face-h' }, '提示词面 · 模型自己问', el('span', { class: 'badge badge-warn' }, '⚠ 无法保证')),
@@ -958,7 +951,9 @@ async function doApplyApprovalSel() {
   const level = S.approvalLevel;
   try {
     const r = await api('/api/approval/apply', { method: 'POST', body: { level, confirm: true } });
-    S.flash = { type: 'ok', text: `已应用 ${r.level}：成功 ${r.ok} / 失败 ${r.failed}　备份 ${r.backupId ?? '—'}　需重启 WorkBuddy` };
+    S.flash = r.changed === false
+      ? { type: 'ok', text: r.note ?? '两面已无改动，未做任何写入' }
+      : { type: 'ok', text: `已应用 ${r.level}：成功 ${r.ok} / 失败 ${r.failed}　备份 ${r.backupId ?? '—'}　需重启 WorkBuddy` };
     S.approvalPlan = null;
     await reloadAll();
     render();
@@ -1334,7 +1329,7 @@ function guardWork() {
       el('div', { class: 'panel-note' }, '本地审计记录，精确记录每次写入与还原动作')),
     el('span', { class: 'pill pill-mono pill-idle' }, `AUDIT_LEDGER: ${S.audit.length} ENTRIES`)));
   const auditBody = el('div', { style: { padding: '6px 20px 16px' } });
-  auditBody.append(auditTable(S.audit.slice(0, 40)));
+  auditBody.append(auditTable(S.audit.slice(-40)));
   auditPanel.append(auditBody);
   wrap.append(auditPanel);
 
@@ -1369,8 +1364,12 @@ async function doBundle() {
 }
 
 async function doRedetect() {
-  await reloadAll();
-  S.replaySel = null;
+  try {
+    await reloadAll();
+    S.replaySel = null;
+  } catch (e) {
+    S.flash = { type: 'err', text: `重新检测失败：${e.message}` };
+  }
   render();
 }
 
@@ -1382,6 +1381,7 @@ async function doReplaySel() {
       type: r.failed > 0 ? 'err' : 'ok',
       text: `重放完成：成功 ${r.ok} / 失败 ${r.failed}　备份 ${r.backupId}`,
     };
+    S.replaySel = null;
     await reloadAll(); render();
   } catch (e) { S.flash = { type: 'err', text: `重放失败 [${e.code ?? 'ERR'}] ${e.message}` }; render(); }
 }

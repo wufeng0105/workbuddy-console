@@ -631,7 +631,7 @@ await atest('静态首页可访问且含标题', async () => {
   const r = await fetch(`${BASE}/`);
   eq(r.status, 200, '首页应 200');
   const html = await r.text();
-  ok(html.includes('workbuddy-console'), '首页内容不符');
+  ok(html.includes('WorkBuddy 控制台'), '首页内容不符');
 });
 await atest('未知接口 → 404 且带稳定错误码', async () => {
   const r = await fetch(`${BASE}/api/nope`, { headers: AUTH });
