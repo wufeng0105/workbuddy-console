@@ -927,6 +927,17 @@ await atest('闸门：应用运行时拒绝写入（而不是写了不生效）'
   );
   ok(/正在运行|退出/.test(g.message), `闸门信息应说明原因：${g.message}`);
 });
+
+// 真实探测：不再只靠注入假值。这条用例会真的调 tasklist，
+// 验证 isWorkBuddyRunning() 至少能给出一个确定的三态之一（而不是崩溃/抛错）。
+// 具体是 true 还是 false 取决于运行测试时 WorkBuddy 是否开着 —— 两者都算通过。
+await atest('真实进程探测：isWorkBuddyRunning() 返回确定值而非抛错', async () => {
+  const { isWorkBuddyRunning } = await import('./core/appstate.mjs');
+  const r = isWorkBuddyRunning();
+  ok(r === true || r === false || r === 'unknown',
+    `应返回 true/false/'unknown'，实际 ${JSON.stringify(r)}（${typeof r}）`);
+  console.log(`      实际探测结果：${JSON.stringify(r)}（取决于本机 WorkBuddy 是否在运行）`);
+});
 await atest('闸门放开 + 未确认 → 仍被铁律 5 拦下', async () => {
   const open = createEngine({
     configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false,
