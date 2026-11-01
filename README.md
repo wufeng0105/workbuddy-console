@@ -18,7 +18,7 @@ WorkBuddy（腾讯的桌面 AI 助手）里，"能改它行为的地方"散落�
 
 ## 快速上手
 
-需要 Node ≥ 20。**无依赖、无需构建。**
+需要 Node ≥ 20。**零依赖、零外网、无需构建**——不装任何包，不发任何外部请求，字体也用系统栈。
 
 ```bash
 node src/cli.mjs doctor    # ① 体检：锚点是否成立、把手是否可用
@@ -28,6 +28,7 @@ node src/cli.mjs serve     # ③ 开控制台（会打印带令牌的 URL）
 
 > 不带参数运行 `node src/cli.mjs` 会打印完整上手。
 > **令牌每次启动都变**——从 `<用户数据目录>/state/console-url.txt` 复制，别手抄。
+> 控制台拿到令牌后会**立刻把它从地址栏抹掉**（存进 sessionStorage），所以刷新不受影响，但 URL 里不会留下它。
 
 ### 常见动作
 
@@ -108,7 +109,7 @@ node src/cli.mjs restore <backupId>
 
 P0–P3 共十项**全部完成**。当前剩余工作是**待实测 8 条**（见 `docs/verification.md`），它们影响若干承诺的措辞准确度，不影响功能可用性。
 
-自测：`node src/selftest.mjs`（147 项）。
+自测：`node src/selftest.mjs`（150 项，全部在合成 fixture 上跑，不碰真实配置）。
 
 ## 关于 `recon-baseline/`
 
