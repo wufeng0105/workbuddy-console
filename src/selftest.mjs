@@ -371,7 +371,7 @@ await atest('pickSessions：取会话**首条**请求（同会话后续轮含累
   const p = pickSessions(gens, 300, () => null);
   eq(p.baselineSession.first.promptTokens, 1000, '基线应取 X 的首条（1000），不是后续轮（1400）');
   eq(p.observedSession.first.promptTokens, 1100, '观测应取 Y 的首条');
-  eq(p.baselineSession.startSource, 'first-request', '无目录时间时应标注为次优信号');
+  eq(p.baselineSession.startSource, 'request-gap', '无目录时间时应标注为次优信号');
 });
 await atest('pickSessions：排除非聊天、0 tokens、content_filter 异常样本', async () => {
   const { pickSessions } = await import('./verify/auto-capture.mjs');

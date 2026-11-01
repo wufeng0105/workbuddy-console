@@ -138,6 +138,13 @@ export function readGenerations(configRoot, opts = {}) {
         contentPreview: String(u.content ?? '').slice(0, 80),
         /** 只有参与主聊天链路的请求才可作为对照样本 */
         isChat: !NON_CHAT_MODEL.test(String(u.model ?? '')),
+        /**
+         * 该 trace 文件里 mcp_tools 的出现次数 —— **请求结构探针**。
+         * 工具定义进请求前缀：MCP 工具数变化会直接改变 prompt_tokens，
+         * 这种差异**不能归因给提示词改动**。实测教训：某次会话从 20 降到 6，
+         * 造成 1200+ tokens 的伪偏移。
+         */
+        mcpToolCount: (lines.filter((x) => x.includes('mcp_tools')).length) || 0,
       });
     }
   }

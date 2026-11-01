@@ -53,12 +53,20 @@ export function defaultSessionStartOf(configRoot) {
 /**
  * 选出基线会话与观测会话。
  *
+ * ⚠️ **会话的判据是 trace 文件，不是 worker**（真实数据实测教训）：
+ *   WorkBuddy 会**复用 worker 进程**：同一个 worker=14824 在 50 秒内产生了
+ *   3 条独立的聊天请求（35044 → 35289 → 35537），每次都是**新建会话**。
+ *   若按 worker 分会话，这三条会被错误地当成"同会话累积历史"，
+ *   从而把真实增量（+245/+248）误判成历史长度变化。
+ *
+ *   正确判据：**一个 trace 文件 = 一次请求**。同会话内的多轮，prompt_tokens 会
+ *   随历史累积而增长；跨会话则回到基线水平。故取"每个会话的**第一条**"时，
+ *   若 worker 被复用，应取该 worker 在**时间窗口内最早的**那条。
+ *
  * @param {Array} generations readGenerations 的输出
  * @param {number} applyAtMs
  * @param {(worker:string)=>number|null} sessionStartOf
  * @param {{preferModel?:string}} [opts]
- *   `preferModel`：有多个聊天模型时优先用哪个（默认自动：取最近一次聊天用的模型）。
- *   跨模型比较的增量无意义 —— 静态前缀不同，模型分词器也可能不同。
  */
 export function pickSessions(generations, applyAtMs, sessionStartOf, opts = {}) {
   // 只保留可信的聊天样本
@@ -72,23 +80,60 @@ export function pickSessions(generations, applyAtMs, sessionStartOf, opts = {}) 
   const targetModel = opts.preferModel ?? beforeAll[0]?.model ?? null;
   const sameModel = targetModel ? chat.filter((g) => g.model === targetModel) : chat;
 
-  /** 每个 worker 一条会话，取其**首条**聊天请求 */
+  /**
+   * 每个 **trace 文件**（= 一次请求）作为一个样本点。
+   * 但同一会话的多轮请求都应该聚合：取该会话的**首轮**。
+   *
+   * 会话边界如何判定？用 worker 目录的创建时间 + 请求间隔：
+   *   - worker 目录创建时间 = 该 worker 进程的起点（一个进程可能服务多次新建会话）
+   *   - 相邻请求间隔 > GAP 视为新会话（用户手动新建）
+   */
+  const GAP_MS = 20 * 1000;
+
+  /** 按 worker 分组，再按时间切分成若干"会话" */
   const byWorker = new Map();
   for (const g of sameModel) {
-    const cur = byWorker.get(g.worker);
-    if (!cur || g.atMs < cur.first.atMs) byWorker.set(g.worker, { worker: g.worker, first: g });
+    if (!byWorker.has(g.worker)) byWorker.set(g.worker, []);
+    byWorker.get(g.worker).push(g);
   }
 
-  const sessions = [...byWorker.values()].map((s) => {
-    const fromDir = sessionStartOf(s.worker);
-    return {
-      worker: s.worker,
-      first: s.first,
-      /** 会话起点：优先目录创建时间，回退首条请求时间 */
-      startMs: fromDir ?? s.first.atMs,
-      startSource: fromDir != null ? 'dir-created' : 'first-request',
+  const sessions = [];
+  for (const [worker, list] of byWorker) {
+    list.sort((a, b) => a.atMs - b.atMs);
+    const dirStart = sessionStartOf(worker);
+    /**
+     * 关键：worker 目录创建时间 = 该 **worker 进程**的起点。
+     * WorkBuddy 复用 worker 进程服务多次"新建会话"，所以：
+     *   - 用 request-gap 切分出的是**逻辑会话**（用户点了新建）
+     *   - 但 user-context 在**逻辑会话启动时**渲染，工作进程复不影响它
+     *
+     * 因此判定"该逻辑会话是否在改动之后创建"，用它的**首条请求时间**与 apply 比。
+     * 只有在整个 worker 只有一个分片（即 worker 从头到尾就是这一条会话）时，
+     * 才用目录创建时间（更精确地反映"会话何时开始"）。
+     */
+    let chunk = [list[0]];
+    const push = () => {
+      const onlyChunk = list.length === chunk.length;
+      sessions.push({
+        worker,
+        first: chunk[0],
+        startMs: onlyChunk && dirStart != null ? dirStart : chunk[0].atMs,
+        startSource: onlyChunk && dirStart != null ? 'dir-created' : 'request-gap',
+      });
     };
-  }).sort((a, b) => a.startMs - b.startMs);
+    for (let i = 1; i < list.length; i += 1) {
+      const gap = list[i].atMs - list[i - 1].atMs;
+      if (gap > GAP_MS) {
+        push();
+        chunk = [list[i]];
+      } else {
+        chunk.push(list[i]);
+      }
+    }
+    push();
+  }
+
+  sessions.sort((a, b) => a.startMs - b.startMs);
 
   const before = sessions.filter((s) => s.startMs < applyAtMs);
   const after = sessions.filter((s) => s.startMs > applyAtMs);
@@ -107,8 +152,18 @@ export function pickSessions(generations, applyAtMs, sessionStartOf, opts = {}) 
     otherModelsExcluded,
     /** 是否所有会话起点都来自目录创建时间（否则是次优信号） */
     allStartsAuthoritative: sessions.every((s) => s.startSource === 'dir-created'),
+    /** 会话切分依据（供排障） */
+    splitting: 'trace-file + request-gap',
   };
 }
+
+/**
+ * 基线新鲜度阈值：改动前多久之内必须有过可比会话。
+ * 超过这个窗口，基线与观测很可能来自不同场景（不同模板、不同工具集），
+ * 跨场景比基线是**假阴性**的常见来源 —— 实测教训：拿 10-31 的 E 组会话
+ * 当 11-01 普通会话的基线，得出 Δ-1013 判"未生效"，实际改动是生效的。
+ */
+export const BASELINE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 小时
 
 /**
  * @param {{configRoot:string, applyAtMs:number, expectedDelta?:number, limitFiles?:number, sessionStartOf?:Function}} p
@@ -137,7 +192,56 @@ export function autoCapture({ configRoot, applyAtMs, expectedDelta, limitFiles, 
     };
   }
 
-  if (!picked.allStartsAuthoritative) {
+  // ── 硬约束 0：观测必须真在改动之后创建的新会话 ──
+  // 若观测来自"旧 worker 里按 request-gap 切出的分片"，其 user-context 可能仍是旧的
+  // （worker 复用 + 逻辑会话边界 ≠ user-context 重渲染边界）⇒ Δ≈0 是假阴性。
+  if (observedSession.startSource === 'request-gap') {
+    const dirStart = startOf(observedSession.worker);
+    if (dirStart != null && dirStart < applyAtMs) {
+      return {
+        warnings,
+        blockedReason: `观测点所在的 worker（${observedSession.worker}）在**改动之前**就已启动 —— `
+          + '它是旧 worker 里切出来的分片，user-context 很可能仍是旧的。'
+          + '请**完全新建会话**（或重启 WorkBuddy）后重测，否则 Δ≈0 是假阴性。',
+      };
+    }
+  }
+
+  // ── 硬约束 1：基线必须新鲜 ──
+  // 陈旧基线 = 跨场景比较 = 假阴性。宁可说"无法判定"，也不给错结论。
+  const baselineAge = applyAtMs - baselineSession.startMs;
+  if (Number.isFinite(baselineAge) && baselineAge > BASELINE_MAX_AGE_MS) {
+    const hours = (baselineAge / 3600_000).toFixed(1);
+    return {
+      warnings,
+      blockedReason: `基线会话距改动已 ${hours} 小时（超过 ${BASELINE_MAX_AGE_MS / 3600_000} 小时上限）——`
+        + '跨场景比较会把模板/工具集/角色的差异算进增量，结论不可信。'
+        + `请先跑一次普通会话说句话建立新基线，再 apply 改动，最后再跑一次会话验证。`,
+    };
+  }
+
+  // ── 硬约束 2：请求结构必须可比（MCP 工具数）──
+  // 工具定义进请求前缀；MCP 工具数不同 ⇒ 前缀不同 ⇒ 增量不能归因给提示词改动。
+  const bMcp = baselineSession.first.mcpToolCount ?? null;
+  const oMcp = observedSession.first.mcpToolCount ?? null;
+  if (Number.isFinite(bMcp) && Number.isFinite(oMcp) && bMcp !== oMcp) {
+    warnings.push(
+      `两轮的 MCP 工具数不同（${bMcp} vs ${oMcp}）—— 工具定义进请求前缀，`
+      + '这部分差异**不能归因**给你的改动。实测教训：某次会话工具数从 20 降到 6，'
+      + '造成了 1200+ tokens 的伪偏移。',
+    );
+  }
+
+  if (applyAtMs && observedSession && baselineSession) {
+    const baseStart = baselineSession.startMs;
+    const obsStart = observedSession.startMs;
+    if (!(obsStart > baseStart)) {
+      // 不该发生，但万一集合顺序错了要早发现
+      warnings.push('观测会话的起点不晚于基线会话 —— 采样顺序异常，结论不可信。');
+    }
+  }
+
+  if(!picked.allStartsAuthoritative) {
     warnings.push(
       '部分会话起点取自**首条请求时间**（拿不到目录创建时间）——'
       + '若某会话在改动前创建、改动后才发请求，它会被误当作观测点，结论可能偏保守。',
@@ -180,6 +284,10 @@ export function autoCapture({ configRoot, applyAtMs, expectedDelta, limitFiles, 
       sessionCount: picked.sessionCount,
       targetModel: picked.targetModel,
       otherModelsExcluded: picked.otherModelsExcluded,
+      /** 请求结构探针：两轮 MCP 工具数，供调用方判断可比性 */
+      mcpToolCount: { baseline: bMcp, observed: oMcp, comparable: bMcp === oMcp },
+      /** 基线新鲜度 */
+      baselineAgeMs: Number.isFinite(baselineAge) ? baselineAge : null,
       /** 会话首条请求才是可比量：同会话后续轮次含累积历史 */
       basis: 'session-first-request',
     },
