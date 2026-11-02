@@ -56,13 +56,15 @@
 |---|---|
 | `DOC-OUTLINE.md` | **文档组账本**：主线 / 反面 / 术语 / 分篇 / 顺序 / 残余 |
 | `docs/product.md` | 产品要什么：定位、层边界、档位模型、范围、分期 |
-| `docs/framework.md` | 怎么造：四条契约、参照系、Core/Data 分层、事务语义 |
-| `docs/verification.md` | 怎么证明：四种策略、三态、五条硬保护、待实测 8 条 |
+| `docs/framework.md` | 怎么造：四条契约、参照系、分层、事务语义、**前端六条不变量** |
+| `docs/verification.md` | 怎么证明：三态、三种已实现策略、**判据何时会给出错答案**、待实测 8 条 |
 | `docs/handles.md` | 有哪些面：18 个把手的清单、风险、验证策略 |
 | `docs/recon-amendments.md` | **哪些旧结论被推翻**——冲突时以它为准 |
 | `docs/ledger.md` | **动过什么、还原了没**——动真实文件前后必须回填 |
-| `src/` | 实现：Core（契约/锚点/备份/引擎/trace）+ 把手 + 验证策略 + CLI + 服务端 |
-| `web/` | 控制台前端（原生 ESM，无构建；2026-11-01 按需求侧重构：顶部导航 + 任务卡 + 双按钮） |
+| `src/` | 实现：Core（契约/锚点/备份/引擎/trace）+ 把手 + 验证策略 + CLI + 服务端 + **启动器** |
+| `web/` | 控制台前端（原生 ESM，无构建；单状态 + 全量重渲染，43 处 render） |
+| `test/` | 前端断言 / 单元断言 / 启项断言（零依赖，`node --test`） |
+| `start-console.cmd` | **双击入口**：开浏览器、关窗口即停 |
 | `baselines/` | **最初基线账本**（每版本一套出厂快照，gitignore 排除不入库） |
 | `recon-baseline/` | 侦察基线（**冻结、只读、代码不依赖**） |
 
@@ -72,9 +74,23 @@
 - **遇到与侦察基线冲突**：以 `docs/recon-amendments.md` 为准（**唯一修正入口**）
 - **改任何事实性断言前**：核对 `docs/recon-amendments.md` 的修正总览——别引用侦察期原始判断
 - **把手现状**：`docs/handles.md`
-- **验证怎么做**：`docs/verification.md`
+- **验证怎么做**：`docs/verification.md`（先读「判据什么时候会给出错答案」）
+- **改前端前**：`docs/framework.md`「前端不变量」——六条各配断言，别绕过
 - **代码级证据**：`recon-baseline/evidence/asar-extract`（明文 minified JS，可直接 grep）
 - **可复用脚本**：`recon-baseline/tools/`（asar 解析、CDP 驱动、trace 读取；注意是 CommonJS）
+
+## 门禁（改完必须全绿）
+
+| 门禁 | 命令 | 期望 |
+|---|---|---|
+| 契约 | `npm run check:contracts` | exit 0 |
+| 自测 | `node src/selftest.mjs` | `通过 157 失败 0` |
+| 前端/单元/启项断言 | `npm test` | `pass 47 fail 0` |
+| 体检 | `node src/cli.mjs doctor` | `总判：✅ 全部通过` |
+| 一次跑完 | `npm run verify:all` | 以上三条串跑 |
+
+> **新增断言必须做红灯验证**：故意把修复改回去，确认断言**真的变红**。
+> 本轮有两条断言第一版是空转的（"改回去也全绿"），全靠红灯验证才发现。
 
 ## 已知踩坑（不得重犯）
 
