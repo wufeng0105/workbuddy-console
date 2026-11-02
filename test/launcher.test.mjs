@@ -413,21 +413,50 @@ test('WorkBuddy 在跑时必须先劝阻，探测不到必须如实说"无法确
   }
 });
 
+test('真实探测返回布尔 true 时必须走引导分支（R29 回归，行为）', async () => {
+  /**
+   * 为什么这条必须存在（残余 R29）：
+   * `isWorkBuddyRunning()` 返回 **true / false / 'unknown'**（布尔 + 一个字符串），
+   * 而旧代码判的是 `state === 'running'` —— 拿布尔比字符串，**真实路径上永不为真**，
+   * 那段引导从来没打印过。只有显式传 `--app-state running`（字符串）才走得到，
+   * 所以自测是绿的、真实双击入口失效。
+   *
+   * 上一批（WP11）在本文件里写过「默认分支只能静态断言，它读本机进程表」——**那个让步正是
+   * 缺陷的藏身处**：静态只查"默认值是不是 isWorkBuddyRunning() 的返回值"，
+   * 查不到"返回值类型与比较方式不匹配"。
+   *
+   * 现在 `--app-state` 允许直接注入探测器的**返回值类型**（布尔），于是这条能真行为化。
+   */
+  const store = mkStore('wbc-launch-bool-');
+  try {
+    const r = await runLaunch(['--app-state', 'true', '--no-open', '--store', store]);
+    assert.equal(r.code, 3,
+      `真实探测为 true（布尔）时必须拒绝启动（期望 exit 3，实际 ${r.code}）：${r.out}`);
+    assert.match(r.out, /WorkBuddy 正在运行/, `必须明说在跑：${r.out}`);
+    // 用户 2026-11-02 定版的四步顺序必须原文出现（不是"劝你别写"，而是"按这个顺序做"）
+    assert.match(r.out, /自己退出 WorkBuddy/, `必须说清第 3 步"自己退出"：${r.out}`);
+    assert.match(r.out, /再启动 WorkBuddy/, `必须说清第 4 步"再启动"：${r.out}`);
+    assert.match(r.out, /新建一个会话/, `必须说清"新建会话才生效"：${r.out}`);
+  } finally {
+    fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
 test('【静态】默认状态必须来自真实进程探测，不许猜（剥注释后）', () => {
   /**
-   * 为什么只能静态：默认分支调的是 `isWorkBuddyRunning()`，它读的是**本机进程表**。
+   * 为什么这一条只能静态：默认分支调的是 `isWorkBuddyRunning()`，它读的是**本机进程表**。
    * 断言"输出与真实探测结果一致"看着像行为断言，实际上是**机器相关的**：
    * 在 WorkBuddy 没开的机器上，"写死成没在运行"和"真的探测到没在运行"输出完全一样，
    * 这条断言抓不住最危险的那个方向（永远当没在运行 → 闸门静默失效）。
    * 所以这里退到接线层：默认值必须**是那个函数的返回值**，不许任何常量。
    *
-   * 分支本身（running / unknown 两条文案与退出码）已经由上面那条行为断言覆盖。
+   * ⚠️ 但"只能静态"这个让步本身曾经漏掉过缺陷（R29：返回值是布尔、比较却用字符串）。
+   * 现在那条缺陷由上面「真实探测返回布尔 true」那条**行为断言**覆盖，本条只管接线。
    */
   const src = stripLaunch();
-  const m = /const state = [\s\S]{0,160}?: (\w+\(\));/.exec(src);
+  const m = /flag === 'auto'[\s\S]{0,60}\?\s*(\w+\(\))/.exec(src);
   assert.ok(m, '找不到"默认状态"的取值处');
   assert.equal(m[1], 'isWorkBuddyRunning()',
     `默认状态必须直接来自进程探测（实际取的是 ${m[1]}）——猜一个值会让闸门在真在跑时静默失效`);
-  assert.doesNotMatch(src, /const state = '[a-z]+'/, '默认状态不许是硬编码的字符串');
 });
 

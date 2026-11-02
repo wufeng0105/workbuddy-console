@@ -12,7 +12,8 @@
  * 自测用参数：
  *   --port <n>          固定端口（默认 0 = 随机，避免撞端口）
  *   --no-open           不自动打开浏览器
- *   --app-state <s>     auto|running|closed —— 覆盖进程探测（只为自测注入）
+ *   --app-state <s>     auto|running|closed|true|false|unknown —— 覆盖进程探测（只为自测注入；
+ *                       取值允许直接写探测器的返回值布尔，用来覆盖"真实路径"分支）
  *   --yes               跳过"WorkBuddy 在跑"的确认
  *   --no-reuse          忽略已存在的实例，强制新起一个
  */
@@ -119,24 +120,42 @@ async function main() {
 
   const store = resolveStoreRoot(typeof f.store === 'string' ? f.store : undefined);
 
-  /* ── 前置：WorkBuddy 是不是还开着 ──────────────────────────── */
-  const state = typeof f['app-state'] === 'string' ? f['app-state']
-    : isWorkBuddyRunning();
-  if (state === 'running' && f.yes !== true) {
+  /* ── 前置：WorkBuddy 是不是还开着 ────────────────────────────
+   * ⚠️ 这里曾经有一个坑（残余 R29）：`isWorkBuddyRunning()` 返回的是
+   * `true|false|'unknown'`（布尔 + 一个字符串），而这里当时拿它去比字符串 `'running'`
+   * ⇒ 真实双击路径上**永不为真**，那段引导从来没打印过；只有显式传
+   * `--app-state running` 才走得到，所以自测是绿的而真实入口失效。
+   * 现在先把"探测值"归一成两个布尔 + 一个 unknown，再分支。
+   * 注：`--app-state` 的 `auto` 以前也会漏进"都不匹配"，一并修掉。
+   */
+  const flag = typeof f['app-state'] === 'string' ? f['app-state'] : 'auto';
+  const probe = flag === 'auto'
+    ? isWorkBuddyRunning()
+    // 注入值允许直接写探测器的**返回值类型**（布尔）。原因：真实探测只返回 true/false/'unknown'，
+    // 而旧代码拿它比字符串 'running'，只在"注入字符串"时才走得通 —— 那种测试**永远测不出真缺陷**。
+    // 所以这里允许 `--app-state true|false|unknown` 直接模拟真实返回值。
+    : (flag === 'running' || flag === 'true' ? true
+      : flag === 'closed' || flag === 'false' ? false
+        : 'unknown');
+  const running = probe === true;
+  const undetectable = probe === 'unknown';
+
+  if (running && f.yes !== true) {
     console.log('');
-    console.log(red('⚠  WorkBuddy 正在运行。'));
+    console.log(yellow('⚠  WorkBuddy 正在运行。按这个顺序做，改动才会真的生效：'));
     console.log('');
-    console.log('   现在写入会有两种情况，都不是你想要的：');
-    console.log(`     · ${yellow('行为规则 / 提示词模板')} —— 工具会直接拒绝执行（闸门 app-must-be-closed）`);
-    console.log(`     · ${yellow('身份 / 配置值 / 风格内容')} —— 能写进去，但当次会话读的是旧内容；`);
-    console.log('       而且应用自己（设置界面、会话里的记忆更新）也在写同一批文件，容易被回写盖掉');
+    console.log(`   ${'1'}）在本控制台里把要改的改完，逐项点「${'应用'}」`);
+    console.log(`   ${'2'}）${yellow('行为规则 / 提示词模板')}这两类会被直接拒绝 —— 闸门 ${'app-must-be-closed'}`);
+    console.log('        要求 WorkBuddy 已退出；其余（身份 / 配置值 / 风格内容）现在就能写');
+    console.log(`   ${'3'}）全部应用完成后，${yellow('自己退出 WorkBuddy')}`);
+    console.log(dim('        注意：退出时应用自己也可能回写这批配置。回到本控制台再看一眼，确认内容还在'));
+    console.log(`   ${'4'}）再启动 WorkBuddy，并${yellow('新建一个会话')} —— 改动在那时才生效`);
     console.log('');
-    console.log(dim('   建议：先退出 WorkBuddy，再回来双击本脚本。'));
-    console.log('   确实要在这个状态下继续（例如只想先看看/还原）：');
-    const go = f.yes === true || await askYes('  → 直接回车退出；输入 c 继续：');
+    console.log(dim('   （提前退出也无妨：退出 WorkBuddy 后重新双击本脚本，顺序一样。）'));
+    const go = await askYes('  → 直接回车退出；输入 c 继续：');
     if (!go) { console.log('\n已退出。'); return 3; }
     console.log(yellow('   继续 —— 规则与模板的写入会被拒绝，这是设计如此，不是故障。\n'));
-  } else if (state === 'unknown') {
+  } else if (undetectable) {
     console.log(yellow('⚠  无法确认 WorkBuddy 是否在运行（进程探测不可用）—— 请自行确认已退出。\n'));
   }
 
