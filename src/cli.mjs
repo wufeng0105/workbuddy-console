@@ -290,7 +290,15 @@ async function main(argv) {
         return undefined;
       }
       console.log(`✅ 已写入 ${r.handle}`);
-      console.log(`备份 ${r.backupId}（还原：node src/cli.mjs restore ${r.backupId}）`);
+      console.log(`备份 ${r.backupId}（**本次写入前**的状态；还原：node src/cli.mjs restore ${r.backupId}）`);
+      /**
+       * 把 `backupId` 的语义说在明处（残余 R42）。
+       *
+       * 它存的是"**最近一次**写入之前"的内容，不是"**最初**"的内容。
+       * 同一把手改过多次时，按它还原回到的是**上一次**——用户以为是原样，就会误判。
+       * 这句话放在这里而不是只写进文档：真正会用到它的人就在看这一行。
+       */
+      console.log('   注：同一把手改过多次时，这条备份回到"上一次"，不是"最初"。要回到最初请用「还原到最初基线」。');
       for (const w of r.gate.warnings) console.log(`⚠️  ${w}`);
       console.log(`验证策略 ${r.verification.strategy} @ ${r.verification.channel} —— 用 verify 子命令判定生效`);
       return undefined;

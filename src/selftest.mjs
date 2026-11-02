@@ -3070,6 +3070,98 @@ await atest('J4（R44①）：命中 0 条时 preview 必须报 willFail —— 
     `命中 0 条时 preview 必须报出 apply 会拒绝（实际 ${JSON.stringify(no.willFail ?? null)}）`);
 });
 
+await atest('J5（R41）：把手**进去才判得出来**的拒绝，不许留下与当前文件重复的孤儿备份', async () => {
+  /**
+   * 备份在 `h.apply` **之前**就建好了，而 `rules.*` 的"没有规则命中"必须先读到当前规则才判得了。
+   * 拒绝发生后那份备份与目标文件**逐字节相同** —— 冗余，但留在 store 里看起来像"动过"
+   * （实测 6 份同 sha 的备份，全是"未变"）。
+   * 这条钉的是分寸：这类拒绝**不留**备份，而**真正的写失败仍必须留**（铁律 1 不许被这次修掉）。
+   */
+  const dir = ensureDir(path.join(fixtureRoot, 'j5-rules'));
+  fs.cpSync(cfg, dir, { recursive: true, force: true });   // 复制锚点结构，只换 settings.json
+  fs.writeFileSync(path.join(dir, 'settings.json'), `${JSON.stringify({
+    sandbox: {
+      orderedRules: {
+        file: { presetVersion: 4, customized: false, rules: [{ path: '~/.ssh/', read: 'ask', write: 'ask', delete: 'ask' }] },
+        command: { presetVersion: 1, customized: false, rules: [] },
+        network: { presetVersion: 1, customized: false, rules: [] },
+      },
+    },
+  }, null, 2)}\n`, 'utf8');
+  const st2 = ensureDir(path.join(fixtureRoot, 'j5-store'));
+  const e = createEngine({ configRoot: dir, storeRoot: st2, appStateProbe: () => false });
+  const countIn = (root) => { const b = path.join(root, 'backups'); return fs.existsSync(b) ? fs.readdirSync(b).length : 0; };
+
+  // ── 腿 ①：拒绝发生在把手内部（命中 0 条）→ 不许留备份 ──
+  const before0 = countIn(st2);
+  let threw = null;
+  try { await e.apply('rules.file', { next: { from: 'deny', to: 'allow' } }); } catch (err) { threw = err; }
+  eq(threw?.code, 'NO_RULES_MATCHED', `这次拒绝应抛 NO_RULES_MATCHED（实际 ${threw?.code}）`);
+  eq(countIn(st2), before0, `"命中 0 条"的拒绝不许留下备份（改前 ${before0}，改后 ${countIn(st2)}）`);
+  eq(threw?.backupId ?? null, null, '清掉之后异常里不许再引用那个 id（否则文案指向一份不存在的备份）');
+  const row = readAudit(st2).filter((r) => r.event === 'apply' && r.status === 'failed').at(-1);
+  ok(row, '失败台账仍必须留下（失败也要可查）');
+  eq(row.backupId ?? null, null, '台账里的 backupId 也要跟着清掉');
+  eq(row.backupDropped, true, '台账要标明"这份备份被丢掉了"，否则事后对不上账');
+});
+
+await atest('J6（R41 对照腿）：**真正的写失败**仍必须保留备份 —— 挡住"顺手把所有失败备份都清掉"的过度修复', async () => {
+  /**
+   * 修 R41 时最容易走过头：看到"失败留备份是噪声"就把所有失败备份都删了。
+   * 但写失败的备份是"回到写前状态"的唯一凭据，而且报错文案会把它交给用户（R28）。
+   * 这条用**只读目标**造一次真写失败（原子写在 rename 那一步 EPERM），断言备份**还在**。
+   */
+  const dir = ensureDir(path.join(fixtureRoot, 'j6-rules'));
+  fs.cpSync(cfg, dir, { recursive: true, force: true });
+  const settings = path.join(dir, 'settings.json');
+  fs.writeFileSync(settings, `${JSON.stringify({
+    sandbox: {
+      orderedRules: {
+        file: { presetVersion: 4, customized: false, rules: [{ path: '~/.ssh/', read: 'ask', write: 'ask', delete: 'ask' }] },
+        command: { presetVersion: 1, customized: false, rules: [] },
+        network: { presetVersion: 1, customized: false, rules: [] },
+      },
+    },
+  }, null, 2)}\n`, 'utf8');
+  const st3 = ensureDir(path.join(fixtureRoot, 'j6-store'));
+  const e3 = createEngine({ configRoot: dir, storeRoot: st3, appStateProbe: () => false });
+  const countIn = (root) => { const b = path.join(root, 'backups'); return fs.existsSync(b) ? fs.readdirSync(b).length : 0; };
+  const beforeBytes = fs.readFileSync(settings);
+
+  fs.chmodSync(settings, 0o444);   // 只读目标 → rename 覆盖时 EPERM（Windows 实测）
+  let threw = null;
+  try { await e3.apply('rules.file', { next: { from: 'ask', to: 'allow', actions: ['read'] } }); } catch (err) { threw = err; }
+  finally { fs.chmodSync(settings, 0o666); }
+
+  ok(threw, '只读目标下这次写入必须失败（本对照腿的前提）');
+  ok(countIn(st3) >= 1,
+    `**真正的写失败必须保留备份**（铁律 1：它是回到写前状态的唯一凭据），实际备份数 ${countIn(st3)}`);
+  ok(String(threw.message ?? '').includes('写入未发生'),
+    `写失败文案仍要说清文件状态：${String(threw.message ?? '').slice(0, 120)}`);
+  eq(Buffer.compare(fs.readFileSync(settings), beforeBytes), 0, '写失败后目标文件必须逐字节不变');
+});
+
+await atest('J7（R42）：apply 输出必须说清 backupId 的语义 —— "最近一次写入前"，不是"最初"', async () => {
+  /**
+   * `backupId` 存的是"**最近一次**写入之前"的内容。同一把手改过多次时，按它还原回到的是
+   * **上一次**。用户以为是原样就会误判（独立验证那次就是这么差点判错的：soul 被 apply 三次，
+   * 按 `actions.json` 里记的那枚还原回不到 pristine）。
+   * 光写进文档没用 —— 真正会用到它的人就在看这一行输出，所以把话说在这里。
+   */
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+  const src2 = path.join(fixtureRoot, 'j7-soul.md');
+  fs.writeFileSync(src2, `J7 内容 ${Date.now()}\n`, 'utf8');
+  const r = spawnSync(process.execPath, [
+    cli, 'apply', 'personalization.soul', '--set', src2, '--root', cfg, '--store', store,
+  ], { encoding: 'utf8', timeout: 30000 });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  eq(r.status, 0, `apply 应成功：${out.slice(0, 200)}`);
+  ok(/本次写入前/.test(out), `必须写明这条备份是"本次写入前"的状态：${out.slice(0, 300)}`);
+  ok(/不是"最初"/.test(out), `必须提醒它**不等于"最初"**：${out.slice(0, 300)}`);
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

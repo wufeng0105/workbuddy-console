@@ -389,6 +389,35 @@ export function createEngine({
       written = await h.apply(ctx, { next });
     } catch (e) {
       /**
+       * ① 先判断这次是不是**什么都没写**（残余 R41）。
+       *
+       * 备份是在调 `h.apply` **之前**建的，而有些校验只能进去才做得了——
+       * 例如 `rules.*` 的"没有规则命中"，它必须先读到当前规则才知道命不命中。
+       * 这类拒绝发生后，那份备份的内容与目标文件**逐字节相同**，纯粹是冗余；
+       * 留在 store 里看起来却像"动过"，还会被误当成改动痕迹（实测 6 份同 sha 的）。
+       *
+       * 分寸（两条都要满足才清）：
+       *   · 不是一次真正的落盘尝试（`!isWriteFailure`）—— 原子写下"写失败 ⇒ 目标未变"，
+       *     但那种情况**保留**备份是对的（铁律 1：备份是唯一能回到写前状态的东西，
+       *     而且报错文案会把它交给用户）；
+       *   · 目标文件逐字节没变 —— 防止"写成功了、后面某步才抛错"被误判成没写。
+       * 两条都满足 ⇒ 这份备份与当前文件完全重复，删掉不影响任何可还原性。
+       */
+      let untouched = false;
+      if (!isWriteFailure(e)) {
+        try {
+          const now = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path) : Buffer.alloc(0);
+          untouched = Buffer.compare(now, Buffer.from(before, 'utf8')) === 0;
+        } catch { untouched = false; }
+      }
+      if (untouched) {
+        try {
+          fs.rmSync(path.join(backupsDir(storeRoot), manifest.id), { recursive: true, force: true });
+        } catch { /* 清不掉不影响结论 */ }
+      }
+      /** 清掉之后**不许再引用**那个 id：否则文案会把用户指向一份已经不存在的备份 */
+      const keepBackupId = untouched ? null : manifest.id;
+      /**
        * 写失败的文案必须说清"文件现在是什么状态"（R28）。
        *
        * 原子写带来一个新事实：**写失败 ⇒ 目标文件必然没被改过**。所以这里把裸 errno
@@ -397,7 +426,7 @@ export function createEngine({
        * 而当时的事实**正相反**（裸 writeFileSync 已把目标截断成 0 字节）。
        */
       const mapped = isWriteFailure(e)
-        ? writeFailureError(e, { handle: h.id, absPath: anchor.path, backupId: manifest.id })
+        ? writeFailureError(e, { handle: h.id, absPath: anchor.path, backupId: keepBackupId })
         : e;
       /**
        * 失败台账：**审计再失败也不许顶掉真实原因**（F6 的"二次伤害"）。
@@ -410,7 +439,8 @@ export function createEngine({
           handle: h.id,
           anchor: h.target,
           path: tildify(anchor.path),
-          backupId: manifest.id,
+          backupId: keepBackupId,
+          backupDropped: untouched || undefined,
           bytesBefore: Buffer.byteLength(before, 'utf8'),
           expectedDeltaTokens,
           gateKind: g.kind,
@@ -422,8 +452,8 @@ export function createEngine({
           reason: reason ?? `apply ${h.id}`,
         });
       } catch { /* 保留原始异常 e：它才是用户要看的失败原因 */ }
-      // 把备份 id 带进异常，让调用方知道"有一份备份，可以还原"
-      if (e && typeof e === 'object') e.backupId = manifest.id;
+      // 把备份 id 带进异常，让调用方知道"有一份备份，可以还原"（被清掉时是 null）
+      if (e && typeof e === 'object') e.backupId = keepBackupId;
       throw mapped;
     }
 
