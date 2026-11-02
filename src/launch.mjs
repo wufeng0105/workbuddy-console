@@ -59,23 +59,35 @@ const EXIT_TABLE = [
 ];
 
 /**
- * 参数表 —— **唯一来源**：`--help` 从它生成，未知参数也拿它校验。
+ * 参数表 —— **唯一来源**：`--help` 从它生成；未知参数、缺值、值域全都拿它校验。
  *
  * ⚠️ 之前这张表不存在：8 个参数**一个都没在 `--help` 里出现**（README 也没有），
- * 而拼错的参数被**静默忽略** —— 实测 `--stroe X` 没有任何抱怨，静默回落到默认 store，
- * 用户以为改到了数据目录，其实没有（残余 R51）。
+ * 而拼错的参数被**静默忽略** —— 实测 `--stroe X` 没有任何抱怨，静默回落到默认 store（残余 R51）。
+ *
+ * `bool: true` = 开关（不带值）；带 `arg` = 必须有值。`values` = 允许取值集合。
+ * 这三样是**校验的依据**，不是注释：独立复核（WP25）实测，只做"未知参数报错"而不做这三样时，
+ * `--store`（不给值）、`--store ""`、`--port`（不给值）、`--port abc`、`--app-state NONSENSE`
+ * 全都还能**静默**走偏 —— 其中 `--port` 不给值甚至会 `Number(true) = 1` 去监听 1 号端口并常驻。
  */
 const FLAGS = {
   port: { arg: '<n>', desc: '固定端口（默认 0 = 随机，不会撞端口）' },
   store: { arg: '<dir>', desc: '数据目录（默认 %USERPROFILE%\\.workbuddy-console；也可用 WORKBUDDY_CONSOLE_HOME）' },
   root: { arg: '<dir>', desc: 'WorkBuddy 配置根（默认 ~/.workbuddy）' },
-  'no-open': { arg: '', desc: '不自动打开浏览器' },
-  'no-reuse': { arg: '', desc: '忽略已在跑的实例、强制新起一个（会让旧实例失去入口，需确认）' },
-  yes: { arg: '', desc: '跳过确认（"WorkBuddy 在跑" / "遗弃旧实例"）' },
-  'app-state': { arg: '<s>', desc: 'auto|running|closed|true|false|unknown —— 覆盖进程探测（自测注入）' },
-  'selftest-emit': { arg: '<sig>', desc: '自测注入：服务起来后自己触发这个信号，用来验证停止路径' },
-  help: { arg: '', desc: '看这份说明' },
+  'no-open': { bool: true, desc: '不自动打开浏览器' },
+  'no-reuse': { bool: true, desc: '忽略已在跑的实例、强制新起一个（会让旧实例失去入口，需确认）' },
+  yes: { bool: true, desc: '跳过确认（"WorkBuddy 在跑" / "遗弃旧实例"）' },
+  'app-state': {
+    arg: '<s>',
+    desc: 'auto|running|closed|true|false|unknown —— 覆盖进程探测（自测注入）',
+    values: ['auto', 'running', 'closed', 'true', 'false', 'unknown'],
+  },
+  'selftest-emit': { arg: '<sig>', desc: '自测注入：服务起来后自己触发这个信号（只**触发**，不负责注册监听）' },
+  'selftest-report-listeners': { bool: true, desc: '自测注入：报告本进程注册了哪些信号监听，然后退出（**只报告**，不注册任何东西）' },
+  help: { bool: true, desc: '看这份说明' },
 };
+
+/** 需要关注的信号（停止路径 + 自测报告用；**唯一来源**） */
+const LIFECYCLE_SIGNALS = ['SIGINT', 'SIGHUP', 'SIGTERM'];
 
 /* ── 颜色：只在真终端里用，重定向到文件时不吐 ANSI ───────────── */
 const TTY = process.stdout.isTTY === true;
@@ -99,8 +111,51 @@ function parseArgs(argv) {
   return f;
 }
 
-/** 编辑距离，只为给拼错的参数一个"你是不是想写…" */
-function editDistance(a, b) {
+/**
+ * 把参数校验做全（残余 R51 的第二半，由独立复核 WP25 实测补出来的）：
+ * 1. **未知参数** → 报错（含"你是不是想写 X"）
+ * 2. **需要值的参数没给值** → 报错（`--store` / `--store ""` / `--port` 后面什么都没有）
+ * 3. **开关给了值** → 只接受 `--yes=true|false` 这种显式布尔，其余报错
+ * 4. **值域** → `--port` 必须 0–65535 的整数；`--app-state` 必须在允许集合里
+ *
+ * 为什么必须做全：只做第 1 条时，`--port` 不给值会 `Number(true) === 1`，
+ * 于是启动器真的去监听 **1 号端口**并常驻；`--store ""` 会静默回落默认目录。
+ * 这些都不是"报错不友好"，而是**用户以为改了、实际没改**。
+ *
+ * @param {Record<string, string|boolean>} f 会被就地规范化（`--yes=true` → `true`）
+ * @returns {string[]} 错误消息（空数组 = 通过）
+ */
+function validateArgs(f) {
+  const errors = [];
+  for (const [name, meta] of Object.entries(FLAGS)) {
+    if (!(name in f)) continue;
+    const v = f[name];
+    if (meta.bool) {
+      if (v === true) continue;
+      if (v === 'true') { f[name] = true; continue; }
+      if (v === 'false') { f[name] = false; continue; }
+      errors.push(`--${name} 是开关，不带值；收到 "${v}"`);
+      continue;
+    }
+    if (v === true || (typeof v === 'string' && v.trim() === '')) {
+      errors.push(`--${name} ${meta.arg} 需要一个值（没给）`);
+      continue;
+    }
+    if (meta.values && !meta.values.includes(String(v))) {
+      errors.push(`--${name} 只能是 ${meta.values.join(' / ')}，收到 "${v}"`);
+      continue;
+    }
+    if (name === 'port') {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 0 || n > 65535) {
+        errors.push(`--port 必须是 0–65535 的整数，收到 "${v}"`);
+      }
+    }
+  }
+  return errors;
+}
+
+/** 编辑距离，只为给拼错的参数一个"你是不是想写…" */function editDistance(a, b) {
   const m = a.length; const n = b.length;
   let prev = Array.from({ length: n + 1 }, (_, j) => j);
   for (let i = 1; i <= m; i += 1) {
@@ -175,33 +230,47 @@ function openBrowser(url) {
 }
 
 /**
- * 那个地址上跑的**是不是我们的控制台**？
+ * 那个地址上跑的**是不是我们的控制台**？入口文件还靠得住吗？
  *
  * ⚠️ 判据曾经只是"那个端口上的 `/` 回 200"（残余 R46，独立审计 WP24 第 2(b) 条）：
  * 让一个**外来 HTTP 服务**占住陈旧 `console-url.txt` 里的端口后，启动器会打印
- * 「✔ 控制台已经在跑，直接打开它」、把**那个外来地址**交给用户、**exit 0、根本不起服务**
- * （外来服务器的日志里确实收到了一次 `GET /`）。
+ * 「✔ 控制台已经在跑」、把**那个外来地址**交给用户、**exit 0、根本不起服务**。
  *
- * 所以判据必须是**指纹**，不是"活着"：
- *   不带令牌访问 `/api/overview` → 必须是 **401**，且响应体是本项目的 JSON 错误形态
- *   （`{error:{code:'UNAUTHORIZED'}}`）。外来服务要同时撞上这两条才会被误认。
+ * 现在的判据是三段，缺一不可（后两段是独立复核 WP25 逼出来的）：
+ *   ① 不带令牌 `/api/overview` → **401**，且响应体是 `{error:{code:'UNAUTHORIZED'}}`；
+ *      （WP25 实测：只查状态码、不查响应体时，一个"回 401 + 别的 JSON"的外来服务就会被误认）
+ *   ② **带上文件里那个令牌**再请求 → 必须 **200**；
+ *      （否则"控制台在跑、但入口文件里的令牌已经对不上"——那时把地址交给用户也是白给）
+ *   ③ 文件**存在但解析不出来** → 不能当作"没有实例"（那正是孤儿的新产线：文件一坏就起第二个、
+ *      覆盖入口、旧实例还活着却没人知道 —— WP25 第 2 条）。
  *
  * @param {string} store
- * @returns {Promise<string|null>} 命中则返回可用的带令牌 URL
+ * @returns {Promise<{status:'none'|'live'|'dead'|'unverifiable', url?:string, tokenOk?:boolean, why?:string}>}
  */
 async function probeExisting(store) {
   const f = path.join(store, 'state', 'console-url.txt');
-  if (!fs.existsSync(f)) return null;
-  const m = /http:\/\/127\.0\.0\.1:(\d+)\/\?token=([A-Za-z0-9_-]+)/.exec(fs.readFileSync(f, 'utf8'));
-  if (!m) return null;
+  if (!fs.existsSync(f)) return { status: 'none' };
+  let text = '';
+  try { text = fs.readFileSync(f, 'utf8'); } catch (e) { return { status: 'unverifiable', why: `读不出来：${e?.code ?? e}` }; }
+  const m = /http:\/\/127\.0\.0\.1:(\d+)\/\?token=([A-Za-z0-9_-]+)/.exec(text);
+  // 文件在、但里面没有一行是我们认得的地址 ⇒ **不知道**有没有实例在跑，不能当成"没有"
+  if (!m) return { status: 'unverifiable', why: '文件里找不到 127.0.0.1:<端口>/?token=… 这一行' };
+
+  const base = `http://127.0.0.1:${m[1]}`;
   try {
-    const r = await fetch(`http://127.0.0.1:${m[1]}/api/overview`, { signal: AbortSignal.timeout(1500) });
-    if (r.status !== 401) return null;
-    const body = await r.json();
-    if (body?.error?.code !== 'UNAUTHORIZED') return null;
-    return m[0];
-  } catch { /* 没在跑，或者不是我们的东西 —— 两种情况都该起新的 */ }
-  return null;
+    // ① 是我们的控制台吗
+    const r = await fetch(`${base}/api/overview`, { signal: AbortSignal.timeout(1500) });
+    if (r.status !== 401) return { status: 'dead' };
+    const body = await r.json().catch(() => null);
+    if (body?.error?.code !== 'UNAUTHORIZED') return { status: 'dead' };
+
+    // ② 文件里那个令牌还对得上吗
+    const authed = await fetch(`${base}/api/overview?token=${m[2]}`, { signal: AbortSignal.timeout(1500) });
+    return { status: 'live', url: m[0], tokenOk: authed.status === 200 };
+  } catch {
+    // 没在跑 —— 重启一个是对的
+    return { status: 'dead' };
+  }
 }
 
 /** @param {string} question */
@@ -224,6 +293,14 @@ async function main() {
       const s = suggestFlag(k);
       console.error(red(`❌ 未知参数：--${k}`) + (s ? yellow(`　你是不是想写 --${s}？`) : ''));
     }
+    console.error(dim('   --help 看全部参数。'));
+    return EXIT.usage;
+  }
+
+  /* ── 参数校验第二半：缺值 / 开关带值 / 值域（WP25 实测出来的静默走偏）── */
+  const argErrors = validateArgs(f);
+  if (argErrors.length) {
+    for (const msg of argErrors) console.error(red(`❌ ${msg}`));
     console.error(dim('   --help 看全部参数。'));
     return EXIT.usage;
   }
@@ -282,13 +359,51 @@ async function main() {
 
   /* ── 单实例：已经在跑就只开浏览器，不再起第二个 ─────────────── */
   const existing = await probeExisting(store);
-  if (f['no-reuse'] !== true && existing) {
+
+  /**
+   * 入口文件**存在但认不出**（坏掉 / 被别的程序改写）：不能当作"没有实例"。
+   *
+   * 这正是孤儿的新产线（独立复核 WP25 第 2 条）：把 `console-url.txt` 写坏，
+   * 再启动就会**静默**起第二个、覆盖入口，而旧实例还活着、API 仍 200 —— 没人知道它在。
+   * 闸门原来只看"文件里那个地址还活不活"，而输入本身坏了时就等于没有闸门。
+   * 处置：**明说"不知道"并要确认**（非交互 ⇒ 拒绝，退出码 4），不替用户做危险决定。
+   */
+  if (existing.status === 'unverifiable' && f.yes !== true) {
+    console.log('');
+    console.log(yellow('⚠  入口文件存在，但内容认不出来：'));
+    console.log(dim(`  ${path.join(store, 'state', 'console-url.txt')}`));
+    console.log(dim(`  原因：${existing.why}`));
+    console.log('');
+    console.log('  这意味着**无法确认**现在有没有实例在跑。直接起一个新的，');
+    console.log('  可能会把旧的那个变成孤儿（它还活着、还占着端口，但入口被覆盖）。');
+    console.log(dim('  不确定的话：先看看有没有控制台窗口开着，把它关掉再来。'));
+    console.log('');
+    const go = await askYes('  → 直接回车退出（先去确认）；输入 c 仍然起一个新的：');
+    if (!go) {
+      console.log('\n已退出 —— 没有起服务。');
+      return EXIT.refuseOrphan;
+    }
+    console.log(yellow('   仍要起新的 —— 如果旧实例还在，它将被遗弃。\n'));
+  }
+
+  if (f['no-reuse'] !== true && existing.status === 'live') {
+    if (existing.tokenOk === false) {
+      /**
+       * 是我们的控制台，但入口文件里的**令牌对不上**（文件被旧的一次运行留下的）。
+       * 这种情况**不许**再起第二个（那是孤儿），也**不许**把这份没用的地址交给用户 ——
+       * 如实说清楚，让他去那个窗口里复制新地址。WP25 探过这条：只验状态码会把这种情况漏过去。
+       */
+      console.log(yellow('⚠  控制台在跑，但入口文件里的令牌已经对不上了（那份地址打开会全是 401）。'));
+      console.log(dim('  去那个正在运行的控制台窗口里复制地址（每次启动令牌都会变）。'));
+      console.log(dim('\n  要停掉它：关掉那个窗口。'));
+      return EXIT.ok;
+    }
     console.log(green('✔ 控制台已经在跑，直接打开它（没有起第二个服务）。'));
-    console.log(`  ${existing}`);
+    console.log(`  ${existing.url}`);
     // 注意别把"用户主动要求不打开"说成"打开失败了"（曾经这么错过，会误导排障）
     if (f['no-open'] === true) {
       console.log(dim('  （--no-open：未打开浏览器）'));
-    } else if (openBrowser(existing)) {
+    } else if (openBrowser(existing.url)) {
       console.log(dim('  已交给默认浏览器。'));
     } else {
       console.log(yellow('  ⚠ 没能自动打开浏览器 —— 手动复制上面这行。'));
@@ -307,10 +422,10 @@ async function main() {
    *
    * 默认保守：非交互（重定向 / 自测 / 管道）拿不到确认 ⇒ **拒绝**，不起第二个。
    */
-  if (f['no-reuse'] === true && existing) {
+  if (f['no-reuse'] === true && existing.status === 'live') {
     console.log('');
     console.log(yellow('⚠  已经有一个控制台在跑：'));
-    console.log(`  ${existing}`);
+    console.log(`  ${existing.url}`);
     console.log('');
     console.log('  --no-reuse 会**再起一个**，并让上面那个失去入口：');
     console.log(dim('  它还活着、还占着端口、API 也还能用，但地址文件里只剩新地址了。'));
@@ -328,9 +443,9 @@ async function main() {
 
   /* ── 起服务 ───────────────────────────────────────────────── */
   const wantPort = f.port !== undefined ? Number(f.port) : 0;
-  let app;
+  let started;
   try {
-    app = await startConsole({
+    started = await startConsole({
       port: wantPort,
       root: typeof f.root === 'string' ? f.root : undefined,
       // `--store` 与 CLI 同义；不传则走 WORKBUDDY_CONSOLE_HOME / 默认目录
@@ -353,7 +468,7 @@ async function main() {
     }
     return EXIT.startFail;
   }
-  const { url, port, urlFile, version, configRoot } = app;
+  const { url, port, urlFile, version, configRoot } = started;
 
   console.log('');
   console.log(`${green('✔')} WorkBuddy ${bold(version)} 控制台已启动`);
@@ -374,11 +489,22 @@ async function main() {
 
   /* ── 常驻 ─────────────────────────────────────────────────── */
   let closing = false;
+  /** 真的关掉那个 http server —— 注意是 `started.app`，不是 `started` 本身 */
+  const closeServer = async () => {
+    try {
+      await started.app.close();
+      return true;
+    } catch (e) {
+      // 关不掉不影响退出（进程马上就要没了），但**不许再静默**：说一句，异步写盘好让它落下去。
+      process.stderr.write(`（关服务时出错：${e?.message ?? e}）\n`);
+      return false;
+    }
+  };
   const shutdown = async () => {
     if (closing) return;
     closing = true;
     console.log(green('\n✔ 已停止。'));
-    try { await app.close(); } catch { /* 关闭失败不影响退出 */ }
+    await closeServer();
     process.exit(EXIT.ok);
   };
   process.on('SIGINT', shutdown);   // Ctrl+C
@@ -393,17 +519,48 @@ async function main() {
   // 这里**故意不再有** `process.stdin.on('end', …)`：那是一段永远不会触发的死代码，
   // 详见文件头注释（控制台被关时进程先被杀；而 resume() 会让 `<nul` 一启动就自杀）。
 
-  /* 自测注入：服务起来后自己触发一个信号，好让断言能**行为地**验证停止路径。
-   * 为什么要有它：原来守"关窗口=服务停"的断言是**纯字符串匹配**，只查源码里有没有
-   * `process.on('SIGINT'` / `'SIGTERM'` —— 独立审计把 `shutdown()` 改成空转（字符串留着），
-   * 13 条断言**全绿**；而且它钉的信号根本不对（真实路径走 SIGHUP）。
-   * 现在断言可以 `--selftest-emit SIGHUP`，然后看进程有没有真的打出「✔ 已停止。」并退出 0。 */
+  /**
+   * 自测注入之一：**只报告**本进程注册了哪些信号监听，然后退出。
+   *
+   * 为什么必须有它（独立复核 WP25 的关键发现）：原来只有 `--selftest-emit`，
+   * 而那条断言既验"注册了"又验"停得掉"，两者是**同一个开关**触发的 ——
+   * 于是把 `process.on('SIGHUP', …)` 挪进 `if (selftest-emit)` 分支里（真实路径等于没接线），
+   * 断言**照样 19/19 全绿**，而同副本的真窗口实验立刻退化成 `^C` + 没有「✔ 已停止。」
+   * （也就是说：断言钉的是自己的监听器数组，不是操作系统的投递）。
+   *
+   * 现在两个开关各管一件事：
+   *   · `--selftest-report-listeners`（这里）：**不带任何别的注入**跑，报告真实路径上注册了什么；
+   *   · `--selftest-emit <sig>`（下面）：只负责**触发**，不负责注册。
+   * 断言两条都要过 ⇒ "只在自测分支里接线"这种变异一定会红。
+   */
+  if (f['selftest-report-listeners'] === true) {
+    for (const sig of LIFECYCLE_SIGNALS) {
+      process.stdout.write(`SELFTEST-LISTENERS:${sig}=${process.listenerCount(sig) > 0}\n`);
+    }
+    /**
+     * 顺带把"关得掉吗"也报出来（残余 R53）：这里必须用 `started.app.close()`。
+     * 之前 `shutdown()` 里写的是 `app.close()` —— 而 `app` 是 `startConsole` 的**返回对象**，
+     * 上面根本没有 `close` 方法 ⇒ 每次都是 `TypeError`，被 `catch {}` 吞掉，
+     * 于是"优雅关掉 server"**从来没执行过**，端口一直是靠 `process.exit()` 才释放的。
+     * 那条断言当时只验"打印了已停止 + 退出码 0"，验不出这个。
+     */
+    const closedOk = await closeServer();
+    process.stdout.write(`SELFTEST-CLOSED=${closedOk}\n`);
+    process.exit(closedOk ? EXIT.ok : EXIT.startFail);
+  }
+
+  /**
+   * 自测注入之二：服务起来后自己**触发**一个信号，好让断言能行为地验证停止路径。
+   *
+   * 为什么需要它：更早版本的断言是纯字符串匹配（只查源码里有没有 `process.on('SIGINT'`），
+   * 独立审计（WP24 的 M1）把 `shutdown()` 改成空转、只留那四个字符串 → 13 条断言**全绿**。
+   * 现在：`--selftest-emit SIGHUP` → 看进程有没有真的打出「✔ 已停止。」并退出 0。
+   */
   if (typeof f['selftest-emit'] === 'string') {
     const sig = f['selftest-emit'];
-    process.stdout.write(`\x00SELFTEST-READY\x00\n`);
+    process.stdout.write('\x00SELFTEST-READY\x00\n');
     setTimeout(() => {
-      const had = process.listenerCount(sig) > 0;
-      process.stdout.write(`\x00SELFTEST-LISTENERS:${sig}=${had}\x00\n`);
+      process.stdout.write(`\x00SELFTEST-EMIT:${sig}=${process.listenerCount(sig) > 0}\x00\n`);
       process.emit(sig);
     }, 120);
   }

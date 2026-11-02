@@ -116,31 +116,60 @@ if (unknown.length) fail(`这些编号被引用了却没有定义：${unknown.so
  *
  * 真实发生过三次：R9/R8（被独立审计抓出）、R27/R28/R29/R31（Lead 复核时发现）、
  * 以及 README 里仍写着「⚠️ 这一条当前未兑现（残余 R29）」—— 而 R29 早就修了。
- * 判据：如果本表把某条标成 `已兑现`，那么其它文档里**同一行**（或紧邻上下各一行）
- * 提到这个编号时，就不许出现"未兑现"；同时该行若已含"已修/已兑现"字样则放行
- * （那是在描述修复本身，不是过期声明）。
+ *
+ * ⚠️ 第一版是**安慰剂**（独立复核 WP25 实测）：只认死字符串「未兑现」，
+ * 于是 `尚未生效` / `还没修` / `待修` / `未修复` / 整句英文 全部放过；
+ * 只扫 11 个硬编码文件名，于是新文档整个漏掉；还有个"同行含「已修」就放行"的白名单，
+ * 一句 `R29 未兑现；已修正措辞待评审` 就能绕过去。
+ * 现在：措辞一律给全、扫描范围改成**仓库里所有 .md**、去掉白名单、窗口放宽到 ±2 行。
  */
+const PENDING_MARKERS = [
+  '未兑现', '尚未生效', '还没修', '尚未修', '未修复', '待修', '待修复',
+  'not yet fixed', 'still broken', 'not fixed yet',
+];
+const pendingRe = new RegExp(PENDING_MARKERS.join('|'), 'i');
+
+/** 仓库里所有 .md（跳过过程资料区与只读基线） */
+function allMarkdown() {
+  const out = [];
+  const skip = new Set(['.git', 'node_modules', '.zhll', 'recon-baseline', 'baselines']);
+  const walk = (dir) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (skip.has(ent.name)) continue;
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (ent.name.toLowerCase().endsWith('.md')) out.push(path.relative(REPO, p));
+    }
+  };
+  walk(REPO);
+  return out;
+}
+
 const doneIds = rows
   .filter((r) => (r.cells[2] ?? '').replace(/\*\*/g, '').trim().startsWith('已兑现'))
   .map((r) => r.id);
 const staleHits = [];
-for (const d of docs) {
-  const p = path.join(REPO, d);
-  if (!fs.existsSync(p)) continue;
-  const dl = fs.readFileSync(p, 'utf8').split(/\r?\n/);
+for (const d of allMarkdown()) {
+  const dl = fs.readFileSync(path.join(REPO, d), 'utf8').split(/\r?\n/);
+  /**
+   * ⚠️ 组窗口时必须**把残余表的行本身剔掉**：那是一行一条的表格，
+   * 相邻行的状态词「未兑现」会落进 ±2 行窗口，把隔壁行的编号误判成过期声明
+   * （第一版加强后一次报了 80 条，全是这种。状态词那一格已经由上面的 ⑤ 单独校验过）。
+   */
+  const isRow = dl.map((l) => /^\|\s*R\d+b?\s*\|/.test(l));
   for (let i = 0; i < dl.length; i += 1) {
-    const window = [dl[i - 1] ?? '', dl[i], dl[i + 1] ?? ''].join('\n');
-    if (!/未兑现/.test(window)) continue;
-    if (/已兑现|已修|已修复/.test(window)) continue;   // 在描述修复本身，放行
+    if (isRow[i]) continue;
+    const win = [-2, -1, 0, 1, 2].map((k) => (isRow[i + k] ? '' : (dl[i + k] ?? ''))).join('\n');
+    if (!pendingRe.test(win)) continue;
     for (const id of doneIds) {
-      if (new RegExp(`\\b${id}\\b`).test(window)) {
-        staleHits.push(`${d}:${i + 1} 把 ${id} 写成了未兑现，而本表已标为「已兑现」`);
+      if (new RegExp(`\\b${id}\\b`).test(win)) {
+        staleHits.push(`${d}:${i + 1} 把 ${id} 写成了"待修"（本表已标「已兑现」）`);
       }
     }
   }
 }
 if (staleHits.length) {
-  for (const h of staleHits) fail(`过期声明 —— ${h}`);
+  for (const h of [...new Set(staleHits)]) fail(`过期声明 —— ${h}`);
 }
 
 // ── 报告 ────────────────────────────────────────────────────

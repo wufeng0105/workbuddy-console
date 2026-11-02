@@ -109,19 +109,29 @@ function mkConfigRoot() {
  * ⚠️ 它必须带上**指纹**（残余 R46）。曾经复用判据只是"那个端口上的 `/` 回 200"，
  * 于是任何外来 HTTP 服务都会被当成我们的控制台 —— 启动器打印「已经在跑」、
  * 把外来地址交给用户、exit 0、根本不起服务（独立审计 WP24 第 2(b) 条实测）。
- * 真控制台的特征是：不带令牌访问 `/api/overview` → **401** 且响应体是
- * `{error:{code:'UNAUTHORIZED'}}`。假控制台必须照这个来，否则测的是旧判据。
+ * 真控制台的特征是两段：不带令牌 `/api/overview` → **401** 且响应体
+ * `{error:{code:'UNAUTHORIZED'}}`；带上正确令牌 → **200**。
  *
- * @param {{ours?: boolean}} [opts] `ours:false` → 一个**外来**服务器（对什么都回 200）
+ * `kind` 三档（后两档是独立复核 WP25 补的，专门用来打"只验状态码"这种半吊子判据）：
+ *   'ours'        —— 我们的控制台（401+精确 body / 带令牌 200）
+ *   'foreign200'  —— 外来服务：对什么都回 200
+ *   'foreign401'  —— 外来服务：回 **401 但响应体不是我们的形态**（`{error:"Unauthorized"}`）
  */
-async function startFakeConsole({ ours = true } = {}) {
+async function startFakeConsole({ kind = 'ours' } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     hits.push(req.url);
-    if (ours && req.url.startsWith('/api/overview')) {
-      res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: '缺少或错误的会话令牌' } }));
-      return;
+    if (req.url.startsWith('/api/overview')) {
+      if (kind === 'foreign401') {
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      if (kind === 'ours' && !/[?&]token=/.test(req.url)) {
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: '缺少或错误的会话令牌' } }));
+        return;
+      }
     }
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('ok');
@@ -130,21 +140,33 @@ async function startFakeConsole({ ours = true } = {}) {
   const { port } = srv.address();
   return {
     hits,
+    port,
     url: `http://127.0.0.1:${port}/?token=FAKE-TOKEN-abc123`,
     close: () => new Promise((resolve) => srv.close(resolve)),
   };
 }
 
 /**
- * 子进程环境：把测试运行器自己的隔离变量摘掉，并清掉 ELECTRON_RUN_AS_NODE。
+ * 子进程环境：把测试运行器自己的隔离变量**换成一个临时目录**（不是删掉！），并清掉 ELECTRON_RUN_AS_NODE。
  * 不清后者会让孩子"当 Node 跑、静默退出码 0"（AGENTS.md 记过的坑）。
+ *
+ * ⚠️ 为什么是"换成临时目录"而不是"删掉"（残余 R54）：
+ * 原来的实现把 `WORKBUDDY_CONSOLE_HOME` 删了 —— 于是任何**忘记带 `--store`** 的用例，
+ * 子进程都会回落到**真实的** `~/.workbuddy-console`。这不是理论风险：
+ * 独立复核 WP25 跑变异时、以及本文件早期版本里，都真的往真实 store 写过
+ * `state/console-url.txt`（一台机器上留了两份证据）。
+ * 隔离不该依赖"每一处都记得"，而该依赖"默认就是安全的"。
  */
+const SAFE_HOME = path.join(os.tmpdir(), `wbc-launch-home-${process.pid}`);
+fs.mkdirSync(SAFE_HOME, { recursive: true });
+
 function childEnv(extra = {}) {
   const env = { ...process.env };
-  delete env.WORKBUDDY_CONSOLE_HOME;
   delete env.WORKBUDDY_CONFIG_DIR;
   delete env.WORKBUDDY_BASELINES_DIR;
   delete env.ELECTRON_RUN_AS_NODE;
+  // 默认就指向临时目录；用例要测"回落"时用 extra 显式覆盖
+  env.WORKBUDDY_CONSOLE_HOME = SAFE_HOME;
   return { ...env, ...extra };
 }
 
@@ -156,7 +178,18 @@ function childEnv(extra = {}) {
  *   `waitFor` 命中即返回并**收掉**子进程 —— 用于"它已经开始常驻，我们只想看它打印了什么"。
  * @returns {Promise<{code:number|null, out:string, how:'exit'|'waitFor'|'timeout'|'error'}>}
  */
-function runLaunch(args, { env = {}, waitFor = null, timeoutMs = 25000 } = {}) {
+function runLaunch(args, { env = {}, waitFor = null, timeoutMs = 25000, allowNoStore = false } = {}) {
+  /**
+   * 兜底闸门（残余 R54）：**允许起服务的调用必须能证明自己隔离了**。
+   * 判据：参数里有 `--store`，或者调用方显式给了 `WORKBUDDY_CONSOLE_HOME`。
+   * 只 print 不启服务的那几条（`--help`、未知参数、参数校验失败）豁免 —— 用 `allowNoStore` 标。
+   */
+  const hasStore = args.includes('--store');
+  const hasHome = Object.prototype.hasOwnProperty.call(env, 'WORKBUDDY_CONSOLE_HOME');
+  if (!hasStore && !hasHome && !allowNoStore) {
+    throw new Error(`runLaunch(${JSON.stringify(args)}) 既没有 --store 也没给 WORKBUDDY_CONSOLE_HOME —— `
+      + '这条用例有可能写到真实 store。确认它不会起服务后，显式传 { allowNoStore: true }。');
+  }
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [LAUNCH, ...args], {
       cwd: REPO,
@@ -276,8 +309,8 @@ test('关窗口 = 服务停：**行为**验证停止路径（不是查源码里�
       '--selftest-emit', 'SIGHUP'], { timeoutMs: 15000 });
     assert.equal(r.code, 0,
       `收到 SIGHUP 后应当优雅停止并退出 0（实际 code=${r.code} how=${r.how}）：${r.out.slice(0, 500)}`);
-    assert.match(r.out, /SELFTEST-LISTENERS:SIGHUP=true/,
-      `必须真的注册了 SIGHUP（关窗口在 Windows 上走的就是它）：${r.out.slice(0, 500)}`);
+    assert.match(r.out, /SELFTEST-EMIT:SIGHUP=true/,
+      `触发时 SIGHUP 必须已有监听者（关窗口在 Windows 上走的就是它）：${r.out.slice(0, 500)}`);
     assert.match(r.out, /✔ 已停止。/,
       `收到信号后必须走完停止路径（shutdown 空转时这句话不会出现）：${r.out.slice(0, 500)}`);
   } finally {
@@ -425,8 +458,11 @@ test('已在跑时复用实例，不发第二次启动（行为）', async () =>
     assert.equal(r.code, 0, `复用时应正常退出 0（实际 ${r.code}）：${r.out}`);
     assert.match(r.out, /已经在跑/, `必须报告"已经在跑"，而不是闷头起第二个：${r.out}`);
     assert.doesNotMatch(r.out, /控制台已启动/, `已经复用了就不许再起一个服务：${r.out}`);
-    assert.equal(fake.hits.length, 1,
-      `复用判据必须真的去探那个实例（"端口真的应答"而不是"文件在"），实际探测 ${fake.hits.length} 次`);
+    // 探针现在是两段：① 不带令牌问 /api/overview（验"是不是我们的"）② 带上令牌再问（验令牌还对得上）
+    assert.equal(fake.hits.length, 2,
+      `复用判据必须真的去探那个实例（现在是两段指纹），实际探测 ${fake.hits.length} 次：${JSON.stringify(fake.hits)}`);
+    assert.ok(fake.hits[0].startsWith('/api/overview'),
+      `第一次探测必须打 /api/overview（而不是只看 "/" 回没回 200）：实际 ${fake.hits[0]}`);
   } finally {
     await fake.close();
     fs.rmSync(store, { recursive: true, force: true });
@@ -530,23 +566,120 @@ test('R46：外来 HTTP 服务占着旧端口时，**不许**被当成"我们的
    * 打印「✔ 控制台已经在跑，直接打开它」、把**外来地址**交给用户、exit 0、**根本不起服务**
    * （外来服务器日志里确实收到了一次 `GET /`）。
    *
-   * 现在判据是**指纹**：不带令牌访问 `/api/overview` 必须是 401 且响应体形如
-   * `{error:{code:'UNAUTHORIZED'}}`。外来服务器（对什么都回 200）必须被识破，
-   * 启动器要**自己起一个**。
+   * 两档外来服务都要被识破 —— 第二档是独立复核 WP25 逼出来的：
+   * 只验"状态码是 401"而不验响应体形态时，一个**回 401 但 body 是别的东西**的外来服务
+   * 会被误认（作者当时的变异实验里，把响应体那一行删掉仍然 19/19 全绿）。
    */
-  const store = mkStore('wbc-launch-r46-');
-  const foreign = await startFakeConsole({ ours: false });
+  for (const kind of ['foreign200', 'foreign401']) {
+    const store = mkStore(`wbc-launch-r46-${kind}-`);
+    const foreign = await startFakeConsole({ kind });
+    try {
+      writeConsoleUrl(store, foreign.url);
+      const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open'],
+        { waitFor: /控制台已启动/, timeoutMs: 15000 });
+      assert.equal(r.how, 'waitFor',
+        `[${kind}] 外来服务占着端口时必须自己起一个，不许宣称"已经在跑"：${r.out.slice(0, 400)}`);
+      assert.doesNotMatch(r.out, /已经在跑/,
+        `[${kind}] 外来服务器绝不能被认成我们的控制台：${r.out.slice(0, 400)}`);
+    } finally {
+      await foreign.close();
+      fs.rmSync(store, { recursive: true, force: true });
+    }
+  }
+});
+
+test('R47 第二产线：入口文件**坏掉**时不许静默起第二个（那也是一条造孤儿的产线）', async () => {
+  /**
+   * 独立复核 WP25 第 2 条：闸门原来只看"文件里那个地址还活不活"，
+   * 而输入本身坏掉时就等于**没有闸门** —— 把 `console-url.txt` 写坏再启动，
+   * 会静默起第二个、覆盖入口，旧实例还活着却没人知道。
+   *
+   * 现在：文件在但认不出来 ⇒ 明说"无法确认"并要确认；非交互拿不到确认 ⇒ 拒绝（exit 4）。
+   */
+  const store = mkStore('wbc-launch-r47b-');
   try {
-    writeConsoleUrl(store, foreign.url);
+    fs.writeFileSync(path.join(store, 'state', 'console-url.txt'), '这不是我们写的格式\n', 'utf8');
     const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open'],
-      { waitFor: /控制台已启动/, timeoutMs: 15000 });
-    assert.equal(r.how, 'waitFor',
-      `外来服务占着端口时必须自己起一个，不许宣称"已经在跑"：${r.out.slice(0, 400)}`);
-    assert.doesNotMatch(r.out, /已经在跑/,
-      `外来服务器绝不能被认成我们的控制台：${r.out.slice(0, 400)}`);
+      { timeoutMs: 12000 });
+    assert.equal(r.code, 4,
+      `入口文件坏掉又拿不到确认时必须拒绝（期望 exit 4，实际 ${r.code}）：${r.out.slice(0, 500)}`);
+    assert.match(r.out, /认不出来|无法确认/,
+      `必须说清"我不知道现在有没有实例在跑"：${r.out.slice(0, 500)}`);
+    assert.doesNotMatch(r.out, /控制台已启动/, '拒绝时绝不许已经起了服务');
+    // 文件的原始内容不许被踩掉（没起服务就不该重写入口）
+    assert.equal(fs.readFileSync(path.join(store, 'state', 'console-url.txt'), 'utf8'), '这不是我们写的格式\n',
+      '拒绝时不许改写入口文件');
   } finally {
-    await foreign.close();
     fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test('R48：**真实路径**上必须注册 SIGHUP，且 server 真的关得掉（不是"打印了已停止"就算）', async () => {
+  /**
+   * 独立复核 WP25 的 H6d 变异打穿了原断言：把 `process.on('SIGHUP', …)` 挪进
+   * `if (--selftest-emit)` 分支里（真实路径等于没接线），`node --test` 仍然 **19 pass / 0 fail** ——
+   * 因为断言自己也靠那个开关触发，它钉的是**自己的监听器数组**，不是真实路径。
+   *
+   * 现在分两个开关：本用例**不带** `--selftest-emit`，只让启动器报告它注册了什么。
+   *
+   * 同时钉住残余 R53：`shutdown()` 里原来写的是 `app.close()`，而 `app` 是 `startConsole`
+   * 的**返回对象**（server 在 `app.app` 里）⇒ 每次都是 TypeError、被 `catch {}` 吞掉，
+   * "优雅关掉 server"从来没执行过，端口一直是靠 `process.exit()` 释放的。
+   * 所以这里要求 `SELFTEST-CLOSED=true`。
+   */
+  const store = mkStore('wbc-launch-r48-');
+  try {
+    const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open',
+      '--selftest-report-listeners'], { timeoutMs: 15000 });
+    assert.equal(r.code, 0, `应正常退出 0（实际 ${r.code}）：${r.out.slice(0, 500)}`);
+    for (const sig of ['SIGINT', 'SIGHUP', 'SIGTERM']) {
+      assert.match(r.out, new RegExp(`SELFTEST-LISTENERS:${sig}=true`),
+        `真实路径必须注册 ${sig}（关窗口走的就是 SIGHUP）：${r.out.slice(0, 500)}`);
+    }
+    assert.match(r.out, /SELFTEST-CLOSED=true/,
+      `server 必须真的关得掉（`+"`app.close()`"+` 是 TypeError 的话这里会是 false）：${r.out.slice(0, 500)}`);
+  } finally {
+    fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test('R51 第二半：缺值 / 开关带值 / 值域都必须硬报错（这些原来会**静默走偏**）', async () => {
+  /**
+   * 独立复核 WP25 实测出来的四条静默走偏（只做"未知参数报错"堵不住）：
+   *   · `--store` 后面没值      → exit 0，**静默回落默认 store**（写到了 ~/.workbuddy-console）
+   *   · `--store ""`            → 同上
+   *   · `--port` 后面没值       → `Number(true) === 1`，**真的去监听 1 号端口并常驻**
+   *   · `--port abc`            → exit 1 + Node 英文原文（而退出码表说 1 = 起不来、2 = 参数错）
+   *   · `--app-state NONSENSE`  → 静默降级成 unknown
+   *
+   * ⚠️ 每条都必须带 `--store <临时>`：**这个用例自己就是"最该保证隔离"的那条**。
+   * WP25 跑变异时就是在这里漏了 `--store` —— 参数校验一被拆掉，被测的启动器就真的
+   * 以默认 store 起了服务、写下真实 `~/.workbuddy-console/state/console-url.txt`。
+   * 断言"未知参数会被拒"的测试，绝不能有能力写到真实目录。
+   */
+  const cases = [
+    { args: ['--store'], why: '--store 没给值' },
+    { args: ['--store', ''], why: '--store 给了空串' },
+    { args: ['--port'], why: '--port 没给值' },
+    { args: ['--port', 'abc'], why: '--port 不是数字' },
+    { args: ['--port', '70000'], why: '--port 超范围' },
+    { args: ['--app-state', 'NONSENSE'], why: '--app-state 取值不在集合里' },
+    { args: ['--yes=maybe'], why: '开关给了非布尔值' },
+  ];
+  for (const c of cases) {
+    const guard = mkStore('wbc-launch-r51b-');
+    /**
+     * 隔离用的 `--store` 必须放在**前面**：这些用例测的正是"后面的参数没给值"，
+     * 如果把 guard 追加在后面，`['--store','--store',guard]` 里第二个 `--store` 会把值补上，
+     * 用例就变成"参数其实没问题"而挂死（第一版就这么错，12 s 超时）。
+     */
+    const args = ['--store', guard, ...c.args];
+    const r = await runLaunch(args, { timeoutMs: 12000 });
+    assert.equal(r.code, 2, `[${c.why}] 必须 exit 2（实际 ${r.code}）：${r.out.slice(0, 400)}`);
+    assert.doesNotMatch(r.out, /控制台已启动/, `[${c.why}] 参数不对时绝不许起服务：${r.out.slice(0, 400)}`);
+    assert.ok(!fs.existsSync(path.join(guard, 'state', 'console-url.txt')),
+      `[${c.why}] 参数不对时不许写任何入口文件`);
+    fs.rmSync(guard, { recursive: true, force: true });
   }
 });
 
@@ -569,7 +702,7 @@ test('R47：`--no-reuse` 遇到已在跑的实例，必须**拒绝**并说清后
     assert.match(r.out, /已经有一个控制台在跑/, `必须告诉用户旧的还在：${r.out.slice(0, 400)}`);
     assert.match(r.out, /失去入口/, `必须说清"旧实例会怎样"：${r.out.slice(0, 400)}`);
     assert.doesNotMatch(r.out, /控制台已启动/, '拒绝时**绝不许**已经起了第二个服务');
-    assert.equal(fake.hits.length, 1, `应当只探测一次，实际 ${fake.hits.length} 次`);
+    assert.equal(fake.hits.length, 2, `应当只探测两段指纹，实际 ${fake.hits.length} 次`);
   } finally {
     await fake.close();
     fs.rmSync(store, { recursive: true, force: true });
@@ -604,17 +737,29 @@ test('R51：`--help` 必须列全部参数与退出码；未知参数必须硬�
    * 且拼错的参数被**静默忽略** —— 实测 `--stroe X` 无任何抱怨、静默回落到默认 store，
    * 用户以为改到了数据目录，其实没有。
    */
-  const help = await runLaunch(['--help'], { timeoutMs: 10000 });
+  // `--help` 在起服务之前就返回，不会碰 store —— 显式声明豁免
+  const help = await runLaunch(['--help'], { timeoutMs: 10000, allowNoStore: true });
   assert.equal(help.code, 0, `--help 应 exit 0（实际 ${help.code}）：${help.out.slice(0, 300)}`);
   for (const flag of ['--port', '--store', '--root', '--no-open', '--no-reuse', '--yes', '--app-state', '--help']) {
     assert.ok(help.out.includes(flag), `--help 必须列出 ${flag}：${help.out.slice(0, 600)}`);
   }
   assert.match(help.out, /退出码/, `--help 必须给出退出码含义（WP24 第 6 条：全仓库没有文档）：${help.out.slice(0, 600)}`);
 
-  const bad = await runLaunch(['--stroe', 'X'], { timeoutMs: 10000 });
+  /**
+   * ⚠️ 必须带 `--store <临时>`：这条用例验的是"未知参数会被拒"，
+   * 一旦校验被拆掉（变异实验就会这么干），被测的启动器就**真的会起服务**。
+   * 不隔离的话它会以默认 store 启动并写下真实 `~/.workbuddy-console/state/console-url.txt`
+   * —— 独立复核 WP25 就是这么误写过一次（已存档并清理）。
+   * **最该保证隔离的那条用例，恰恰最不隔离**，这个坑值得单独记一笔。
+   */
+  const guard = mkStore('wbc-launch-r51-guard-');
+  const bad = await runLaunch(['--stroe', 'X', '--store', guard], { timeoutMs: 10000 });
   assert.equal(bad.code, 2, `未知参数必须 exit 2（实际 ${bad.code}）：${bad.out.slice(0, 300)}`);
   assert.match(bad.out, /未知参数：--stroe/, `必须点名那个参数：${bad.out.slice(0, 300)}`);
   assert.match(bad.out, /--store/, `必须给出"你是不是想写 --store"：${bad.out.slice(0, 300)}`);
+  assert.ok(!fs.existsSync(path.join(guard, 'state', 'console-url.txt')),
+    '未知参数被拒时不许起服务（否则测试自己就污染了 store）');
+  fs.rmSync(guard, { recursive: true, force: true });
 });
 
 test('【静态】默认状态必须来自真实进程探测，不许猜（剥注释后）', () => {
