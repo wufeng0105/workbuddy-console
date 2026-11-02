@@ -230,8 +230,16 @@ h1, h2, h3 { margin: 0; }
 .ledger-evt .mk-apply { color: var(--accent); }
 .ledger-evt .mk-restore { color: var(--ink-2); }
 .ledger-evt .mk-verify { color: var(--ok); }
+/* 验证三态不得合并：生效绿 / 未生效红 / 无法判定黄（铁律 6） */
+.ledger-evt .mk-ok { color: var(--ok); }
+.ledger-evt .mk-bad { color: var(--bad); }
+.ledger-evt .mk-warn { color: var(--warn); }
 .ledger-evt .mk-neutral { color: var(--ink); }
 .ledger td code { font-size: 12px; }
+
+/* 整页级加载失败横幅里的错误清单 */
+.err-list { margin: 6px 0 8px; padding-left: 20px; }
+.err-list li { font-size: 12px; line-height: 1.65; }
 
 /* ══════════════ 总览 · 页尾边界条（黄） ══════════════ */
 
@@ -640,4 +648,70 @@ h1, h2, h3 { margin: 0; }
   .nav-tabs { display: none; }
   .task-grid { grid-template-columns: 1fr; }
   .hs-sep { display: none; }
+}
+
+/* ══════════════ 站内对话框（替代 window.prompt / confirm） ══════════════ */
+/* 原生弹窗在无头/自动化环境会阻塞页面，且无法表达"这是危险操作"的语气 */
+.dlg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(12, 20, 33, 0.38);
+  backdrop-filter: blur(2px);
+}
+
+.dlg {
+  width: min(520px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  overflow: auto;
+  background: var(--surface, #fff);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(12, 20, 33, 0.28), 0 2px 8px rgba(12, 20, 33, 0.12);
+  padding: 22px 24px 18px;
+}
+
+.dlg-h { font-size: 16px; font-weight: 600; margin-bottom: 10px; color: var(--ink, #121a26); }
+
+.dlg-b {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--ink-2, #5a6673);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+  margin-bottom: 14px;
+}
+
+.dlg .input { width: 100%; margin-bottom: 16px; }
+
+.dlg-f { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ══════════════ 只读内容查看区（厂商参考件） ══════════════ */
+/* 厂商文件不能编辑，但必须能看 —— 原来只能看一行摘要，想确认内容时无处可看 */
+.read-only-text {
+  margin: 0 0 10px;
+  padding: 12px 14px;
+  max-height: 420px;
+  overflow: auto;
+  background: var(--hover, #f6f8fa);
+  border: 1px solid var(--line, #e4e8ee);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-2, #5a6673);
+  user-select: text;
+}
+
+/* 参考件卡：只读内容区 与 写操作授权区 分开（后者不是"内容"的一部分） */
+.ref-actions {
+  border-top: 1px dashed var(--line, #e4e8ee);
+  margin-top: 8px;
+  padding-top: 12px;
 }
