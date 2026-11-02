@@ -8,7 +8,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "check:contracts": "node -e \"import('./src/core/contracts.mjs').then(m=>console.log('contracts ok:', m.HANDLE_STEPS.length, 'steps,', m.VERIFY_STRATEGIES.length, 'verify strategies'))\""
+    "check:contracts": "node -e \"import('./src/core/contracts.mjs').then(m=>console.log('contracts ok:', m.HANDLE_STEPS.length, 'steps,', m.VERIFY_STRATEGIES.length, 'verify strategies'))\"",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:frontend": "node --test test/frontend.test.mjs",
+    "test:launcher": "node --test test/launcher.test.mjs",
+    "selftest": "node src/selftest.mjs",
+    "doctor": "node src/cli.mjs doctor",
+    "start": "node src/launch.mjs",
+    "verify:all": "npm run check:contracts && npm run selftest && npm run test"
   },
   "dependencies": {},
   "devDependencies": {}
