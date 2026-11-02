@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createResolver } from './anchor.mjs';
-import { createBackup, restoreBackup, listBackups, sha256 } from './backup.mjs';
+import { createBackup, restoreBackup, listBackups, sha256, readManifest } from './backup.mjs';
 import { appendAudit, readAudit } from './audit.mjs';
 import { diffLines, renderDiff } from './diff.mjs';
 import { estimateCost } from './tokens.mjs';
@@ -28,7 +28,7 @@ import { buildBundle, readBundle, detectDrift } from './replay.mjs';
 import { previewApproval, findApprovalLevel, combineVerdicts, APPROVAL_LEVELS } from './approval.mjs';
 import { applyLevel, detectLevel } from './safety-block.mjs';
 import { readRules } from './rules.mjs';
-import { tildify } from './paths.mjs';
+import { tildify, backupsDir } from './paths.mjs';
 
 /** @param {object} h */
 function meta(h) {
@@ -135,8 +135,28 @@ export function createEngine({
   }
 
   // ── 4. 写入（备份先行，铁律 1）──────────────────────────────
-  async function apply(id, { next = '', confirm = false, reason } = {}) {
+  async function apply(id, { next, confirm = false, reason } = {}) {
     const h = registry.get(id);
+
+    /**
+     * ⚠️ 防线（独立复核 D1，CRITICAL）：`next` 必须是**显式传进来的值**。
+     *
+     * 曾经签名是 `{ next = '' }` —— 漏传就兜底成空字符串，把手把整个文件写成空。
+     * 实测：32 字节的人设文件 → 0 字节，CLI 还打印「✅ 已写入」。
+     * 一次漏参数的命令就清空用户数据，而且工具用绿色说成功。
+     *
+     * 现在：`next` 为 undefined（漏传）直接拒绝；只有**显式**传空字符串才允许清空
+     * （那是用户的真实意图，例如主动清空某段内容）。
+     */
+    if (next === undefined) {
+      throw new ConsoleError(
+        'INPUT_MISSING',
+        `未提供写入内容（next）—— 拒绝执行。`
+        + `\n  这是防"漏参数把 ${h.title} 的整个文件清空"的硬防线（曾实测 32 字节 → 0 字节且报成功）。`
+        + `\n  确实要清空内容，请显式传空字符串。`,
+        { handle: h.id },
+      );
+    }
 
     const g = gateCheck(h);
     if (g.blocked) throw new GateBlockedError(g.reason, { handle: h.id, gate: g.kind });
@@ -150,12 +170,95 @@ export function createEngine({
     const anchor = anchorFor(h);
     const before = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path, 'utf8') : '';
 
+    /**
+     * 无改动即不写、不备份。
+     *
+     * 曾经（T3）：apply 不做 noop 判定，内容一模一样也照写、照建备份 ——
+     * 于是用户每点一次「应用」就多一份噪声备份，台账里也分不清哪次真改了什么。
+     * `restoreBaseline` 一直有 `changed` 判定，apply 却没有，两个同类动作语义不一致。
+     *
+     * 判定分两层（独立复核 D4 指出第一版只覆盖 10/18 把手）：
+     *
+     *   ① **纯文本把手**（身份文件 / 风格 / 模板）：写入内容与现存文本逐字节比较，
+     *      相同就直接返回 noop，**连备份都不建**。这是零成本的预判。
+     *   ② **结构化把手**（JSON 字段 / 规则矩阵）：它们做"最小改动写入"，
+     *      传入的 next 与文件全文根本不可比（例如 toneStyle 传的是枚举值 'efficient'，
+     *      文件是整篇 JSON）。对这些只能**写完再比**：前后字节一致则判定为 noop，
+     *      并把刚建的备份删掉（否则就是噪声备份）。
+     *
+     * 第一版只做了 ①，导致 value 型（toneStyle / customPrompt）与 rule-op 型
+     * （rules.*）同值重复 apply 仍然每次建备份 —— 计划里的验收判据「同内容两次备份数不变」不通过。
+     */
+    const nextText = typeof next === 'string' ? next : JSON.stringify(next);
+
+    /**
+     * "整文件文本把手"的判定 —— **不能靠猜**（独立复核 D4 抓出）。
+     *
+     * 踩过的两个坑：
+     *   ① 最早按 `!h.inputKind` 判 → `json-field` 工厂（toneStyle / customPrompt）
+     *      根本没声明 inputKind，被误判成文本把手，于是它的"最小改动写入"跳过了第②层，
+     *      同值重复 apply 照样建备份。
+     *   ② 改成 `typeof next === 'string'` 也不行 → toneStyle 的 next 是**枚举值字符串**
+     *      'efficient'，与"整篇 JSON 文件全文"性质完全不同，但类型上分不出来。
+     *
+     * 正确做法：**让把手自己声明**。契约里加一个可选的 `writesWholeFile: true`：
+     *   - 身份文件（SOUL/USER/IDENTITY）、风格文件、提示词模板 → true（next 就是整文件内容）
+     *   - JSON 字段（toneStyle / customPrompt）、规则矩阵 → 不声明（next 只是字段值/操作）
+     *
+     * 没声明的按"非整文件"处理（保守：宁可多走一次写后比对，也不要把结构化写入误判成全文）。
+     */
+    const writesWholeFile = h.writesWholeFile === true;
+    const isTextHandle = writesWholeFile && typeof next === 'string';
+
     // 期望增量按**截断后**文本计算（把手自己知道注入上限），落进台账供 verify 自动对照
     let expectedDeltaTokens = null;
     if (typeof h.preview === 'function') {
       try {
         expectedDeltaTokens = (await h.preview(ctx, { next })).expectedDeltaTokens ?? null;
       } catch { /* 预览失败不阻断写入（写入本身仍有备份兜底） */ }
+    }
+
+    // ① 纯文本把手：写入内容与现存文本逐字节相同 → 什么都不做
+    if (isTextHandle && before === nextText) {
+      appendAudit(storeRoot, {
+        event: 'apply',
+        handle: h.id,
+        anchor: h.target,
+        path: tildify(anchor.path),
+        backupId: null,
+        bytesBefore: Buffer.byteLength(before, 'utf8'),
+        bytesAfter: Buffer.byteLength(before, 'utf8'),
+        /**
+         * ⚠️ 这里必须是 **null**，不能是 0。
+         *
+         * 曾经写 0，后果（由独立复核抓出，三版代码上全部复现）：
+         * noop apply 之后跑 verify，自动对照读到 expectedDelta=0，
+         * `evaluateTokenDelta` 走"预期无变化 + 实测无变化"分支 → 回 **effective**。
+         * 也就是**用户什么都没改，工具却报绿色「✅ 生效」**——违铁律 6。
+         *
+         * 语义上：expectedDeltaTokens 表示"这次改动应带来多少增量"。
+         * 没改动 = 没有可验证的期望 = null（无从判定），不是 0（期望零增量）。
+         */
+        expectedDeltaTokens: null,
+        gateKind: g.kind,
+        actor,
+        changed: false,
+        noop: true,
+        reason: reason ?? 'apply-noop',
+      });
+      return {
+        handle: h.id,
+        backupId: null,
+        contentChanged: false,
+        path: anchor.path,
+        bytes: Buffer.byteLength(before, 'utf8'),
+        note: '内容与现状一致，未写入、未建备份（无需验证——没有改动）',
+        written: null,
+        gate: g,
+        verification: h.verification,
+        expectedDeltaTokens: null,
+        noop: true,
+      };
     }
 
     const manifest = createBackup({
@@ -165,8 +268,85 @@ export function createEngine({
       entries: [{ key: h.target, absPath: anchor.path }],
     });
 
-    const written = await h.apply(ctx, { next });
+    /**
+     * 铁律 1 的失败面：备份已落盘、写入却失败时，**必须留下台账**。
+     *
+     * 曾经（T1）：这里裸 await。写失败（例如 EPERM）→ 备份成了孤儿、审计里一个字都没有，
+     * 用户看到的是"点了没反应、也没报错留痕"。同类路径 `applyProfile`（见下）
+     * 与 `replay` 都有逐项 try/catch + `status: partial/failed`，唯独单把手这条漏了。
+     */
+    let written;
+    try {
+      written = await h.apply(ctx, { next });
+    } catch (e) {
+      appendAudit(storeRoot, {
+        event: 'apply',
+        handle: h.id,
+        anchor: h.target,
+        path: tildify(anchor.path),
+        backupId: manifest.id,
+        bytesBefore: Buffer.byteLength(before, 'utf8'),
+        expectedDeltaTokens,
+        gateKind: g.kind,
+        actor,
+        changed: false,
+        status: 'failed',
+        error: { code: e.code ?? 'ERR', message: e.message },
+        reason: reason ?? `apply ${h.id}`,
+      });
+      // 把备份 id 带进异常，让调用方知道"有一份备份，可以还原"
+      if (e && typeof e === 'object') e.backupId = manifest.id;
+      throw e;
+    }
+
     const after = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path, 'utf8') : '';
+
+    /**
+     * ② 结构化把手（或任何绕过预判的路径）：**写完再比**。
+     * 前后字节完全一致 ⇒ 这次 apply 实际上什么都没改。
+     * 处置：删掉刚建的备份（否则就是噪声备份）并如实回报 noop。
+     *
+     * 为什么不靠把手自己上报：`rules.*` 的 `changed` 是"改了几条规则"（数字），
+     * `toneStyle` 是"枚举值有没有换"，语义各不相同；引擎只认"文件字节变没变"这个共同事实。
+     */
+    const contentChanged = before !== after;
+
+    if (!contentChanged && !isTextHandle) {
+      // 只在"结构化把手 + 文件确实没变"时清掉备份。
+      // （纯文本把手的 noop 已在前面拦掉，不会走到这里；走到的都是"以为要改、实际没改"。）
+      try {
+        fs.rmSync(path.join(backupsDir(storeRoot), manifest.id), { recursive: true, force: true });
+      } catch { /* 删不掉就留着：多一份备份比丢数据好 */ }
+      appendAudit(storeRoot, {
+        event: 'apply',
+        handle: h.id,
+        anchor: h.target,
+        path: tildify(anchor.path),
+        backupId: null,
+        bytesBefore: Buffer.byteLength(before, 'utf8'),
+        bytesAfter: Buffer.byteLength(after, 'utf8'),
+        expectedDeltaTokens: null,
+        gateKind: g.kind,
+        actor,
+        changed: false,
+        noop: true,
+        reason: reason ?? `apply-noop ${h.id}`,
+      });
+      return {
+        handle: h.id,
+        backupId: null,
+        ...(written && typeof written === 'object' ? written : {}),
+        contentChanged: false,
+        noop: true,
+        path: anchor.path,
+        bytes: Buffer.byteLength(after, 'utf8'),
+        note: '内容与现状一致，未改动（已清理本次预建的备份）',
+        written,
+        gate: g,
+        verification: h.verification,
+        expectedDeltaTokens: null,
+      };
+    }
 
     appendAudit(storeRoot, {
       event: 'apply',
@@ -179,9 +359,16 @@ export function createEngine({
       expectedDeltaTokens,
       gateKind: g.kind,
       actor,
+      changed: contentChanged,
+      status: 'ok',
     });
 
     // 把把手自己的结果**展开到顶层**，方便调用方直接读（同时保留 written 原样）
+    //
+    // ⚠️ 顶层**不额外**塞 `changed`：多个把手（rules.*）自己就用 `changed` 表示
+    // "改了几条规则"。引擎若再写一个布尔 `changed`，会把把手的数值覆盖成 true，
+    // 下游断言全部读到布尔而不是条数（自测当场红过 3 条）。
+    // 引擎自己的"内容是否变化"用独立字段名 `contentChanged`。
     return {
       handle: h.id,
       backupId: manifest.id,
@@ -190,6 +377,7 @@ export function createEngine({
       gate: g,
       verification: h.verification,
       expectedDeltaTokens,
+      contentChanged: before !== after,
     };
   }
 
@@ -220,6 +408,32 @@ export function createEngine({
 
       if (!lastApply) {
         capture = { blockedReason: '这个把手还没有 apply 记录 —— 先改一次，再验证', warnings: [] };
+      } else if (lastApply.noop === true) {
+        /**
+         * 上一次 apply 是 noop（内容没变）→ 没有任何可验证的改动。
+         *
+         * 这是独立复核抓出的假阳性：noop 记录曾写 `expectedDeltaTokens: 0`，
+         * verify 读到 0 → "预期无变化 + 实测无变化" → 回 **effective**。
+         * 用户什么都没改，工具报绿色「✅ 生效」。
+         *
+         * 正确语义：**没改过就没有"生效"可言**，三态里只有 undetermined 说得通。
+         *
+         * ⚠️ 判据只能用 `noop === true`（独立复核 D6）：
+         * 曾经写成 `lastApply.noop === true || lastApply.changed === false`，
+         * 而**写入失败**的台账记录也带 `changed: false` —— 于是"上次写入失败了"
+         * 被误报成"上次没有真正改动内容"，把用户引向完全错误的下一步。
+         */
+        capture = {
+          blockedReason: '上一次 apply 没有真正改动内容（noop）—— 没有可验证的变化。'
+            + '改点东西再应用，然后新建会话发一条消息，再验证。',
+          warnings: [],
+        };
+      } else if (lastApply.status === 'failed') {
+        capture = {
+          blockedReason: `上一次 apply **失败了**（${lastApply.error?.code ?? 'ERR'}: ${lastApply.error?.message ?? '未知原因'}）——`
+            + '内容根本没写进去，无从验证。先修好写入失败（权限/占用/厂商文件确认），再应用一次。',
+          warnings: ['不要把"上次写入失败"当成"没改动"——两者下一步完全不同。'],
+        };
       } else {
         const applyAtMs = Date.parse(lastApply.at);
         capture = autoCapture({
@@ -897,6 +1111,54 @@ export function createEngine({
   }
 
   // ── 6. 还原 ────────────────────────────────────────────────
+  /**
+   * 还原前的闸门检查（独立复核 D3）。
+   *
+   * 为什么需要它：`apply` 对 `app-must-be-closed` 类的把手会拒绝执行，
+   * 而 `restore`/`/api/restore` 曾经**完全不过闸** —— WorkBuddy 运行中也能写厂商文件。
+   * 同一类写操作两套规矩，等于给了一个绕过闸门的后门。
+   *
+   * 判据：一条备份可能覆盖多个把手；**只要有一条被阻断，整体拒绝**（宁严不宽）。
+   * @param {string} backupId
+   */
+  function checkRestoreGate(backupId) {
+    let manifest;
+    try {
+      manifest = readManifest(storeRoot, backupId);
+    } catch {
+      // 备份不存在由后续 restore 报 BACKUP_MISSING，这里不重复判定
+      return { blocked: false, reason: null, handles: [], gate: null };
+    }
+
+    const blockedHandles = [];
+    let gateKind = null;
+    let reason = null;
+
+    for (const entry of manifest.entries ?? []) {
+      // 把备份条目反查成把手：优先按 key，其次按 anchorPath
+      const h = registry.list().find((x) => x.target === entry.key)
+        ?? registry.list().find((x) => {
+          try { return anchorFor(x).path === entry.absPath; } catch { return false; }
+        });
+      if (!h) continue;                       // 不是把手管的文件（例如手写的外部路径）
+      const g = gateCheck(h);
+      if (g.blocked) {
+        blockedHandles.push(h.id);
+        gateKind = g.kind;
+        reason = g.reason;
+      }
+    }
+
+    if (!blockedHandles.length) return { blocked: false, reason: null, handles: [], gate: null };
+    return {
+      blocked: true,
+      reason: `还原会写入 ${blockedHandles.length} 个需要停机的把手：${blockedHandles.join('、')}。`
+        + `${reason ?? ''}（拒绝执行，而不是写了不生效）`,
+      handles: blockedHandles,
+      gate: gateKind,
+    };
+  }
+
   function restore(backupId, { dryRun = false } = {}) {
     const r = restoreBackup({ storeRoot, id: backupId, dryRun });
     const changed = r.results.filter((x) => x.action !== 'noop');
@@ -932,11 +1194,20 @@ export function createEngine({
   }
 
   // ── 最初基线（版本化账本）──────────────────────────────────
-  // 每个 WorkBuddy 版本一套账：baselines/5.9.3(d4692421).json。
+  // 每个 WorkBuddy 版本一套账：baselines/<版本(哈希)>.json。
   // 同版账本捕获一次不可覆盖；升级出新版 → 新版另立一本，旧账永不被动。
   // 条目三类：text（整文件把手）/ value（json 字段把手，只存字段值）/ file（规则矩阵共享文件）。
-
-  const baselinesDir = () => path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'baselines');
+  //
+  // 位置：按 AGENTS 铁律 4 的**例外条款**，最初基线账本维护在项目目录 `baselines/`
+  // （由 .gitignore 排除，公开仓库不收其内容）。
+  //
+  // ⚠️ 曾经的坑（T8）：这个位置**不可覆盖**，于是 `selftest.mjs` 一跑就把合成账本
+  // `5.9.3(0000).json` 写进了真实账本目录，UI 因此显示"共 2 套账本"，
+  // 用户无法分辨哪本是出厂快照、哪本是测试垃圾。
+  // 现在允许经 `WORKBUDDY_BASELINES_DIR` 覆盖 —— 自测必须指向临时目录，
+  // 生产默认位置保持不变（不搬动既有真实账本）。
+  const baselinesDir = () => (process.env.WORKBUDDY_BASELINES_DIR?.trim()
+    || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'baselines'));
 
   /** 旧位置（storeRoot/baselines、storeRoot/baseline.json）→ 项目目录 baselines/ 的迁移 */
   function migrateStoreBaselines(key) {
@@ -1065,29 +1336,58 @@ export function createEngine({
       entries: [{ key: h.target, absPath: st.path }],
     });
 
+    /**
+     * 铁律 1 的失败面（独立复核 D2）：备份已落盘、还原却失败时，**必须留下台账**。
+     *
+     * 曾经：这里裸写盘。失败（EPERM 等）→ 备份成了孤儿、审计里一个字都没有，
+     * 用户看到"点了还原没反应"，也不知道有一份备份可以回滚。
+     * 与单把手 apply 的 T1 是同一个病——T1 修好了，这条同类路径漏了。
+     * 控制台的「还原」按钮走的正是这条路径。
+     */
     let changed = false;
-    if (entry.kind === 'file') {
-      if ((st.text ?? '') !== entry.content) {
-        fs.writeFileSync(st.path, entry.content, 'utf8');
-        changed = true;
+    try {
+      if (entry.kind === 'file') {
+        if ((st.text ?? '') !== entry.content) {
+          fs.writeFileSync(st.path, entry.content, 'utf8');
+          changed = true;
+        }
+      } else {
+        const cur = entry.kind === 'value'
+          ? (st.value !== undefined && st.value !== null ? String(st.value) : '')
+          : (st.text ?? '');
+        if (cur !== entry.content) {
+          await h.apply(ctx, { next: entry.content });
+          changed = true;
+        }
       }
-    } else {
-      const cur = entry.kind === 'value'
-        ? (st.value !== undefined && st.value !== null ? String(st.value) : '')
-        : (st.text ?? '');
-      if (cur !== entry.content) {
-        await h.apply(ctx, { next: entry.content });
-        changed = true;
-      }
+    } catch (e) {
+      appendAudit(storeRoot, {
+        event: 'restore',
+        handle: id,
+        anchor: h.target,
+        path: tildify(st.path ?? ''),
+        backupId: manifest.id,
+        bytesBefore: Buffer.byteLength(st.text ?? '', 'utf8'),
+        actor,
+        changed: false,
+        status: 'failed',
+        error: { code: e.code ?? 'ERR', message: e.message },
+        reason: 'restore-baseline',
+      });
+      if (e && typeof e === 'object') e.backupId = manifest.id;
+      throw e;
     }
 
     appendAudit(storeRoot, {
       event: 'restore',
       handle: id,
       anchor: h.target,
+      path: tildify(st.path ?? ''),
       backupId: manifest.id,
       bytesBefore: Buffer.byteLength(st.text ?? '', 'utf8'),
       actor,
+      changed,
+      status: 'ok',
       reason: 'restore-baseline',
     });
     return { handle: id, changed, backupId: manifest.id, kind: entry.kind, ledger: key };
@@ -1096,6 +1396,7 @@ export function createEngine({
   return {
     resolver, ctx,
     probe, plan, apply, verify, restore, backups, audit, doctor,
+    checkRestoreGate,
     // 最初基线
     baselineCapture: captureBaseline, baseline: baselineInfo, baselineRestore: restoreBaseline,
     // 专家档位

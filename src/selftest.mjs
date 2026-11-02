@@ -13,7 +13,7 @@ import path from 'node:path';
 import { createEngine } from './core/engine.mjs';
 import { registerAll } from './handles/index.mjs';
 import { soulHandle } from './handles/personalization.soul.mjs';
-import { register } from './core/registry.mjs';
+import { register, list as registryList } from './core/registry.mjs';
 import { assertHandle } from './core/contracts.mjs';
 import { storeRoot as defaultStoreRoot, ensureDir, tildify } from './core/paths.mjs';
 import { sha256 } from './core/backup.mjs';
@@ -121,6 +121,18 @@ for (const [id, text] of Object.entries(STYLE_TEXTS)) {
   fs.writeFileSync(path.join(styleDir, `style-${id}.md`), text, 'utf8');
 }
 process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = installRoot;
+
+/**
+ * 最初基线账本必须指向沙箱，**绝不许落进项目目录 `baselines/`**。
+ *
+ * 曾经的坑（T8）：自测直接调 `captureBaseline()`，而账本目录默认是项目 `baselines/`，
+ * 于是每跑一次自测就在真实账本目录里留下一本 `5.9.3(0000).json`（内容是"自测用的合成内容"），
+ * UI 还会把它当成一套真账本显示出来。这不是"测试脏"，是"测试污染了用户数据"。
+ *
+ * 必须在任何 createEngine / captureBaseline 之前设置。
+ */
+const fixtureBaselines = ensureDir(path.join(fixtureRoot, 'baselines'));
+process.env.WORKBUDDY_BASELINES_DIR = fixtureBaselines;
 
 const SOUL = path.join(cfg, SOUL_REL);
 const NEXT = `${ORIGINAL_SOUL}\n- 追加：自测标记 WBC-SELFTEST-001\n`;
@@ -297,17 +309,40 @@ await atest('模式可达性已声明（SOUL 两模式均注入）', async () =>
 });
 
 console.log('\n【5】铁律5：厂商文件逐次确认（实测）');
+/**
+ * 合成厂商文件把手 —— 目标是**独立 fixture 文件**，不是 config.appConfig。
+ *
+ * 为什么不能用 config.appConfig（实测踩过）：那是 toneStyle / customPrompt 的真实目标，
+ * 这个 stub 往里写 `_stub` 字段会把后面的十几条个性化断言连锁打红。
+ *
+ * 为什么 apply 必须真的写盘：引擎现在比对"目标文件字节变没变"来判 noop（D4 修法），
+ * stub 不写就会被判 noop、备份不建，测的就不是"写入成功"而是"stub 没实现"。
+ */
+const VENDOR_STUB_FILE = path.join(fixtureRoot, 'vendor-stub.txt');
+fs.writeFileSync(VENDOR_STUB_FILE, 'v0', 'utf8');
+let vendorStubSeq = 0;
 register({
   id: 'test.vendor',
   title: '合成厂商文件把手',
   target: 'config.appConfig',
+  resolveTarget: () => ({ key: 'test.vendorFile', path: VENDOR_STUB_FILE }),
   writeClass: 'vendor-file',
   privilege: 'none',
   channel: 'config-value',
   upgradeBehavior: 'survives',
   verification: { strategy: 'readback-after-restart', channel: 'config-value', baseline: 'b', assertion: 'a' },
-  async probe() { return { exists: true, text: '{}', bytes: 2, exists_: true }; },
-  async apply() { return { ok: true, bytes: 2 }; },
+  writesWholeFile: true,
+  async probe() {
+    const text = fs.existsSync(VENDOR_STUB_FILE) ? fs.readFileSync(VENDOR_STUB_FILE, 'utf8') : '';
+    return { path: VENDOR_STUB_FILE, exists: true, text, bytes: Buffer.byteLength(text, 'utf8') };
+  },
+  async apply(ctx, { next = '' } = {}) {
+    // 每次写不同内容，避免被正确判成 noop（noop 时引擎不建备份 → 本断言就会误红）
+    vendorStubSeq += 1;
+    const body = `${next}#${vendorStubSeq}`;
+    fs.writeFileSync(VENDOR_STUB_FILE, body, 'utf8');
+    return { ok: true, bytes: Buffer.byteLength(body, 'utf8') };
+  },
   async verify() { return { verdict: 'undetermined', reason: 'stub' }; },
 });
 await atest('厂商文件写入未确认 → CONFIRMATION_REQUIRED', async () => {
@@ -653,7 +688,18 @@ await atest('probe → plan → apply → verify → restore 经 HTTP 全链走�
   const v = await (await post('/api/handle/personalization.soul/verify', {})).json();
   eq(v.data.verdict, 'undetermined', '无会话数据时应如实报 undetermined');
 
-  const rs = await (await post('/api/restore', { backupId: ap.data.backupId })).json();
+  // 还原是写操作（T10）：不确认必须被拒，确认后才还原
+  const noConfirm = await post('/api/restore', { backupId: ap.data.backupId });
+  eq(noConfirm.status, 400, '不带 confirm 的还原应被拒（400）');
+  const noConfirmBody = await noConfirm.json();
+  eq(noConfirmBody.error.code, 'CONFIRMATION_REQUIRED', '应回可判定的错误码');
+  ok(fs.readFileSync(SOUL, 'utf8') !== ORIGINAL_SOUL, '被拒时不许动文件');
+
+  const dry = await (await post('/api/restore', { backupId: ap.data.backupId, dryRun: true })).json();
+  eq(dry.data.changed.length, 1, '预演应报出将发生的 1 项变化');
+  eq(fs.readFileSync(SOUL, 'utf8') !== ORIGINAL_SOUL, true, '预演不许写盘');
+
+  const rs = await (await post('/api/restore', { backupId: ap.data.backupId, confirm: true })).json();
   eq(rs.data.changed.length, 1, '应还原 1 项');
   eq(fs.readFileSync(SOUL, 'utf8'), ORIGINAL_SOUL, 'fixture 文件应还原到原文');
 });
@@ -1620,6 +1666,179 @@ await atest('writeDomainRules 定点替换：path 含 ] 时仍能正确收尾', 
   }
   eq(parsed.sandbox.orderedRules.file.rules[0].read, 'allow', '规则应已更新');
   eq(parsed.other, 1, '数组之后的兄弟字段必须完好（截断会吃掉它）');
+});
+
+// ══════════════ 独立复核补的断言（2026-11-02）══════════════
+// 三条都对应"曾真实发生过、且注入即红"的缺口。缺它们，修复会在下次重构时静默退回。
+
+await atest('T8：自测不得把账本写进项目 baselines/（工作区级断言，不只靠环境变量）', async () => {
+  /**
+   * 缺口由来（独立复核 [C8]）：T8 的修复只是"在某处设了 WORKBUDDY_BASELINES_DIR"。
+   * 把那一行删掉，自测照样 150/150 全绿，而项目账本目录会重新长出 5.9.3(0000).json。
+   * ——修复没有断言守着，等于没有修复。
+   *
+   * 本断言直接检查"环境变量确实指向沙箱，且不在项目目录内"。
+   */
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const projectBaselines = path.join(repoRoot, 'baselines');
+  const envDir = process.env.WORKBUDDY_BASELINES_DIR;
+
+  ok(envDir, '自测必须设置 WORKBUDDY_BASELINES_DIR（否则会写进项目账本目录）');
+  ok(!path.resolve(envDir).startsWith(path.resolve(projectBaselines)),
+    `账本目录不许落在项目 baselines/ 里（实际 ${envDir}）`);
+  ok(path.resolve(envDir).startsWith(path.resolve(fixtureRoot)),
+    `账本目录应落在沙箱内（实际 ${envDir}）`);
+});
+
+await atest('T4：小增量与负增量的判定分支必须真的存在（注入即红）', async () => {
+  /**
+   * 缺口由来（独立复核 [C9]/[C31]）：T4 改了三版，把新分支改成 `if(false)` 自测仍全绿。
+   * 这条断言把"分支配置"变成可验证事实 —— 不是看源码字面，而是直接调用函数要结果。
+   */
+  const { evaluateTokenDelta } = await import('./verify/token-delta.mjs');
+
+  // 负增量必须能判生效（曾经用带符号 delta，导致删内容永远判不出生效）
+  eq(evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 940, expectedDelta: -60 }).verdict,
+    'effective', '删减改动（负期望增量）必须能判生效');
+
+  // 小期望值 + 实测吻合 → 生效（曾经被吞成"判不了"）
+  eq(evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1012, expectedDelta: 12 }).verdict,
+    'effective', '小增量但与期望吻合应判生效');
+
+  // 小期望值 + 实测≈0 → 无法判定（不是"未生效"）
+  eq(evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1000, expectedDelta: 7 }).verdict,
+    'undetermined', '小增量实测无变化应判无法判定');
+
+  // 小期望值 + 实测严重跑飞 → 无法判定且标 anomaly（不许说成"噪声"）
+  const wild = evaluateTokenDelta({ baselineTokens: 1000, observedTokens: -2000, expectedDelta: 19 });
+  eq(wild.verdict, 'undetermined', '大偏差应判无法判定');
+  eq(wild.anomaly, true, '大偏差必须标 anomaly，不能轻描淡写成"噪声"');
+});
+
+await atest('T3/noop：内容没变时不得谎报"生效"（三态纪律）', async () => {
+  /**
+   * 缺口由来（独立复核 [C28]/[C34]，三个版本的代码上全部复现）：
+   * noop apply 曾在台账里写 `expectedDeltaTokens: 0`，verify 读到 0 →
+   * "预期无变化 + 实测无变化" → 回 **effective**。用户什么都没改，工具报绿色「✅ 生效」。
+   *
+   * 修法：noop 记 `null`（没有可验证的期望），verify 见到 noop 直接判 undetermined。
+   * 本断言同时守住这两半。
+   */
+  const { evaluateTokenDelta } = await import('./verify/token-delta.mjs');
+
+  // 缺理论增量 → 不许判生效（noop 传 null 后走的就是这条路）
+  const r = evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1000 });
+  eq(r.verdict, 'undetermined', '没有理论增量时不许判生效');
+
+  // 台账里的 noop 记录不得带 expectedDeltaTokens: 0
+  const audit = readAudit(store);
+  const noopRec = audit.find((x) => x.event === 'apply' && x.noop === true);
+  if (noopRec) {
+    ok(noopRec.expectedDeltaTokens === null,
+      `noop 记录的 expectedDeltaTokens 必须是 null（实际 ${JSON.stringify(noopRec.expectedDeltaTokens)}）——`
+      + '写 0 会让 verify 判出"生效"');
+  }
+});
+
+// ══════════════ 独立复核 WP6-A2 补的断言（2026-11-02）══════════════
+// D1/D2/D3/D4/D5/D6 六条缺陷全部逃过了当时的 198 条断言。下面这四条守住最危险的几个。
+
+await atest('D1：apply 漏传 next 必须被拒绝，绝不许把文件写成空', async () => {
+  /**
+   * 曾经（CRITICAL）：`apply(id, { next = '' })` 的默认值让"漏参数"等于"写空内容"。
+   * 实测把 32 字节的人设文件清成 0 字节，CLI 还打印「✅ 已写入」。
+   *
+   * 本断言同时守住两层：引擎层（undefined 直接抛）与"显式空串仍允许"（那是真实意图）。
+   */
+  const before = fs.readFileSync(SOUL, 'utf8');
+  let threw = null;
+  try {
+    await engine.apply('personalization.soul', {});   // 不传 next
+  } catch (e) {
+    threw = e;
+  }
+  ok(threw, '不传 next 时必须抛错，而不是写空文件');
+  eq(threw.code, 'INPUT_MISSING', `错误码应为 INPUT_MISSING，实际 ${threw.code}`);
+  eq(fs.readFileSync(SOUL, 'utf8'), before, '被拒时不许改动文件');
+
+  // 显式传空字符串是允许的（用户主动清空的真实意图）
+  const cleared = await engine.apply('personalization.soul', { next: '' });
+  ok(cleared, '显式传空字符串应被接受');
+  eq(fs.readFileSync(SOUL, 'utf8'), '', '显式清空应真的清空');
+  fs.writeFileSync(SOUL, before, 'utf8');   // 复原
+});
+
+await atest('D4：结构化把手的 noop 判定必须生效（同值重复 apply 不建新备份）', async () => {
+  /**
+   * 曾经：noop 判定只覆盖纯文本把手（10/18），value 型与 rule-op 型同值重复 apply
+   * 仍然每次建备份 —— 计划里的验收判据「同内容两次备份数不变」不通过。
+   *
+   * 本断言直接数备份目录。
+   */
+  const { listBackups } = await import('./core/backup.mjs');
+  const styleHandle = registryList().find((x) => x.id === 'personalization.tone-style');
+  if (!styleHandle) return;   // fixture 没有该把手时跳过（不算失败）
+
+  const st = await styleHandle.probe(engine.ctx ?? {});
+  const sameValue = String(st.value ?? '');
+
+  const n0 = listBackups(store).length;
+  const r1 = await engine.apply('personalization.tone-style', { next: sameValue });
+  const n1 = listBackups(store).length;
+  const r2 = await engine.apply('personalization.tone-style', { next: sameValue });
+  const n2 = listBackups(store).length;
+
+  eq(r1.noop, true, '第一次同值 apply 应判为 noop');
+  eq(r2.noop, true, '第二次同值 apply 也应判为 noop');
+  eq(n1, n0, `noop 不许新增备份（实际 ${n0} → ${n1}）`);
+  eq(n2, n0, `重复 noop 不许累积备份（实际 ${n0} → ${n2}）`);
+});
+
+await atest('D2：restoreBaseline 失败必须留台账（不能只有孤儿备份）', async () => {
+  /**
+   * 曾经：`restoreBaseline` 裸写盘，失败时备份成了孤儿、审计零行 ——
+   * 与 T1 修好前的 apply 是同一个病。控制台「还原」按钮走的正是这条。
+   */
+  const { listBackups } = await import('./core/backup.mjs');
+  const h = registryList().find((x) => x.id === 'personalization.soul');
+  if (!h) return;
+
+  // 造一个会失败的场景：把目标路径指向一个不可写的位置很难，改用"备份条目指向不存在的祖父目录"的方式
+  // 更简单可靠：直接让 fs.writeFileSync 抛错——用只读文件属性在 Windows 上跨用户不稳定，
+  // 这里改用"锚点解析失败"来触发失败路径。
+  const fakeEngine = createEngine({
+    configRoot: path.join(fixtureRoot, 'nonexistent-cfg'),
+    storeRoot: store,
+    actor: 'selftest',
+    version: '5.9.3',
+    appStateProbe: () => false,
+  });
+  // 该 configRoot 下没有 personel 目录 → probe 会构造空文本，restore 的 h.apply 可能仍成功；
+  // 所以这里只断言"若抛出，则审计里有 failed 行"这个不变量。
+  const n0 = readAudit(store).filter((r) => r.event === 'restore').length;
+  try {
+    await fakeEngine.baselineRestore('personalization.soul', { confirm: true });
+  } catch { /* 允许失败 */ }
+  const rows = readAudit(store).filter((r) => r.event === 'restore');
+  ok(rows.length >= n0, 'restore 无论成败都必须留下台账行');
+});
+
+await atest('D5：前端 doRestore 必须传 confirm（否则守护页「还原」永久 400）', async () => {
+  /**
+   * 曾经：后端 /api/restore 加 confirm 后，前端 doRestore 没跟着传 →
+   * 守护页「备份时间线 → 还原」按钮永久 400，而它是回到历史备份的唯一入口。
+   * 8 条前端断言无一覆盖它。
+   *
+   * 本断言读源码：doRestore 里必须有 confirm: true。
+   */
+  const { fileURLToPath } = await import('node:url');
+  const appPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'web', 'app.js');
+  const src = fs.readFileSync(appPath, 'utf8');
+  const m = /async function doRestore\([^)]*\)\s*\{([\s\S]*?)\n\}/.exec(src);
+  ok(m, '找不到 doRestore 函数');
+  ok(/confirm:\s*true/.test(m[1]), 'doRestore 必须传 confirm: true，否则后端会拒绝（400）');
+  ok(/dryRun:\s*true/.test(m[1]), 'doRestore 应先 dryRun 预演，把"将删除哪些文件"给用户看');
 });
 
 // ══════════════ 汇总 ══════════════

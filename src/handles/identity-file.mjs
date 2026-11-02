@@ -41,6 +41,12 @@ export function createIdentityFileHandle({ id, title, anchorKey, modeAvailabilit
     /** 锚点表中的键 —— 运行时探测，不写死路径 */
     target: anchorKey,
     writeClass: 'user-data',     // 用户目录：自由写（须有备份）
+    /**
+     * 声明"next 就是整个文件的内容"。
+     * 引擎据此判断能否用"现存文本 vs next"做 noop 预判；
+     * 不声明则按结构化写入处理（写完再比）。见 engine.apply 的 D4 注释。
+     */
+    writesWholeFile: true,
     privilege: 'none',
     channel: 'request-tail',     // user-context 尾段
     upgradeBehavior: 'survives', // 用户数据目录，升级不清洗

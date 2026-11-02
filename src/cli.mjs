@@ -12,6 +12,8 @@
  *   node src/cli.mjs plan    <handleId> --set <file>    预览差异与代价（不写盘）
  *   node src/cli.mjs apply   <handleId> --set <file>    写入（自动备份）
  *   node src/cli.mjs verify  <handleId>                 验证是否真生效
+ *     --baseline <n> --observed <n> --expected <n>      手工给三个数字（不自动对照）
+ *     --restarted                                       规则面专用：确认 WorkBuddy 已重启过
  *   node src/cli.mjs restore <backupId>                 还原
  *
  * 专家档位（N 套人设一键切换）：
@@ -115,7 +117,7 @@ async function main(argv) {
   const json = f.json === true;
 
   const configRoot = resolveConfigRoot(typeof f.root === 'string' ? f.root : undefined);
-  const storeRoot = resolveStoreRoot();
+  const storeRoot = resolveStoreRoot(typeof f.store === 'string' ? f.store : undefined);
   registerAll();
 
   const engine = createEngine({
@@ -194,9 +196,32 @@ async function main(argv) {
 
     case 'apply': {
       const h = engine.doctor().handles.find((x) => x.id === f._[1]);
-      const next = f.set !== undefined ? readNextFor(f.set, h?.inputKind) : undefined;
+      /**
+       * ⚠️ 必须**显式**要求 --set（独立复核 D1，CRITICAL）。
+       *
+       * 曾经的灾难：漏写 `--set` 时 `next` 是 undefined → engine 兜底成 '' →
+       * 把手把整个文件**写成空**（实测 32 字节的人设文件 → 0 字节），
+       * 而 CLI 还打印「✅ 已写入」。用户一条手滑命令就清空自己的人设，
+       * 且工具用绿色告诉他"成功"。
+       *
+       * 纪律：破坏性动作宁可拒绝，不可猜测意图。`--set -` 表 stdin 是显式写法，正常放行。
+       */
+      if (f.set === undefined) {
+        throw new ConsoleError(
+          'INPUT_MISSING',
+          `apply 必须指定写入内容：--set <文件>（或 --set - 从 stdin 读）。\n`
+          + `  不指定就等于"写入空内容"—— 会清空 ${h?.title ?? f._[1]} 的整个文件。\n`
+          + `  只想预览不写盘，用 plan 子命令。`,
+          { handle: f._[1], hint: 'node src/cli.mjs plan <handle> --set <file>' },
+        );
+      }
+      const next = readNextFor(f.set, h?.inputKind);
       const r = await engine.apply(f._[1], { next, confirm: f.confirm === true, reason: typeof f.reason === 'string' ? f.reason : undefined });
       if (json) return out(r, true);
+      if (r.noop) {
+        console.log(`＝ 无需改动 ${r.handle}：${r.note ?? '内容与现状一致'}`);
+        return undefined;
+      }
       console.log(`✅ 已写入 ${r.handle}`);
       console.log(`备份 ${r.backupId}（还原：node src/cli.mjs restore ${r.backupId}）`);
       for (const w of r.gate.warnings) console.log(`⚠️  ${w}`);
@@ -205,11 +230,19 @@ async function main(argv) {
     }
 
     case 'verify': {
-      /** @type {{baselineTokens?:number, observedTokens?:number, expectedDelta?:number}} */
+      /** @type {{baselineTokens?:number, observedTokens?:number, expectedDelta?:number, restarted?:boolean}} */
       const args = {};
       if (f.baseline !== undefined) args.baselineTokens = Number(f.baseline);
       if (f.observed !== undefined) args.observedTokens = Number(f.observed);
       if (f.expected !== undefined) args.expectedDelta = Number(f.expected);
+      // 规则面（readback-after-restart）必须知道"重启过了没"。曾经没有这个参数，
+      // 于是规则把手永远停在 undetermined，还提示用户"带 restarted 参数"——而用户拿不到它。
+      //
+      // ⚠️ 必须接受三种写法：裸 `--restarted`（parseArgs 给 true）、
+      // `--restarted=true` 与 `--restarted true`（parseArgs 给字符串 "true"）。
+      // 曾经只判 `=== true`，后两种**静默失效**——输出与不带参数逐字相同，
+      // 用户以为"重启过了但没生效"，实际是参数没被认出来（独立复核 [C13] 抓出）。
+      if (f.restarted === true || f.restarted === 'true' || f.restarted === '1') args.restarted = true;
       const r = await engine.verify(f._[1], args);
       if (json) return out(r, true);
       console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   ${r.handle ?? f._[1]}`);

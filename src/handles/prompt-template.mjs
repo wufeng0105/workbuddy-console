@@ -86,6 +86,8 @@ export function createPromptTemplateHandle({ id, title, plugin, fileName }) {
     channel: 'request-head',     // ★ 请求头部
     upgradeBehavior: 'invalidated',
     gate: 'app-must-be-closed',  // 保守：待实测 #3 证实可热改后再放宽
+    /** next 就是整个模板文件的全文（见 engine.apply 的 noop 判定注释） */
+    writesWholeFile: true,
 
     /** 头部通道 → 标记法（trace grep）；**禁止**用 token-delta 判头部 */
     verification: {
@@ -227,8 +229,43 @@ export function createPromptTemplateHandle({ id, title, plugin, fileName }) {
   };
 }
 
-/** 有 apply 记录时，按改动时间做标记法验证 */
+/**
+ * 有 apply 记录时，按改动时间做标记法验证。
+ *
+ * ⚠️ 前置守卫（独立复核 [C15]/[C16] 抓出的 HIGH，违反铁律 6）：
+ * 标记法的前提是"模板里含一个我们认识的标记 `WBC-PROBE…`"。
+ * 但 **apply 从不注入标记** —— 用户正常编辑模板，写进去的是自己的内容。
+ * 于是 verify 拿常量前缀去 grep，必然找不到 → 判 `ineffective`（未生效）。
+ * 这是把"没测"说成"未生效"：用户明明改对了，工具说他没生效。
+ *
+ * 实测旁证：真实 6 个 prompt.tpl 全部 `hasMarker = False`。
+ *
+ * 处置：**模板里没有标记时，直接判 undetermined 并说清原因**，不去 grep 一个必然落空的东西。
+ * （另一条路是 apply 时自动注入标记，但那会污染用户真实的模板内容，不采用。）
+ */
 async function markerStrategyAfter(ctx, handleId, st, marker, lastApply, args) {
+  const hasMarker = typeof st.text === 'string' && st.text.includes(String(marker));
+
+  if (!hasMarker && !args.marker) {
+    return {
+      verdict: 'undetermined',
+      reason: '当前模板里**没有验证标记**（`WBC-PROBE…`）——标记法无法判定是否生效。'
+        + '原因：apply 写入的是你的真实内容，不会自动注入标记。'
+        + '若要做标记法验证，请手动在模板里放一个 `WBC-PROBE-test` 之类的标记，'
+        + '再让 WorkBuddy 发一条消息，然后重跑 verify。'
+        + '（这不代表改动没生效——只代表"用这个策略测不出来"。）',
+      handle: handleId,
+      currentBytes: st.bytes,
+      version: st.version,
+      markerMissing: true,
+      warnings: [
+        '这是**无法判定**，不是"未生效"——不要据此回滚改动。',
+        ...(st.hasPolicy ? [] : ['当前模板里已没有 `<personal_files_safety>` 段。']),
+      ],
+      hint: `标记格式：${buildMarker(MARKER_PREFIX, 'test')}`,
+    };
+  }
+
   const afterMs = Date.parse(lastApply.at);
   const r = await markerStrategy.verify({
     configRoot: ctx.configRoot,

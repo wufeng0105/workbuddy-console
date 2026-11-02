@@ -198,7 +198,12 @@ export function createRuleDomainHandle({ domain, id, title }) {
         );
       }
       if (r.verdict === 'undetermined' && r.stage === 'after-write') {
-        warnings.push('下一步：退出 WorkBuddy → 重新启动 → 再运行一次 verify（带 restarted 参数）。');
+        // 给出**可直接复制**的完整命令，而不是"带 restarted 参数"这种用户拿不到的说法
+        warnings.push(
+          '下一步：退出 WorkBuddy → 重新启动 → 再跑一次验证（本把手必须知道"已重启"才能排除启动覆盖）：\n'
+          + `    node src/cli.mjs verify ${this.id} --restarted\n`
+          + '  控制台页面不提供重启判定（它无法确认你有没有真的重启）；这条只能用命令行。',
+        );
       }
 
       return {

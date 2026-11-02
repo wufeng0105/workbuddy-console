@@ -8,9 +8,17 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
-/** 本工具的私有数据目录（profiles / backups / state） */
-export function storeRoot() {
-  return process.env.WORKBUDDY_CONSOLE_HOME?.trim()
+/**
+ * 本工具的私有数据目录（profiles / backups / state）。
+ *
+ * @param {string} [override] 命令行 `--store` 传入的目录。
+ *   ⚠️ 曾经这个参数**不存在**：`cli.mjs` 的帮助里承诺了 `--store <dir>`，
+ *   但代码里是裸调 `storeRoot()`，参数被静默丢弃（独立复核两路发现）。
+ *   现在真的生效：显式参数 > 环境变量 > 默认值。
+ */
+export function storeRoot(override) {
+  return override?.trim()
+    || process.env.WORKBUDDY_CONSOLE_HOME?.trim()
     || path.join(os.homedir(), '.workbuddy-console');
 }
 

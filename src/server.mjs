@@ -81,7 +81,53 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
       return engine.audit(Number(url.searchParams.get('limit') ?? 50));
     }
     if (pathname === '/api/restore' && method === 'POST') {
-      return engine.restore(String(body.backupId ?? ''), { dryRun: body.dryRun === true });
+      /**
+       * 边界契约（T10）：按备份还原是**写操作**，它会逐字节覆盖目标文件；
+       * 更危险的是 `restoreBackup` 对"备份时本不存在"的条目执行 `rmSync` —— 也就是**删除**。
+       *
+       * 曾经：这个接口既不要 confirm、也不过闸门，任何人点一下就能删/覆盖文件，
+       * 且删除动作不会单独回报给用户（只在 results 里一个 action:'delete'）。
+       * 现在：必须显式 confirm；并先做 dryRun 预演，把"将要删除哪些文件"原样回报。
+       */
+      const backupId = String(body.backupId ?? '');
+      const dryRun = body.dryRun === true;
+      if (!dryRun && body.confirm !== true) {
+        throw new ConsoleError(
+          'CONFIRMATION_REQUIRED',
+          '还原会覆盖甚至删除目标文件，需显式确认（confirm: true）。可先用 dryRun:true 预演。',
+          { backupId },
+        );
+      }
+      // 预演：先把"将要发生什么"算出来，并把删除项显式列出来
+      const preview = engine.restore(backupId, { dryRun: true });
+      const willDelete = preview.results.filter((x) => x.action === 'delete');
+      if (dryRun) return { ...preview, willDelete };
+
+      /**
+       * 闸门（独立复核 D3）：还原是写操作，必须与 apply 过同一道闸。
+       *
+       * 曾经：`apply` 对需停机的把手会 400 `GATE_BLOCKED`，而 `restore` 直接**放行并真写入** ——
+       * WorkBuddy 运行中也能写厂商文件。这是"同一类写操作两套规矩"。
+       * `restore` 一条备份可能覆盖多个把手，所以按"最严"处理：只要有一条被闸门阻断，整体拒绝。
+       */
+      const gateBlock = engine.checkRestoreGate(backupId);
+      if (gateBlock.blocked) {
+        throw new ConsoleError(
+          'GATE_BLOCKED',
+          gateBlock.reason,
+          { backupId, handles: gateBlock.handles, gate: gateBlock.gate },
+        );
+      }
+
+      const r = engine.restore(backupId, { dryRun: false });
+      return {
+        ...r,
+        willDelete,
+        deleted: r.changed.filter((x) => x.action === 'delete'),
+        note: willDelete.length
+          ? `注意：本备份里有 ${willDelete.length} 个文件在备份时并不存在，还原会把它们**删除**`
+          : undefined,
+      };
     }
     // ── 最初基线 ──
     if (pathname === '/api/baseline' && method === 'GET') return engine.baseline();
@@ -210,14 +256,66 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
 
       throw new ConsoleError('NOT_FOUND', `未知路径：${pathname}`);
     } catch (e) {
-      const code = e instanceof ConsoleError ? e.code : 'INTERNAL';
-      const status = code === 'UNAUTHORIZED' ? 401 : code === 'NOT_FOUND' ? 404 : 400;
+      /**
+       * 错误码不能一律 INTERNAL（T6）。
+       *
+       * 曾经：非 `ConsoleError` 一律回 `code:'INTERNAL'` + 把原始堆栈塞进 `detail` 发给浏览器。
+       * 后果有二：① 前端只能显示「写入失败 [INTERNAL] EPERM: operation not permitted, open 'C:\\…'」
+       * ——用户看不出"这是没权限"，而这次"点应用没反应"正是被这句话掩盖的；
+       * ② 堆栈含本机绝对路径与源码行号，属于不必要的暴露面。
+       *
+       * 现在：把常见的系统错误映射成可判定的稳定码；堆栈只写进服务端日志，不进响应。
+       */
+      const sysErr = mapSystemError(e);
+      const isConsole = e instanceof ConsoleError;
+      const code = isConsole ? e.code : (sysErr?.code ?? 'INTERNAL');
+      const status = code === 'UNAUTHORIZED' ? 401
+        : code === 'NOT_FOUND' ? 404
+          : code === 'PERMISSION_DENIED' ? 403
+            : 400;
+      if (!isConsole) {
+        // 堆栈只进服务端日志（运维可见），不进响应（前端不需要、也不该拿到本机路径）
+        console.error(`[${new Date().toISOString()}] ${req.method} ${pathname} → ${code}:`, e?.stack ?? e);
+      }
       sendJson(status, {
         ok: false,
-        error: { code, message: e?.message ?? String(e), detail: e?.detail ?? (code === 'INTERNAL' ? String(e?.stack ?? '') : {}) },
+        error: {
+          code,
+          message: isConsole ? (e?.message ?? String(e)) : (sysErr?.message ?? e?.message ?? String(e)),
+          detail: isConsole ? (e.detail ?? {}) : (sysErr ? { hint: sysErr.hint } : {}),
+        },
       });
     }
   });
+
+  /**
+   * 把 Node 的系统错误翻译成"用户能据此行动"的错误码。
+   * @param {any} e
+   * @returns {{code:string, message:string, hint:string}|null}
+   */
+  function mapSystemError(e) {
+    const errno = String(e?.code ?? '');
+    const p = String(e?.path ?? '');
+    const where = p ? `（${p}）` : '';
+    if (errno === 'EPERM' || errno === 'EACCES') {
+      return {
+        code: 'PERMISSION_DENIED',
+        message: `没有权限写入${where}`,
+        hint: '目标可能在受保护目录（如 Program Files），或文件被 WorkBuddy / 安全软件占用。'
+          + '厂商文件需要管理员权限；用户目录下的文件通常是 WorkBuddy 运行中锁住了。',
+      };
+    }
+    if (errno === 'ENOENT') {
+      return { code: 'NOT_FOUND_PATH', message: `目标路径不存在${where}`, hint: '锚点可能失效（WorkBuddy 升级换了目录）——去「守护」页看漂移。' };
+    }
+    if (errno === 'EBUSY' || errno === 'ETXTBSY') {
+      return { code: 'FILE_BUSY', message: `文件被占用${where}`, hint: '先退出 WorkBuddy 再试。' };
+    }
+    if (errno === 'ENOSPC') {
+      return { code: 'DISK_FULL', message: '磁盘空间不足', hint: '清理磁盘后重试。' };
+    }
+    return null;
+  }
 
   return {
     engine,
@@ -241,9 +339,10 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
 }
 
 /** 便捷入口：用默认路径起服务并打印 URL */
-export async function startConsole({ root, port } = {}) {
+export async function startConsole({ root, store, port } = {}) {
   const configRoot = resolveConfigRoot(root);
-  const storeRoot = resolveStoreRoot();
+  // `store` 与 CLI 的 `--store` 同义（显式参数 > 环境变量 > 默认）
+  const storeRoot = resolveStoreRoot(store);
   const app = createConsoleServer({ configRoot, storeRoot });
   const { url, port: actual } = await app.listen(port ?? 0);
   const d = app.describe();

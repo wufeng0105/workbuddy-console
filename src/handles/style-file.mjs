@@ -53,6 +53,8 @@ export function createStyleContentHandle({ styleId, title }) {
     channel: 'request-tail',
     upgradeBehavior: 'invalidated',
     gate: 'new-session-required',
+    /** next 就是整个风格文件的全文（见 engine.apply 的 noop 判定注释） */
+    writesWholeFile: true,
 
     verification: {
       strategy: 'token-delta',
