@@ -129,7 +129,14 @@ export function createStyleContentHandle({ styleId, title }) {
     },
 
     // ── 4. 写入 ────────────────────────────────────────────────
-    async apply(ctx, { next = '' } = {}) {
+    async apply(ctx, { next } = {}) {
+      /**
+       * 同 F1 的把手层防线：漏传 next 不是"写空串"。
+       * 引擎已拦 undefined；删掉工厂原有的 `{ next = '' }` 默认值，显式拒绝。
+       */
+      if (next === undefined) {
+        throw new ConsoleError('INPUT_MISSING', `未提供写入内容（next）—— 拒绝把 style-${styleId}.md 写成空。`);
+      }
       const st = await this.probe(ctx);
       if (!st.exists) {
         throw new ConsoleError('STYLE_FILE_MISSING', `style 文件不存在：${st.path}`, { path: st.path });

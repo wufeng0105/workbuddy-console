@@ -35,6 +35,16 @@ const S = {
    * textarea / select / 勾选框四个面都靠它跨 render 存活。详见 pendingFields() 的注释。
    */
   pendingForm: null,
+  /**
+   * 风格正文编辑器的状态（D4/F1/F4）。
+   *   styleEditorOpen: 正在编辑的 styleId（null = 未展开）
+   *   styleDraft:      { styleId, text } —— 必须记住是**哪一档**的草稿，
+   *                    否则把 friendly 的草稿带进 socratic 就是改错文件
+   *   stylePlan:       /plan 的预演结果（diff、token 成本、warnings）
+   */
+  styleEditorOpen: null,
+  styleDraft: null,
+  stylePlan: null,
 
   // 当前把手的工作面状态
   busy: false,
@@ -244,7 +254,10 @@ function page() {
   const banner = loadErrorBanner();
   if (banner) wrap.append(banner);
   if (S.flash) {
-    wrap.append(el('div', { class: `flash flash-${S.flash.type}` }, S.flash.text));
+    // 支持多行：一次写操作要分条说清（正文写没写成 / 档位切没切 / 验证三态）
+    const flashLines = Array.isArray(S.flash.lines) ? S.flash.lines : [S.flash.text];
+    wrap.append(el('div', { class: `flash flash-${S.flash.type}` },
+      ...flashLines.filter(Boolean).map((x) => el('div', { class: 'flash-line' }, x))));
   }
   if (S.nav === 'overview') {
     wrap.append(homeWork());
@@ -719,14 +732,27 @@ function accCard(h, idx) {
   const open = S.expanded === h.id;
   const pr = probeData(h.id);
   const failed = probeFailed(h.id);
-  const st = pr?.state ?? {};
+  /**
+   * ⚠️ 这里**不许** `?? {}`（F1 的前端腿，CRITICAL）。
+   *
+   * 探测失败时 `pr` 是 null，`?? {}` 把"没读到"变成一个**看似正常的空状态**：
+   * `wizBody` → `editorArea` 里 `if (!st) return '读取中…'` 的守卫因此形同虚设，
+   * 界面渲染出**空的、可编辑的** textarea，`getNext()` 读到 `''`，
+   * 点「应用」就把整个文件写成空 —— 与后端 `body.next ?? ''` 是同一条数据丢失链。
+   * 实测证据：`gates/WP3/exp-G-probe-failed-editor.log`（`#editor` 存在、`value=""`、
+   * `disabled=false`、「应用」可点）。
+   *
+   * 现在：读不到就是 null，由 `wizBody` 显式渲染"读取失败"并**不渲染编辑器与动作按钮**。
+   */
+  const st = pr?.state ?? null;
   // 风格内容组（style.*）：厂商原厂参考件 —— 不提供编辑，只校验 + 从重放包还原
   const referenceMode = h.id.startsWith('style.');
 
   // ── 参考件卡片（风格内容 7 个）────────────────────────────
   if (referenceMode) {
-    const chars = typeof st.text === 'string' ? st.text.length : null;
-    const sha = st.sha256 ? st.sha256.slice(0, 6) : null;
+    // `st` 在探测失败/未加载时是 null —— 用可选链读，交给下面 failed / !pr 两个分支说话
+    const chars = typeof st?.text === 'string' ? st.text.length : null;
+    const sha = st?.sha256 ? st.sha256.slice(0, 6) : null;
     const drift = S.overview?.drift;
     const baseline = drift?.available ? `参考件基线已存 ${fmtTime(drift.bundleCreatedAt)}` : '尚无参考件基线';
     const sub = failed
@@ -854,6 +880,12 @@ function accCard(h, idx) {
   if (!failed && pr) {
     if (h.inputKind === 'rule-op') {
       if (st.ruleCount != null) badges.push(el('span', { class: 'pill pill-ok' }, `✓ ${st.ruleCount} 条规则`));
+    } else if (st.allowedValues) {
+        /**
+         * 枚举卡**不打"已设置"徽章**（D7）。
+         * 枚举恒有值（七档之一），这个徽章恒为绿、不携带任何信息——
+         * 它把"有值"包装成"已设置"，是个假信号。当前值已经在副标题里了。
+         */
     } else if (st.value !== undefined && st.value !== null && st.value !== '') {
       badges.push(el('span', { class: 'pill pill-ok' }, '✓ 已设置'));
     } else if (typeof st.text === 'string') {
@@ -886,8 +918,10 @@ function accCard(h, idx) {
       sub = `${first.slice(0, 60)}${body.length > 60 ? '…' : ''} · ${fmtNum(st.text.length)} 字符 · 已自定义`;
     } else sub = '未设置';
   } else sub = '—';
-  if (st.limits?.exceeded) sub = `内容超出上限，超出 ${fmtNum(st.limits.dropped)} 字符将静默丢弃`;
-  if (st.isActive === false) sub = '该档位当前未生效 —— 改它不影响任何请求';
+  // `st` 在探测失败/未加载时是 null —— 这两行是**无条件**执行的，必须用可选链
+  // （否则"读取失败"的卡片会在构造摘要时抛 TypeError，直接从界面上消失）
+  if (st?.limits?.exceeded) sub = `内容超出上限，超出 ${fmtNum(st.limits.dropped)} 字符将静默丢弃`;
+  if (st?.isActive === false) sub = '该档位当前未生效 —— 改它不影响任何请求';
 
   const expand = () => {
     if (S.expanded === h.id) return;
@@ -924,6 +958,32 @@ function accCard(h, idx) {
 /** 展开卡内容：编辑器 + 生效提示 + 两按钮（应用 / 还原最初设置） */
 function wizBody(h, st) {
   const body = el('div', { class: 'wiz-body' });
+
+  /**
+   * 探测失败 / 还没读到 → **不渲染编辑器，也不渲染动作按钮**（F1 前端腿）。
+   *
+   * 为什么在入口再判一次：`accCard` 已经去掉了 `?? {}`，但只要有**任何**路径让 `st`
+   * 落到缺省值，`editorArea` 就会渲染出一个空的、可编辑的 textarea，`getNext()` 读到 `''`，
+   * 「应用」照点不误 —— 这正是"把读不到伪装成内容本来就是空的"。
+   * 这里不猜、不兜底：读不到就说读不到，并给一个真的能点的「重试」
+   * （普通卡此前只有一句"点「重试」"的文案，却根本没有那个按钮）。
+   */
+  if (probeFailed(h.id) || !probeData(h.id)) {
+    const isFailed = probeFailed(h.id);
+    body.append(el('div', { class: isFailed ? 'warn' : 'dim' },
+      isFailed
+        ? '读取失败 —— 读不到当前内容。读到之前不允许写入（否则会把文件写成空）。'
+        : '读取中…'));
+    if (isFailed) {
+      body.append(el('div', { class: 'row' },
+        el('button', {
+          class: 'btn btn-xs btn-warn',
+          onclick: (e) => { e.stopPropagation(); retryProbe(h.id); },
+        }, '重试')));
+    }
+    return body;
+  }
+
   body.append(el('div', { class: 'step-title' }, '编辑',
     el('span', { class: 'note' }, effectNote(h))));
   body.append(editorArea(h, st));
@@ -965,10 +1025,20 @@ function editorArea(h, st) {
     for (const v of st.allowedValues) sel.append(el('option', { value: v }, v));
     // 优先用用户已经选过的值，否则用探测到的当前值（render 会重建下拉，这里保证它不被弹回去）
     sel.value = recallField('editor', st.value ?? '');
-    sel.addEventListener('change', () => rememberField('editor', sel.value));
-    const row = el('div', { class: 'row' }, sel);
-    row.append(actions(h, () => $('editor').value));
+    sel.addEventListener('change', () => {
+      rememberField('editor', sel.value);
+      // 换了档位就把预览作废（否则会拿 A 档的预演结果去描述 B 档）
+      S.stylePlan = null;
+      S.styleEditorOpen = null;
+      render();
+    });
+    // F6：直接摊平放进同一个 .row —— 按钮与下拉框才是同级，才可能对齐
+    const row = el('div', { class: 'row' }, sel, ...actionButtons(h, () => $('editor').value));
+    row.append(...editorExtraButtons(h, sel.value));
     box.append(row);
+    // 风格正文编辑器（只对 toneStyle 这种"指针 + 内容"型把手出现）
+    const stylePanel = styleEditorPanel(h, sel.value);
+    if (stylePanel) box.append(stylePanel);
     return box;
   }
 
@@ -1060,28 +1130,329 @@ function vendorConfirmed() {
   return $('confirm-vendor')?.checked === true;
 }
 
-function actions(h, getNext) {
-  const row = el('div', { class: 'row' });
+/**
+ * 生成「应用 / 还原」这一组按钮。
+ *
+ * ⚠️ 返回**按钮数组**，不是包好 `.row` 的容器（F6/D7 修复）。
+ *
+ * 为什么改：原来它自己返回一个 `.row`（带 `margin-top:12px`），而枚举分支又把它
+ * `append` 进**另一个** `.row` → 嵌套两层 flex，内层的 margin-top 把按钮整体推下去，
+ * 与旁边的下拉框错位（实测：高度差 2.6px、中心偏移 6px、`sameParent: false`）。
+ * `align-items:center` 只作用于同层子元素，跨层就失效——所以那不是"没调好"，是结构错。
+ */
+function actionButtons(h, getNext) {
+  const out = [];
   const isVendor = h.writeClass === 'vendor-file';
-  // 最小按钮集：应用（备份→写入）/ 还原最初设置（基线写回，坏改的保险）；写入中禁用防双击双写
-  row.append(el('button', { class: 'btn btn-primary', disabled: S.busy ? '' : null, onclick: () => doApply(getNext) }, '应用'));
-  const be = lastBaselineEntryFor(h);
-  row.append(el('button', {
-    class: 'btn btn-quiet',
-    ...(be ? {} : { disabled: '' }),
-    title: be
-      ? `还原到 ${S.baseline.versionKey} 账本的最初快照（${fmtTime(S.baseline.capturedAt)} 建立）`
-      : `当前版本（${S.baseline?.versionKey ?? '?'}）还没有账本——先在页首建立`,
-    onclick: be ? () => doRestoreBaseline(h) : null,
-  }, '还原'));
+  /**
+   * 枚举卡**不给「还原到最初基线」**。
+   *
+   * 为什么：枚举的全部合法值就摆在下拉框里——想回到 `efficient`，选它 + 应用即可。
+   * 「还原到最初基线」做的正是"替你选中基线里记的那个值"，对枚举属于**功能重叠**，
+   * 只是少点两下；而它和「应用」并排会让人把它读成"撤销"（实测：用户就是这么问的）。
+   *
+   * 文本卡与规则卡相反，那里的正文没法凭记忆重建，「还原到最初」是唯一的路，必须留。
+   */
+  const isEnum = Array.isArray(probeData(h.id)?.state?.allowedValues);
+
+  // 最小按钮集：应用（备份→写入）；写入中禁用防双击双写
+  out.push(el('button', { class: 'btn btn-primary', disabled: S.busy ? '' : null, onclick: () => doApply(getNext) }, '应用'));
+
+  if (!isEnum) {
+    const be = lastBaselineEntryFor(h);
+    out.push(el('button', {
+      class: 'btn btn-quiet',
+      ...(be ? {} : { disabled: '' }),
+      // 标签自解释（D6）：不悬停也要知道"还原"还原到什么
+      title: be
+        ? `写回 ${S.baseline.versionKey} 账本里记录的最初值（${fmtTime(S.baseline.capturedAt)} 建立）`
+        : `当前版本（${S.baseline?.versionKey ?? '?'}）还没有账本——先在页首建立`,
+      onclick: be ? () => doRestoreBaseline(h) : null,
+    }, (() => {
+      const hint = baselineHintFor(h);
+      return hint ? `还原到最初（${hint}）` : '还原到最初';
+    })()));
+  }
+
   if (isVendor) {
     const cb = el('input', { type: 'checkbox', id: 'confirm-vendor' });
     // 勾选状态也要跨 render 存活：用户勾了确认，不该因为一次进度刷新被重置回未勾
     cb.checked = recallField('confirm-vendor', false);
     cb.addEventListener('change', () => rememberField('confirm-vendor', cb.checked));
-    row.append(el('label', { class: 'check check-warn' }, cb, el('span', {}, '我确认这是厂商文件')));
+    out.push(el('label', { class: 'check check-warn' }, cb, el('span', {}, '我确认这是厂商文件')));
   }
-  return row;
+  return out;
+}
+
+/**
+ * 「还原」按钮上显示的基线值摘要（让标签自解释，不用悬停）。
+ *
+ * 只对**短值**（枚举/字段）返回具体内容——`/api/baseline` 只给 `kind: 'value'`
+ * 的条目带 content（全文本动辄几十 KB，不往响应里塞）。
+ * 拿不到具体值就返回 null，让调用方**不要**拼出一个没信息量的「（基线值）」。
+ *
+ * @returns {string|null}
+ */
+function baselineHintFor(h) {
+  const e = lastBaselineEntryFor(h);
+  if (!e) return null;
+  const v = typeof e.content === 'string' ? e.content : null;
+  if (v == null) return null;
+  const one = v.replace(/\s+/g, ' ').trim();
+  if (!one) return null;
+  return one.length > 16 ? `${one.slice(0, 16)}…` : one;
+}
+
+/** 旧的容器版（保留调用兼容）：把按钮包进一个 `.row` */
+function actions(h, getNext) {
+  return el('div', { class: 'row' }, ...actionButtons(h, getNext));
+}
+
+/* ══════════════ 风格正文编辑器（D4/F1/F4） ══════════════
+ *
+ * 背景：toneStyle 是**指针**（七档枚举），真正注入模型的是 `style-<id>.md` 的全文。
+ * 用户的实际任务是"把 friendly 这档改成我想要的样子"——一件事，
+ * 不该拆成"去另一张卡找 style.friendly"+"点应用"+"再回来切档位"。
+ *
+ * 三条不可省的规矩：
+ *   ① 写正文前必须**预览**（/plan）并展示 warnings。
+ *      后端会在这里说"这一档当前未生效，改了不影响任何请求"——不展示就等于瞒下来。
+ *   ② 写的是 Program Files 里的厂商文件 → 逐次确认（铁律 5），与切指针分开。
+ *   ③ 保存 = 写正文 + 顺手切到这一档（用户选定），但**分条报告**，且写完后跑一次验证。
+ */
+
+/** 该把手是不是"指针 + 内容"型（目前只有 toneStyle） */
+const isToneStylePointer = (h) => h.id === 'personalization.tone-style';
+
+/** 取某档 style 的正文（走探针缓存，不额外打请求） */
+function styleTextOf(styleId) {
+  const st = probeData(`style.${styleId}`)?.state;
+  return typeof st?.text === 'string' ? st.text : null;
+}
+
+/** /plan 预演：拿 diff、token 成本与全部 warnings */
+async function planStyleContent(styleId, text) {
+  return api(`/api/handle/${encodeURIComponent(`style.${styleId}`)}/plan`, {
+    method: 'POST', body: { next: text },
+  });
+}
+
+/** 打开某一档的正文编辑器 */
+function openStyleEditor(styleId) {
+  const text = styleTextOf(styleId);
+  if (text == null) {
+    S.flash = { type: 'err', text: `读不到 style-${styleId}.md 的内容 —— 先点「校验」或「重试」` };
+    render();
+    return;
+  }
+  S.styleEditorOpen = styleId;
+  S.styleDraft = { styleId, text };
+  S.stylePlan = null;
+  S.flash = null;
+  render();
+  // 开编辑器立刻预演一次（此时应显示"无改动"）
+  void refreshStylePlan(styleId, text);
+}
+
+function closeStyleEditor() {
+  S.styleEditorOpen = null;
+  S.styleDraft = null;
+  S.stylePlan = null;
+  render();
+}
+
+/** 重新预演并**只更新预览区**（不整体 render —— 那会丢焦点与光标） */
+async function refreshStylePlan(styleId, text) {
+  const node = $('style-plan');
+  try {
+    const r = await planStyleContent(styleId, text);
+    S.stylePlan = r;
+    if (node && S.styleEditorOpen === styleId) paintStylePlan(node, r, styleId);
+  } catch (e) {
+    if (node) { clear(node); node.append(el('div', { class: 'warn-t' }, `预演失败 [${e.code ?? 'ERR'}] ${e.message}`)); }
+  }
+}
+
+/** 把预演结果画进预览区 */
+function paintStylePlan(node, r, styleId) {
+  clear(node);
+  const pv = r?.preview ?? r?.data?.preview ?? r ?? {};
+  const diff = pv.diff ?? {};
+  if (diff.added === 0 && diff.removed === 0) {
+    node.append(el('span', { class: 'dim' }, '内容与现状一致 —— 保存不会产生写入'));
+    return;
+  }
+  node.append(
+    el('span', {}, `改动 `),
+    el('span', { class: 'diff-add' }, `+${diff.added ?? 0}`),
+    el('span', {}, ' / '),
+    el('span', { class: 'diff-del' }, `−${diff.removed ?? 0}`),
+    el('span', {}, ' 行'),
+    pv.cost?.delta != null ? el('span', { class: 'dim' }, `　约 ${pv.cost.delta >= 0 ? '+' : ''}${pv.cost.delta} tokens`) : null,
+  );
+}
+
+/**
+ * 保存正文：写 style 文件 + 顺手切档位 + 验证。
+ * 三条结果分开报告——一次点击做了三件事，就不许合成一句"成功"。
+ */
+async function saveStyleContent(pointerHandle, styleId) {
+  const styleHandleId = `style.${styleId}`;
+  const text = S.styleDraft?.styleId === styleId ? S.styleDraft.text : null;
+  if (text == null) return;
+  if (!$('confirm-vendor')?.checked) {
+    S.flash = { type: 'err', text: '写的是安装目录里的厂商文件，请先勾选「我确认这是厂商文件」。' };
+    render();
+    return;
+  }
+
+  await runBusy(async () => {
+    const lines = [];
+    let type = 'ok';
+
+    // ① 写正文（先预演一次，把警告取出来，作为最后一道拦截）
+    let warnings = [];
+    try {
+      const pv = await planStyleContent(styleId, text);
+      warnings = pv?.preview?.warnings ?? pv?.data?.preview?.warnings ?? [];
+    } catch { /* 预演失败不阻断，下面 apply 自己也会算一遍 */ }
+
+    const w = await api(`/api/handle/${encodeURIComponent(styleHandleId)}/apply`, {
+      method: 'POST', body: { next: text, confirm: true },
+    });
+    if (w.noop) {
+      lines.push(`正文未改动（内容与现状一致）`);
+    } else {
+      lines.push(`正文已写入 style-${styleId}.md　备份 ${w.backupId ?? '—'}`);
+    }
+    // 后端在 apply 里也算过一遍 warnings（D2 修复后带出来了）
+    if (Array.isArray(w.previewWarnings)) warnings = [...new Set([...warnings, ...w.previewWarnings])];
+
+    // ② 顺手切档位（用户选定 A 方案：编辑某档的意图就是"我要用它"）
+    const cur = probeData(pointerHandle.id)?.state?.value;
+    let didSwitch = false;
+    if (cur === styleId) {
+      lines.push(`档位无需切换（当前已生效：${styleId}）`);
+    } else {
+      const s = await api(`/api/handle/${encodeURIComponent(pointerHandle.id)}/apply`, {
+        method: 'POST', body: { next: styleId },
+      });
+      didSwitch = !s.noop;
+      lines.push(s.noop ? `档位无需切换（已是 ${styleId}）` : `已切换生效档位 → ${styleId}`);
+    }
+
+    /**
+     * 把"写入前该档未生效"那条警告收口。
+     *
+     * 它描述的是**写入那一刻**的前置状态。我们随后就把档位切过去了，
+     * 所以它已经不再成立——照抄进报告会和上一行的「已切换生效档位 → X」自相矛盾
+     * （真机实测过：同一份报告里同时出现"已切换"与"当前未生效"）。
+     * 切换失败时保留原警告：那时它仍然是真的。
+     */
+    let shownWarnings = warnings;
+    if (didSwitch) {
+      const stale = warnings.filter((wmsg) => /当前未生效/.test(wmsg));
+      shownWarnings = warnings.filter((wmsg) => !/当前未生效/.test(wmsg));
+      if (stale.length) lines.push('（写入时该档尚未生效，已由上面的切换解决）');
+    }
+
+    // ③ 验证（B 为魂：写成功必须跟一句"生效了没有"）
+    try {
+      const v = await api(`/api/handle/${encodeURIComponent(styleHandleId)}/verify`, {
+        method: 'POST', body: { args: {} },
+      });
+      const vv = v?.verdict ?? v?.data?.verdict ?? 'undetermined';
+      const label = { effective: '✅ 生效', ineffective: '❌ 未生效', undetermined: '⚪ 无法判定' }[vv] ?? vv;
+      lines.push(`验证：${label} —— ${v?.reason ?? v?.data?.reason ?? ''}`);
+      if (vv === 'ineffective') type = 'err';
+    } catch (e) {
+      lines.push(`验证：未能执行（${e.code ?? 'ERR'} ${e.message}）`);
+    }
+
+    // 预览阶段的警告原样呈现，不与结论合并
+    for (const wmsg of shownWarnings) lines.push(`⚠ ${wmsg}`);
+
+    // 编辑器关闭前把草稿标记为已保存（内容已落盘）
+    S.styleEditorOpen = null;
+    S.styleDraft = null;
+    S.stylePlan = null;
+    S.flash = { type, text: lines[0], lines };
+    await reloadAll();
+    S.probes = {};
+    await loadProbes();
+  }, (e) => { S.flash = { type: 'err', text: `保存失败 [${e.code ?? 'ERR'}] ${e.message}` }; });
+}
+
+/**
+ * 枚举卡片下方的附加按钮（目前只有 toneStyle 用）。
+ * 放在同一行，与「应用 / 还原」同级 —— 这样才对得齐。
+ */
+function editorExtraButtons(h, selectedValue) {
+  if (!isToneStylePointer(h) || !selectedValue) return [];
+  if (S.styleEditorOpen === selectedValue) {
+    return [el('button', { class: 'btn btn-quiet', onclick: closeStyleEditor }, '收起编辑器')];
+  }
+  return [el('button', {
+    class: 'btn',
+    onclick: () => openStyleEditor(selectedValue),
+  }, `编辑这一档的正文`)];
+}
+
+/** 枚举卡片下方的编辑器面板 / 提示 */
+function styleEditorPanel(h, selectedValue) {
+  if (!isToneStylePointer(h)) return null;
+  const isOpen = S.styleEditorOpen === selectedValue;
+  if (!isOpen) {
+    // 未展开时也要说清这张卡在管什么（D6：不要让界面暗示它不给的能力）
+    return el('div', { class: 'style-hint' },
+      `这里只决定「用哪一档生效」（切指针）。要改某一档的正文，选好档位后点「编辑这一档的正文」。`);
+  }
+
+  const styleId = selectedValue;
+  const sh = S.handles.find((x) => x.id === `style.${styleId}`);
+  const st = probeData(`style.${styleId}`)?.state ?? {};
+  const draft = S.styleDraft?.styleId === styleId ? S.styleDraft.text : (st.text ?? '');
+  const activeNow = probeData(h.id)?.state?.value;
+  const willActivate = activeNow === styleId;
+
+  const ta = el('textarea', { class: 'input input-text', id: 'style-editor', spellcheck: 'false' });
+  ta.value = draft;
+
+  const planNode = el('div', { class: 'style-plan', id: 'style-plan' });
+  if (S.stylePlan) paintStylePlan(planNode, S.stylePlan, styleId);
+  else planNode.append(el('span', { class: 'dim' }, '预演中…'));
+
+  let timer = null;
+  ta.addEventListener('input', () => {
+    S.styleDraft = { styleId, text: ta.value };
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { void refreshStylePlan(styleId, ta.value); }, 350);
+  });
+
+  const cb = el('input', { type: 'checkbox', id: 'confirm-vendor' });
+  cb.checked = recallField('confirm-vendor', false);
+  cb.addEventListener('change', () => rememberField('confirm-vendor', cb.checked));
+
+  return el('div', { class: 'style-editor' },
+    el('div', { class: 'step-title' }, `编辑 style-${styleId}.md 的正文`,
+      el('span', { class: 'note' }, sh?.title ?? '')),
+    el('div', { class: 'style-editor-meta' },
+      el('span', { class: 'pill pill-mono pill-idle' }, `style.${styleId}`),
+      willActivate
+        ? el('span', { class: 'pill pill-ok' }, '保存后即为当前生效档')
+        : el('span', { class: 'pill pill-warn' }, `保存会顺手切到这一档（现在是 ${activeNow ?? '?'}）`),
+      st.writeAccess === false ? el('span', { class: 'pill pill-bad' }, '当前不可写（需管理员）') : null),
+    ta,
+    el('div', { class: 'editor-hint' },
+      el('span', {}, `${fmtNum(draft.length)} 字符`),
+      el('span', { class: 'dim' }, '　预演：'), planNode),
+    el('div', { class: 'row' },
+      el('label', { class: 'check check-warn' }, cb, el('span', {}, '我确认这是厂商文件（写在安装目录）')),
+      el('button', { class: 'btn', onclick: closeStyleEditor }, '取消'),
+      el('button', {
+        class: 'btn btn-primary',
+        disabled: S.busy ? '' : null,
+        onclick: () => { void saveStyleContent(h, styleId); },
+      }, '保存正文并切到这一档')));
 }
 
 function colorDiff(text) {

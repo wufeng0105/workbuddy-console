@@ -72,6 +72,49 @@ async function athrowsCode(fn, code) {
   throw new Error(`未抛错（期望 ${code}）`);
 }
 
+/**
+ * 剥掉 JS 源码里的 `/* … *\/` 块注释与 `//` 行注释（**字符串字面量里的内容原样保留**）。
+ *
+ * 为什么需要它：D5 曾经直接对源码正则，于是"只把 `confirm: true` 写进注释里、
+ * 真调用里删掉"就能骗过它（独立复核 inj16）——注释不是证据。
+ *
+ * 为什么不用正则：正则分不清 `//` 是注释还是字符串里的两个字符（`'http://…'`）。
+ * 这里用一个小状态机；块注释里的换行**保留**，免得行号/边界跑掉。
+ * 已知边界：模板字符串里的 `${…}` 表达式按字符串内容处理（其中的 `//` 不会被剥），
+ * 对本用途（找 `confirm: true` 这类实参）足够。
+ * @param {string} src
+ */
+function stripJsComments(src) {
+  let out = '';
+  let mode = 'code';   // code | line | block | s | d | t
+  for (let i = 0; i < src.length;) {
+    const ch = src[i];
+    const nx = src[i + 1];
+    if (mode === 'code') {
+      if (ch === '/' && nx === '*') { mode = 'block'; i += 2; continue; }
+      if (ch === '/' && nx === '/') { mode = 'line'; i += 2; continue; }
+      if (ch === "'") mode = 's';
+      else if (ch === '"') mode = 'd';
+      else if (ch === '`') mode = 't';
+      out += ch; i += 1; continue;
+    }
+    if (mode === 'line') {
+      if (ch === '\n') { mode = 'code'; out += ch; }
+      i += 1; continue;
+    }
+    if (mode === 'block') {
+      if (ch === '*' && nx === '/') { mode = 'code'; i += 2; continue; }
+      if (ch === '\n') out += ch;   // 保留换行
+      i += 1; continue;
+    }
+    // 字符串模式（'s' | 'd' | 't'）
+    if (ch === '\\') { out += ch + (nx ?? ''); i += 2; continue; }
+    if ((mode === 's' && ch === "'") || (mode === 'd' && ch === '"') || (mode === 't' && ch === '`')) mode = 'code';
+    out += ch; i += 1;
+  }
+  return out;
+}
+
 // ── fixture（合成内容，**不含任何真实用户文本**）────────────
 const fixtureRoot = ensureDir(path.join(defaultStoreRoot(), 'sandbox', `fixture-${Date.now()}`));
 const store = ensureDir(path.join(fixtureRoot, '_store'));
@@ -156,6 +199,24 @@ test('配置根无插件缓存 → 拒绝猜测版本', () => {
 test('缺锚点表版本 → ANCHOR_MISSING 且提示新增数据', () => {
   const e = throwsCode(() => createEngine({ configRoot: cfg, storeRoot: store, version: '9.9.9' }), 'ANCHOR_MISSING');
   ok(/新增数据/.test(e.message), '错误信息未提示"新增数据"');
+});
+test('插件缓存目录在、但无任何合法版本目录 → ANCHOR_MISSING（不猜版本）', () => {
+  /**
+   * 覆盖洞由来（独立复核 inj02）：`detectVersion` 有两个 "探测失败" 出口 ——
+   *   `core/anchor.mjs:77` 插件缓存目录**不存在**（上一条断言已覆盖，inj02b 红）；
+   *   `core/anchor.mjs:88` 目录**在**、但里面没有任何 `x.y.z-` 版本目录 —— **无覆盖**：
+   *   把它改成 `return '5.9.3'`（猜一个版本）自测仍全绿。
+   *
+   * 脏插件缓存目录（装了非插件目录 / 版本目录被清空）就会走到这个出口。
+   * 铁律 3：探测失败 = 硬报错，绝不回退到猜测值。
+   */
+  const dirty = path.join(fixtureRoot, 'dirty-plugin-cache');
+  fs.rmSync(dirty, { recursive: true, force: true });
+  const pluginDir = ensureDir(path.join(dirty, 'plugins', 'cache', 'workbuddy-builtin', 'welcomemode-code'));
+  fs.writeFileSync(path.join(pluginDir, 'README.txt'), '这个目录不是版本目录', 'utf8');
+  ensureDir(path.join(pluginDir, 'not-a-version'));   // 目录名不匹配 ^\d+\.\d+\.\d+-
+  const e = throwsCode(() => createEngine({ configRoot: dirty, storeRoot: store }), 'ANCHOR_MISSING');
+  ok(/版本/.test(e.message), `错误信息应说明版本探测失败，实际：${e.message}`);
 });
 test('doctor 全绿（可选锚点缺席不算失败）', () => {
   const d = engine.doctor();
@@ -1716,6 +1777,81 @@ await atest('T4：小增量与负增量的判定分支必须真的存在（注�
   eq(wild.anomaly, true, '大偏差必须标 anomaly，不能轻描淡写成"噪声"');
 });
 
+await atest('V8：`serve` 必须把 --store 传下去，且隔离运行时账本也跟着隔离', async () => {
+  /**
+   * 曾经的两层断链（排查 fixture 污染真实 baselines 时抓出来）：
+   *   ① `cli.mjs` 的 serve 分支只传 root/port，`--store` 被解析后丢掉
+   *      → `serve --store X` 实际用默认数据目录，帮助文案在撒谎；
+   *   ② 就算传了 store，`baselinesDir()` 也只看 WORKBUDDY_BASELINES_DIR，
+   *      仍然把账本写进**项目目录** baselines/ → 隔离运行污染真实账本。
+   *
+   * 后果实测过两次：fixture 起一次服务就在真实账本目录留下 `5.9.3(0000).json`，
+   * UI 显示"共 2 套账本"，用户分不清哪本是出厂快照。
+   *
+   * ⚠️ ② 的真行为断言已拆到下面那条独立的 `V8②`（原来这里是 `/isolatedBaselines/`
+   * **词存在性**检查 —— 切断接线、把词留在注释里仍然全绿，独立复核 inj13）。
+   */
+  const cliSrc = fs.readFileSync(new URL('./cli.mjs', import.meta.url), 'utf8');
+  const serveBlock = /case 'serve': \{[\s\S]*?\n    \}/.exec(cliSrc)?.[0] ?? '';
+  ok(serveBlock, '找不到 serve 分支');
+  ok(/store:\s*typeof f\.store/.test(serveBlock), 'serve 必须把 f.store 传给 startConsole（否则 --store 是空承诺）');
+
+  // 行为验证：给了 baselinesDir 就必须落在那儿，不许碰项目目录
+  const isoDir = ensureDir(path.join(fixtureRoot, 'iso-baselines'));
+  const e = createEngine({ configRoot: cfg, storeRoot: store, baselinesDir: isoDir });
+  const b = await e.baselineCapture();
+  ok(b?.versionKey, '捕获应成功');
+  const files = fs.readdirSync(isoDir).filter((x) => x.endsWith('.json'));
+  ok(files.length >= 1, `账本必须落在指定的 baselinesDir（实际 ${files.length} 个文件）`);
+});
+await atest('V8②：隔离运行时账本真的落到 `<storeRoot>/baselines`（起真服务，只认落盘位置）', async () => {
+  /**
+   * 这条替代原来的 `/isolatedBaselines/.test(server.mjs 源码)` —— 那是**词存在性**检查：
+   * 把 `baselinesDir: isolatedBaselines ? … : undefined` 的接线切断、只把 `isolatedBaselines`
+   * 这个词留在注释里，自测仍全绿（独立复核 inj13）；只把这个词改名却会红（inj14）——
+   * 证明它认的是词，不是行为。
+   *
+   * 现在只认「落盘位置」这个事实：起一个真的 `createConsoleServer({isolatedBaselines:true})`，
+   * 账本必须出现在 `<storeRoot>/baselines`。词在不在、叫什么都不相干。
+   * 隔离运行（`serve --store <tmp>`）是"试跑不污染真账本"的唯一依赖；接线一断，
+   * fixture 起一次服务就会在项目 `baselines/` 里长出合成账本（T8 已发生过两次）。
+   */
+  const isoStore = ensureDir(path.join(fixtureRoot, 'iso-server-store'));
+  fs.rmSync(path.join(isoStore, 'baselines'), { recursive: true, force: true });
+  const isoApp = createConsoleServer({ configRoot: cfg, storeRoot: isoStore, isolatedBaselines: true });
+  try {
+    const { port } = await isoApp.listen(0);
+    const res = await fetch(`http://127.0.0.1:${port}/api/baseline/capture`, {
+      method: 'POST',
+      headers: { 'X-WBC-Token': isoApp.token, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    eq(res.status, 200, `隔离账本的捕获接口应 200（实际 ${res.status}）`);
+    const ledgerDir = path.join(isoStore, 'baselines');
+    ok(fs.existsSync(ledgerDir),
+      `隔离运行时账本必须落在 <storeRoot>/baselines（实际不存在：${tildify(ledgerDir)}）—— `
+      + '接线断了的话它会落进环境变量指定的沙箱账本，而不是这个 store');
+    const ledgers = fs.readdirSync(ledgerDir).filter((x) => x.endsWith('.json'));
+    ok(ledgers.length >= 1, `<storeRoot>/baselines 里必须有账本文件（实际 ${ledgers.length} 个）`);
+  } finally {
+    await isoApp.close();
+  }
+});
+await atest('D2/F3：apply 必须把 preview 的 warnings 带出来（不许丢掉"写了也白写"的提醒）', async () => {
+  /**
+   * 曾经的实现（engine.mjs）：只取 preview 的 expectedDeltaTokens，把 warnings 直接扔掉。
+   * 于是 style 把手那条「该档位当前未生效 —— 改这个文件不会影响任何请求」
+   * 在前端不调 /plan 的前提下**彻底不可达**：两处都断。
+   * 这正好是本项目存在的理由（防"写成功但效果为零"）在自己代码里失守。
+   */
+  const st = await engine.probe('style.socratic');
+  const next = (st.text ?? '') + '\n<!-- selftest -->';
+  const r = await engine.apply('style.socratic', { next, confirm: true, actor: 'selftest' });
+  ok(Array.isArray(r.previewWarnings), 'apply 返回值必须含 previewWarnings 数组');
+  ok(typeof r.isActive === 'boolean', 'apply 返回值必须含 isActive（该档是不是当前生效档）');
+  const joined = r.previewWarnings.join('\n');
+  ok(/未生效|不可写/.test(joined), '未生效档位的警告必须原样带出（实际：' + JSON.stringify(r.previewWarnings).slice(0, 160) + '）');
+});
 await atest('T3/noop：内容没变时不得谎报"生效"（三态纪律）', async () => {
   /**
    * 缺口由来（独立复核 [C28]/[C34]，三个版本的代码上全部复现）：
@@ -1739,6 +1875,42 @@ await atest('T3/noop：内容没变时不得谎报"生效"（三态纪律）', a
       `noop 记录的 expectedDeltaTokens 必须是 null（实际 ${JSON.stringify(noopRec.expectedDeltaTokens)}）——`
       + '写 0 会让 verify 判出"生效"');
   }
+});
+
+await atest('T3/noop（纯文本预判分支）：同一段纯文本两次 apply，第二次台账 null + noop', async () => {
+  /**
+   * 半空转由来（独立复核 inj09）：上面那条只在台账里**找**一条 `noop === true` 的记录，
+   * 而 fixture 里第一条 noop 来自 `personalization.tone-style`（JSON 字段 → 走
+   * `engine.mjs` 的**结构化**分支，写完再比）。于是 `engine.mjs` 的**纯文本预判分支**
+   * （`isTextHandle && before === nextText`）的 `expectedDeltaTokens: null` 改成 `0`
+   * 仍全绿 —— 它宣称守住的语义在那一半上没人管。
+   *
+   * 这里真的走纯文本分支：整文件把手（SOUL）同一段文本 apply 两次，
+   * 第二次必须判 noop，且台账里 `expectedDeltaTokens === null`（不是 0）。
+   */
+  const st = await engine.probe('personalization.soul');
+  const original = st.state.text ?? '';
+  const sameText = `${original}\n- WBC-TEXT-NOOP-001\n`;
+  const n0 = readAudit(store).length;
+
+  const first = await engine.apply('personalization.soul', { next: sameText, confirm: true, actor: 'selftest' });
+  ok(!first.noop, '第一次内容确实变了，不该判 noop');
+  const second = await engine.apply('personalization.soul', { next: sameText, confirm: true, actor: 'selftest' });
+  eq(second.noop, true, '同一段纯文本第二次 apply 必须判 noop（走文本预判分支）');
+  eq(second.expectedDeltaTokens, null, '文本分支 noop 的返回里 expectedDeltaTokens 必须是 null（写 0 会骗出"生效"）');
+
+  const rows = readAudit(store).slice(n0)
+    .filter((x) => x.event === 'apply' && x.handle === 'personalization.soul');
+  const noopRows = rows.filter((x) => x.noop === true);
+  eq(noopRows.length, 1, `两次 apply 应恰好留下 1 行 noop 台账（实际 ${noopRows.length} 行）`);
+  eq(noopRows[0].expectedDeltaTokens, null,
+    `文本分支的 noop 台账必须是 null（实际 ${JSON.stringify(noopRows[0].expectedDeltaTokens)}）——`
+    + '写 0 会让 verify 走"预期无变化"分支，把"什么都没改"报成 ✅ 生效');
+  eq(noopRows[0].changed, false, 'noop 台账必须记 changed:false');
+
+  // 复原 fixture（第二次是 noop 没写盘，用第一次的备份还原）
+  engine.restore(first.backupId);
+  eq(fs.readFileSync(SOUL, 'utf8'), original, '文本分支用例必须把 fixture 复原');
 });
 
 // ══════════════ 独立复核 WP6-A2 补的断言（2026-11-02）══════════════
@@ -1795,50 +1967,472 @@ await atest('D4：结构化把手的 noop 判定必须生效（同值重复 appl
   eq(n2, n0, `重复 noop 不许累积备份（实际 ${n0} → ${n2}）`);
 });
 
-await atest('D2：restoreBaseline 失败必须留台账（不能只有孤儿备份）', async () => {
+await atest('D2（重写·三证）：restoreBaseline 写入失败必须留 status:"failed" 台账，且异常带 backupId', async () => {
   /**
-   * 曾经：`restoreBaseline` 裸写盘，失败时备份成了孤儿、审计零行 ——
-   * 与 T1 修好前的 apply 是同一个病。控制台「还原」按钮走的正是这条。
+   * ⚠️ 这条断言的前身是**空转**的（类 3 的"整条不可能失败"）：
+   *   `ok(rows.length >= n0)` —— 同一份**只增**日志的前后计数比较，恒真。
+   *   实测：把 `engine.mjs` 里成功+失败两条 `appendAudit` 全删（正是它宣称守住的
+   *   "孤儿备份 + 审计零行"），自测仍 159/0 全绿。
+   *
+   * 现在真的把失败场景造出来：把目标文件设成**只读**（Windows: FILE_ATTRIBUTE_READONLY
+   * → writeFileSync 抛 EPERM，已单独预检：`gates/WP9/injection-mechanisms.log`），
+   * 再断言"**恰好新增一行** status:'failed'"。计数改为"失败行"而不是"总行数"。
    */
-  const { listBackups } = await import('./core/backup.mjs');
-  const h = registryList().find((x) => x.id === 'personalization.soul');
-  if (!h) return;
+  // 先确保本版账本存在（账本里要有 personalization.soul 的快照）
+  const led = await engine.baselineCapture();
+  ok(led?.versionKey, '前提：必须能建立本版账本');
 
-  // 造一个会失败的场景：把目标路径指向一个不可写的位置很难，改用"备份条目指向不存在的祖父目录"的方式
-  // 更简单可靠：直接让 fs.writeFileSync 抛错——用只读文件属性在 Windows 上跨用户不稳定，
-  // 这里改用"锚点解析失败"来触发失败路径。
-  const fakeEngine = createEngine({
-    configRoot: path.join(fixtureRoot, 'nonexistent-cfg'),
-    storeRoot: store,
-    actor: 'selftest',
-    version: '5.9.3',
-    appStateProbe: () => false,
-  });
-  // 该 configRoot 下没有 personel 目录 → probe 会构造空文本，restore 的 h.apply 可能仍成功；
-  // 所以这里只断言"若抛出，则审计里有 failed 行"这个不变量。
-  const n0 = readAudit(store).filter((r) => r.event === 'restore').length;
+  // 把现状改成"与账本不同"，这样还原一定会尝试写盘
+  fs.chmodSync(SOUL, 0o666);
+  fs.writeFileSync(SOUL, `${ORIGINAL_SOUL}\n- WBC-READONLY-001\n`, 'utf8');
+  fs.chmodSync(SOUL, 0o444);          // 只读 → 写入必失败
+
+  const beforeContent = fs.readFileSync(SOUL, 'utf8');
+  const failedRows = () => readAudit(store)
+    .filter((r) => r.event === 'restore' && r.handle === 'personalization.soul' && r.status === 'failed');
+  const n0 = failedRows().length;
+
+  let threw = null;
   try {
-    await fakeEngine.baselineRestore('personalization.soul', { confirm: true });
-  } catch { /* 允许失败 */ }
-  const rows = readAudit(store).filter((r) => r.event === 'restore');
-  ok(rows.length >= n0, 'restore 无论成败都必须留下台账行');
+    await engine.baselineRestore('personalization.soul');
+  } catch (e) {
+    threw = e;
+  } finally {
+    try { fs.chmodSync(SOUL, 0o666); } catch { /* 复原失败不影响断言 */ }
+  }
+
+  ok(threw, '只读目标上的还原必须失败（否则本用例的前提不成立，断言会空转）');
+  const rows = failedRows();
+  eq(rows.length, n0 + 1,
+    `失败场景下审计必须**恰好**新增一行 status:"failed"（实际 ${n0} → ${rows.length}；`
+    + `抛出 ${threw?.code}: ${String(threw?.message ?? '').slice(0, 160)}）`);
+  const row = rows.at(-1);
+  ok(row.error && row.error.code, '失败行必须带 error.code（不许只写一句"失败"）');
+  ok(threw.backupId, '异常必须带 backupId —— 否则用户不知道"有一份备份可以回滚"');
+  eq(row.backupId, threw.backupId, '台账里的 backupId 与异常里的必须是同一份备份');
+  eq(fs.readFileSync(SOUL, 'utf8'), beforeContent, '被拒/失败时文件内容不许变');
+  // 复原 fixture
+  fs.writeFileSync(SOUL, ORIGINAL_SOUL, 'utf8');
 });
 
-await atest('D5：前端 doRestore 必须传 confirm（否则守护页「还原」永久 400）', async () => {
+await atest('D5：前端 doRestore 必须传 confirm（**剥掉注释后**仍出现在真代码里）', async () => {
   /**
    * 曾经：后端 /api/restore 加 confirm 后，前端 doRestore 没跟着传 →
    * 守护页「备份时间线 → 还原」按钮永久 400，而它是回到历史备份的唯一入口。
    * 8 条前端断言无一覆盖它。
    *
-   * 本断言读源码：doRestore 里必须有 confirm: true。
+   * ⚠️ 半空转由来（独立复核 inj16）：原来的写法直接对源码正则，于是
+   *     "删掉真调用里的 `confirm: true`、只在**注释**里写一句 `confirm: true`"
+   *     就能骗过它（全绿）。注释不是证据 —— 现在先 `stripJsComments()` 再匹配。
    */
   const { fileURLToPath } = await import('node:url');
   const appPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'web', 'app.js');
-  const src = fs.readFileSync(appPath, 'utf8');
+  const raw = fs.readFileSync(appPath, 'utf8');
+  const src = stripJsComments(raw);
+  ok(src.length > 0 && stripJsComments('/* confirm: true */').trim() === '',
+    '剥注释器自证：块注释里的内容必须被剥掉了');
   const m = /async function doRestore\([^)]*\)\s*\{([\s\S]*?)\n\}/.exec(src);
-  ok(m, '找不到 doRestore 函数');
-  ok(/confirm:\s*true/.test(m[1]), 'doRestore 必须传 confirm: true，否则后端会拒绝（400）');
+  ok(m, '找不到 doRestore 函数（剥注释后）');
+  ok(/confirm:\s*true/.test(m[1]), 'doRestore 必须传 confirm: true，否则后端会拒绝（400）—— 写在注释里不算');
   ok(/dryRun:\s*true/.test(m[1]), 'doRestore 应先 dryRun 预演，把"将删除哪些文件"给用户看');
+});
+
+// ══════════════ WP9 · P1 止血 + 立信（2026-11-02）══════════════
+// 每条修复都配一条**行为**断言（不是"源码里有这个词"），并各自做过三证：
+//   ① 把修复改回缺陷态 → 红；② 正常态 → 绿；③ 把被测字段删掉 → 红。
+// 三证的原始输出见 `.zhll/audit2/gates/WP9/`。
+
+console.log('\n【WP9】P1 止血：F1 漏参数 / F2 还原留副本 / F6 写后台账 / F7 逐条容错 / F3 null 传播');
+
+await atest('F1（HTTP 层）：apply 漏传 next → 非 200/INPUT_MISSING，SOUL.md 逐字节不变', async () => {
+  /**
+   * 致命缺陷的原样姿势（Lead 实测）：`POST /api/handle/personalization.soul/apply`
+   * body `{}` → SOUL.md 31 B → 0 B，响应还是 `ok:true`。
+   * 根因是 server.mjs 的 `body.next ?? ''` 把"没传"提前变成了"显式空串"，
+   * 绕过了引擎那道 `next === undefined` 的硬防线。
+   */
+  const app = createConsoleServer({ configRoot: cfg, storeRoot: store });
+  const { port } = await app.listen(0);
+  const base = `http://127.0.0.1:${port}`;
+  const headers = { 'X-WBC-Token': app.token, 'Content-Type': 'application/json' };
+  const post = (p, body) => fetch(`${base}${p}`, { method: 'POST', headers, body: JSON.stringify(body) });
+  const before = fs.readFileSync(SOUL);
+  try {
+    // ① 空 body = 漏参数
+    const r = await post('/api/handle/personalization.soul/apply', {});
+    ok(r.status !== 200, `漏参数必须被拒（实际 HTTP ${r.status}）`);
+    const j = await r.json();
+    eq(j.ok, false, '响应不许是 ok:true');
+    eq(j.error.code, 'INPUT_MISSING', `错误码应为 INPUT_MISSING，实际 ${j.error.code}`);
+    eq(sha256(fs.readFileSync(SOUL)), sha256(before),
+      '被拒时 SOUL.md 必须逐字节不变（曾经的缺陷：31 B → 0 B 且报 ok:true）');
+
+    // ② `next: null` 与"没传"同义：JSON null 不是任何把手认识的写入值，
+    //    而 `?? ''` 当年同样把它变成空串 —— 那是另一条"清空文件"的路
+    const r2 = await post('/api/handle/personalization.soul/apply', { next: null });
+    ok(r2.status !== 200, 'next:null 也必须被拒');
+    eq((await r2.json()).error.code, 'INPUT_MISSING', 'null 的语义应与"没传"一致');
+    eq(sha256(fs.readFileSync(SOUL)), sha256(before), 'null 被拒时文件不许变');
+
+    // ③ 显式空串是**合法意图**，不许一起否掉（防"修过头"）
+    const r3 = await post('/api/handle/personalization.soul/apply', { next: '' });
+    eq(r3.status, 200, `显式 next:"" 必须放行（实际 ${r3.status}）`);
+    eq(fs.readFileSync(SOUL, 'utf8'), '', '显式清空应真的清空——那是用户意图，不是漏参数');
+  } finally {
+    fs.writeFileSync(SOUL, before);   // 逐字节复原 fixture
+    await app.close();
+  }
+});
+
+await atest('F1（把手层）：工厂 apply 漏传 next 必须拒绝（三个整文件写入工厂一致）', async () => {
+  /**
+   * 引擎那道 `next === undefined` 的防线是对的，但它只在**引擎**这一层。
+   * 五个把手工厂里有三个（identity-file / style-file / prompt-template）写着
+   * `{ next = '' }` 默认值 —— 一旦有调用点绕过引擎（例如把 profile **对象**直接
+   * 喂给 `applyProfile`，它不做 assertProfile），"漏参数"会再次变成"写空整个文件"。
+   * 默认值本身就是缺陷，删掉并显式拒绝。
+   */
+  const cases = [
+    ['identity-file', 'personalization.soul'],
+    ['style-file', 'style.creative'],
+    ['prompt-template', 'prompt.welcomemode-code'],
+  ];
+  for (const [label, id] of cases) {
+    const h = registryList().find((x) => x.id === id);
+    ok(h, `${label}：找不到把手 ${id}`);
+    const st = await h.probe(engineB.ctx);
+    const before = fs.existsSync(st.path) ? fs.readFileSync(st.path) : null;
+    let threw = null;
+    try { await h.apply(engineB.ctx, {}); } catch (e) { threw = e; }
+    ok(threw, `${label}：漏传 next 必须抛错（不许把文件写成空）`);
+    eq(threw.code, 'INPUT_MISSING', `${label}：错误码应为 INPUT_MISSING，实际 ${threw.code}`);
+    const after = fs.existsSync(st.path) ? fs.readFileSync(st.path) : null;
+    eq(after === null ? null : sha256(after), before === null ? null : sha256(before),
+      `${label}：被拒时文件不许变`);
+  }
+});
+
+await atest('F2：还原"备份时不存在"的条目之前，必须把当前内容留副本（可从 restore-pre 找回）', async () => {
+  /**
+   * 致命缺陷：`restoreBackup` 对"备份时本不存在"的条目直接 `fs.rmSync(absPath,{force:true})`，
+   * **删前不留任何副本** —— 实测删除后全 store 递归搜不到被删内容的任何一个字节。
+   * 现在删除/覆盖前先把当前字节落到 `state/restore-pre/<backupId>/<key 的 hash>.bin`。
+   */
+  const { createBackup } = await import('./core/backup.mjs');
+  const crypto = await import('node:crypto');
+  const target = path.join(fixtureRoot, 'restore-pre-target.txt');
+  fs.rmSync(target, { force: true });
+
+  const manifest = createBackup({
+    storeRoot: store,
+    reason: 'selftest restore-pre',
+    entries: [{ key: 'selftest.restore-pre', absPath: target }],
+  });
+  eq(manifest.entries[0].existed, false, '前提：备份时目标不存在');
+
+  // 备份之后用户才写了内容 —— 还原会把这份内容删掉
+  const SECRET = '备份之后才写的、还原会删掉的内容 WBC-RESTORE-PRE-001\n';
+  fs.writeFileSync(target, SECRET, 'utf8');
+
+  const r = engine.restore(manifest.id);
+  eq(fs.existsSync(target), false, '还原应删除"备份时不存在"的目标');
+  ok(r.savedDir, `必须返回还原前副本目录（实际 ${JSON.stringify(r.savedDir)}）`);
+
+  const preDir = path.join(store, 'state', 'restore-pre', manifest.id);
+  ok(fs.existsSync(preDir), 'restore-pre 目录必须存在');
+  const found = fs.readdirSync(preDir).filter((f) => {
+    const p = path.join(preDir, f);
+    return fs.statSync(p).isFile() && fs.readFileSync(p, 'utf8') === SECRET;
+  });
+  eq(found.length, 1, `被删内容必须能在 restore-pre 里逐字节找回（实际命中 ${found.length} 个文件）`);
+
+  // 文件名 = key 的 sha256 前 16 位（与 verify/readback.mjs 同一算法，可按 key 复算）
+  const expectName = `${crypto.createHash('sha256').update('selftest.restore-pre').digest('hex').slice(0, 16)}.bin`;
+  eq(found[0], expectName, '副本文件名应为 key 的 sha256 前 16 位（与 readback 一致）');
+
+  // index.json：只有 hash 名，人眼认不出是哪个文件，必须有可读映射
+  const idx = JSON.parse(fs.readFileSync(path.join(preDir, 'index.json'), 'utf8'));
+  ok(Array.isArray(idx.entries) && idx.entries.some((e) => e.key === 'selftest.restore-pre'),
+    'index.json 必须记录 key → 文件 的映射');
+
+  // 台账也要说出落点（用户得知道去哪找）
+  const row = readAudit(store).filter((x) => x.event === 'restore' && x.backupId === manifest.id).at(-1);
+  eq(row.status, 'ok', '全成功时 status 应为 ok');
+  eq(row.savedDir, tildify(preDir), '台账必须记下还原前副本落点');
+});
+
+await atest('F7：还原逐条目容错 —— 一条失败继续下一条，审计 status:"partial" 且 results 带 error', async () => {
+  /**
+   * 曾经的缺陷：`restoreBackup` 裸循环。第一条目已还原、第二条目 EISDIR 一抛就中断，
+   * 后面的全不执行，`engine.restore` 的审计在写之后 → **restore 审计 0 行**
+   * （半还原 + 零台账）。
+   * 现在逐条目 try/catch，失败原样带回，整体按"部分成功"入账。
+   */
+  const { createBackup } = await import('./core/backup.mjs');
+  const good = path.join(fixtureRoot, 'partial-good.txt');
+  const dirTarget = path.join(fixtureRoot, 'partial-dir-target');
+  fs.rmSync(good, { force: true });
+  fs.rmSync(dirTarget, { recursive: true, force: true });
+
+  const manifest = createBackup({
+    storeRoot: store,
+    reason: 'selftest restore partial',
+    entries: [
+      { key: 'selftest.partial-good', absPath: good },
+      { key: 'selftest.partial-dir', absPath: dirTarget },
+    ],
+  });
+  eq(manifest.entries.every((e) => e.existed === false), true, '前提：两个目标备份时都不存在');
+
+  // 第一条：普通文件（应被删除）；第二条：**目录**（rmSync 报 ERR_FS_EISDIR → 该条失败）
+  fs.writeFileSync(good, 'GOOD-BEFORE-RESTORE\n', 'utf8');
+  ensureDir(dirTarget);
+  fs.writeFileSync(path.join(dirTarget, 'keep.txt'), 'x', 'utf8');
+
+  const r = engine.restore(manifest.id);
+  eq(r.status, 'partial', `应判 partial（实际 ${r.status}）`);
+  eq(r.partial, true, 'partial 字段应为 true');
+  eq(r.ok, false, 'ok 字段应为 false（有失败就不是全成功）');
+
+  const goodRes = r.results.find((x) => x.key === 'selftest.partial-good');
+  eq(goodRes?.ok, true, '第一条必须成功 —— 证明没有在失败处中断');
+  eq(fs.existsSync(good), false, '第一条必须真的被删除（不是"后面失败所以整体没做"）');
+
+  const bad = r.results.find((x) => x.key === 'selftest.partial-dir');
+  ok(bad && bad.ok === false, '失败条目必须 ok:false');
+  ok(bad.error && bad.error.code, '失败条目必须带 error.code');
+  ok(fs.existsSync(path.join(dirTarget, 'keep.txt')), '失败的条目不许被误删（目录还在）');
+
+  // 台账：恰好新增一行 status:'partial'，且带失败明细
+  const row = readAudit(store).filter((x) => x.event === 'restore' && x.backupId === manifest.id).at(-1);
+  ok(row, '无论成败都必须有 restore 台账行（曾经是 0 行）');
+  eq(row.status, 'partial', '台账 status 必须是 partial');
+  eq(row.failed?.length, 1, '台账必须列出 1 条失败');
+  eq(row.failed[0].key, 'selftest.partial-dir', '失败明细要点名是哪个条目');
+});
+
+await atest('F2（CLI 层）：restore 不给 --confirm → 非零退出且目标文件不变；给了才真的还原', async () => {
+  /**
+   * 缺陷：`/api/restore` 修好了（confirm + dryRun + 闸门），但 CLI `restore` 直调引擎：
+   * 既不要 `--confirm`、也不过 `checkRestoreGate` —— 同一类写操作两套规矩，
+   * 等于给闸门留了个后门。这里跑**真的子进程**（不是读源码）。
+   */
+  const { createBackup } = await import('./core/backup.mjs');
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const target = path.join(fixtureRoot, 'cli-restore.txt');
+  fs.rmSync(target, { force: true });
+  fs.writeFileSync(target, 'ORIGINAL-BEFORE-BACKUP\n', 'utf8');
+
+  const manifest = createBackup({
+    storeRoot: store,
+    reason: 'selftest cli restore',
+    entries: [{ key: 'selftest.cli-restore', absPath: target }],
+  });
+  fs.writeFileSync(target, 'CHANGED-AFTER-BACKUP\n', 'utf8');
+
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cli.mjs');
+  const run = (...extra) => spawnSync(process.execPath, [
+    cli, 'restore', manifest.id, ...extra, '--root', cfg, '--store', store,
+  ], { encoding: 'utf8', cwd: path.dirname(cli) });
+
+  const refused = run();
+  ok(refused.status !== 0, `不给 --confirm 必须非零退出（实际 ${refused.status}）`);
+  ok(/--confirm/.test(`${refused.stdout ?? ''}${refused.stderr ?? ''}`),
+    `必须给出可复制的完整命令，实际输出：${JSON.stringify((refused.stderr ?? '').slice(0, 200))}`);
+  eq(fs.readFileSync(target, 'utf8'), 'CHANGED-AFTER-BACKUP\n', '被拒时目标文件一个字节都不许变');
+
+  const done = run('--confirm');
+  eq(done.status, 0, `给 --confirm 后应成功（stderr: ${(done.stderr ?? '').slice(0, 300)}）`);
+  eq(fs.readFileSync(target, 'utf8'), 'ORIGINAL-BEFORE-BACKUP\n', '确认后应真的还原');
+});
+
+await atest('F6：写已落盘但台账写不成 → 异常带 backupId 且如实说"已完成、台账失败"', async () => {
+  /**
+   * 曾经：`appendAudit` 裸露在"文件已经写完"之后。`store/state` 不可写时——
+   * 目标文件**已改**、调用方收到"失败"、`audit.jsonl` 零行、异常里**没有 backupId**。
+   * 用户既不知道写已经发生，也不知道有一份备份可以还原。
+   * 现在：抛可判定的 `AUDIT_WRITE_FAILED` + 异常带 `backupId` + 文案明说"已完成但台账失败"。
+   *
+   * 失败注入：把 `<store>/state` 占成一个**普通文件** → `ensureDir(state)` 必然 EEXIST
+   * （已单独预检：`gates/WP9/injection-mechanisms.log`）。
+   */
+  const storeNoAudit = ensureDir(path.join(fixtureRoot, '_store-no-audit'));
+  fs.rmSync(path.join(storeNoAudit, 'state'), { recursive: true, force: true });
+  fs.writeFileSync(path.join(storeNoAudit, 'state'), 'occupied', 'utf8');
+  const eNoAudit = createEngine({
+    configRoot: cfg, storeRoot: storeNoAudit, sessionStartOf: startOf, appStateProbe: () => false,
+  });
+
+  const before = fs.readFileSync(SOUL, 'utf8');
+  const NEW = `${before}\n- WBC-AUDIT-FAIL-001\n`;
+  let threw = null;
+  try {
+    await eNoAudit.apply('personalization.soul', { next: NEW });
+  } catch (e) {
+    threw = e;
+  }
+  try {
+    ok(threw, '台账写不成时必须抛错（不许静默成功）');
+    eq(threw.code, 'AUDIT_WRITE_FAILED', `错误码应为 AUDIT_WRITE_FAILED，实际 ${threw.code}`);
+    ok(threw.backupId, '异常必须带 backupId —— 用户要知道"写已经发生、有备份可退"');
+    ok(threw.written === true, '异常必须标明"写已经发生"（written:true）');
+    ok(/台账/.test(threw.message) && /(已完成|写入)/.test(threw.message),
+      `文案必须如实说明"已完成但台账失败"，实际：${threw.message}`);
+    eq(fs.readFileSync(SOUL, 'utf8'), NEW, '既然已经写了，就必须如实承认写了（不许假装没发生）');
+  } finally {
+    fs.writeFileSync(SOUL, before, 'utf8');              // 复原 fixture
+    fs.rmSync(storeNoAudit, { recursive: true, force: true });
+  }
+});
+
+await atest('F3（判据层）：expectedDelta 为 null 必须 undetermined；0 仍是合法的"预期无变化"', async () => {
+  /**
+   * 消费端缺陷（F3）：`token-delta` 的「预期无变化（|期望|≤噪声）」分支
+   * 会把 `null`（= 估不出来）当成 0（= 确实零增量），于是"改动完全没进请求"
+   * 也被判成 `effective`。
+   */
+  const { evaluateTokenDelta } = await import('./verify/token-delta.mjs');
+
+  const nul = evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1000, expectedDelta: null });
+  eq(nul.verdict, 'undetermined', 'null（估不出）不是 0（预期无变化）——折成 0 会把"没进请求"报成生效');
+  ok(/理论增量/.test(nul.reason), `理由必须点出缺理论增量：${nul.reason}`);
+
+  // 第三证：把被测字段**删掉**（而不是传 null）同样必须判"判不了"
+  const undef = evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1000 });
+  eq(undef.verdict, 'undetermined', '字段缺失必须与 null 同一个结论（不许静默按缺省放过）');
+
+  // 反向：合法 0 的语义必须保留（不许把 null 与 0 一起否掉）
+  const zero = evaluateTokenDelta({ baselineTokens: 1000, observedTokens: 1000, expectedDelta: 0 });
+  eq(zero.verdict, 'effective', '确实零增量的改动仍应判生效（0 不能被当成 null）');
+});
+
+await atest('F3（档位链）：任一项估不出增量 → 台账 null + verifyProfile undetermined（真实 apply 路径）', async () => {
+  /**
+   * 曾经的缺陷（F3）：`applyProfile` 用 `?? 0` 求和 → `expectedDelta=0` →
+   * 判据走「预期无变化 + 实测无变化 → effective」，**改动完全没进请求也报绿灯**。
+   *
+   * 这里走真实链路，不手改台账：档位里放一个头部通道把手（`prompt.welcomemode-*`），
+   * 它的 preview 明确返回 `expectedDeltaTokens: null`（头部通道无法用 token 估增量）。
+   */
+  const engineC = createEngine({
+    configRoot: cfg, storeRoot: store, sessionStartOf: startOf, appStateProbe: () => false,
+  });
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.clear();
+
+  const prof = {
+    id: 'selftest-null-delta',
+    name: '估不出增量的档位',
+    values: { 'prompt.welcomemode-code': '<personal_files_safety>WP9 自测</personal_files_safety>\n' },
+  };
+  const applied = await engineC.applyProfile(prof, { confirm: true });
+  eq(applied.expectedDeltaTokens, null,
+    `档位里有把手估不出增量 → 合计必须是 null（实际 ${JSON.stringify(applied.expectedDeltaTokens)}）——`
+    + '折成 0 会让 verify 走"预期无变化"分支把"没进请求"报成生效');
+
+  const row = engineC.audit().filter((r) => r.event === 'apply-profile' && r.profile === prof.id).at(-1);
+  ok(row, '应有 apply-profile 台账行');
+  eq(row.expectedDeltaTokens, null, '台账里也必须记 null（不许折成 0）');
+
+  // 造"改动后新建会话、Δ=0"的对照数据 —— 这正是缺陷会误判成 effective 的场景
+  const at = Date.parse(row.at);
+  SESS.set('901', at - 120000);
+  writeTrace('901', 'base.jsonl', new Date(at - 115000).toISOString(), CHAT_MODEL, 1000);
+  SESS.set('902', at + 5000);
+  writeTrace('902', 'obs.jsonl', new Date(at + 10000).toISOString(), CHAT_MODEL, 1000);
+
+  const v = await engineC.verifyProfile(prof.id);
+  ok(v.evidence, `必须真的走完对照采集，不能是"取不到会话"的兜底：${JSON.stringify(v).slice(0, 200)}`);
+  eq(v.verdict, 'undetermined', `估不出理论增量时必须说"判不了"，实际 ${v.verdict}：${v.reason}`);
+  ok(/理论增量/.test(v.reason), `理由必须点出缺理论增量：${v.reason}`);
+
+  /**
+   * 正向对照：同样是 Δ0，但期望增量**真的是 0** → 必须仍能判 effective。
+   * 这条对照证明"判据真的在区分 null 与 0"，而不是"永远 undetermined"的空转。
+   */
+  const { appendAudit } = await import('./core/audit.mjs');
+  appendAudit(store, {
+    event: 'apply-profile', profile: 'selftest-zero-delta', handles: [],
+    expectedDeltaTokens: 0, status: 'ok',
+  });
+  const zeroRow = engineC.audit()
+    .filter((r) => r.event === 'apply-profile' && r.profile === 'selftest-zero-delta').at(-1);
+  const at0 = Date.parse(zeroRow.at);
+  SESS.clear();
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.set('911', at0 - 120000);
+  writeTrace('911', 'base.jsonl', new Date(at0 - 115000).toISOString(), CHAT_MODEL, 1000);
+  SESS.set('912', at0 + 5000);
+  writeTrace('912', 'obs.jsonl', new Date(at0 + 10000).toISOString(), CHAT_MODEL, 1000);
+
+  const v0 = await engineC.verifyProfile('selftest-zero-delta');
+  eq(v0.verdict, 'effective',
+    `合法 0 的语义必须保留（确实零增量的改动仍判生效），实际 ${v0.verdict}：${v0.reason}`);
+
+  fs.rmSync(tracesDir, { recursive: true, force: true });
+  SESS.clear();
+});
+
+// ══════════════ WP10 · P2（上半）契约门禁 + 空转断言改造（2026-11-02）══════════════
+// 本批消灭"源码字符串/词存在性"类空转断言；这里补的是其中最贵的一处判据层缺口。
+console.log('\n【WP10】P2（上半）：断言去空转（后端）');
+
+await atest('C2：applyProfile 多把手求和 —— 任一项估不出则整体 null（不是 0，也不是其余项之和）', async () => {
+  /**
+   * 缺口由来（brief C2）：WP9 把 `applyProfile` 的 `?? 0` 求和改成「任一项估不出即整体 null」，
+   * 但只有 `F3（档位链）` 顺带覆盖到它 —— 那条用的是**单把手**档位，
+   * "多把手求和的算术"这一层（`previews.reduce(...)`）没有独立断言钉住：
+   * 单把手场景下"永远 null"和"正确实现"给出同一个答案，分辨不出来。
+   * 这里用两个合成把手把两个方向都钉死：
+   *   · 全部估得出（10 + 25）→ 必须真的求和；
+   *   · 任一项估不出（+ null）→ 必须整体 null（不是 0，也不是其余项之和 35）。
+   */
+  const aFile = path.join(fixtureRoot, 'sum-a.txt');
+  const bFile = path.join(fixtureRoot, 'sum-b.txt');
+  const cFile = path.join(fixtureRoot, 'sum-c.txt');
+  for (const [p, v] of [[aFile, 'A'], [bFile, 'B'], [cFile, 'C']]) fs.writeFileSync(p, v, 'utf8');
+
+  const mkSumHandle = (id, file, delta) => ({
+    id,
+    title: `求和测试 ${id}`,
+    target: id,
+    resolveTarget: () => ({ key: id, path: file }),
+    writeClass: 'user-data',
+    channel: 'request-tail',
+    privilege: 'none',
+    upgradeBehavior: 'survives',
+    verification: { strategy: 'token-delta', channel: 'request-tail', baseline: 'session-first', assertion: 'delta-tokens' },
+    async probe() { return { exists: true, path: file, text: fs.readFileSync(file, 'utf8') }; },
+    async preview() { return { expectedDeltaTokens: delta }; },
+    async apply(ctx, { next }) { fs.writeFileSync(file, String(next), 'utf8'); return { changed: true }; },
+  });
+  register(mkSumHandle('test.sum-a', aFile, 10));
+  register(mkSumHandle('test.sum-b', bFile, 25));
+  register(mkSumHandle('test.sum-c', cFile, null));   // 估不出增量（如头部通道把手）
+
+  const eSum = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+
+  // 方向一：全部估得出 → 必须是**算术和**（把求和写成"永远 null"就会在这里红）
+  const okProfile = await eSum.applyProfile({
+    id: 'selftest-sum-ok', name: '全部估得出', values: { 'test.sum-a': 'A2', 'test.sum-b': 'B2' },
+  }, { confirm: true });
+  eq(okProfile.expectedDeltaTokens, 35,
+    `两个估得出的把手必须求和（10 + 25 = 35），实际 ${JSON.stringify(okProfile.expectedDeltaTokens)}`);
+  const okRow = readAudit(store).filter((r) => r.event === 'apply-profile' && r.profile === 'selftest-sum-ok').at(-1);
+  eq(okRow.expectedDeltaTokens, 35, '台账里也必须是无损的算术和');
+
+  // 方向二：任一项估不出 → 整体 null（折成 0 / 用其余项之和都会在这里红）
+  const nullProfile = await eSum.applyProfile({
+    id: 'selftest-sum-null', name: '含估不出的把手',
+    values: { 'test.sum-a': 'A3', 'test.sum-b': 'B3', 'test.sum-c': 'C2' },
+  }, { confirm: true });
+  eq(nullProfile.expectedDeltaTokens, null,
+    '任一项估不出增量 → 合力必须是 null（实际 '
+    + `${JSON.stringify(nullProfile.expectedDeltaTokens)}）——折成 0 会让 verify 把"没进请求"报成生效，`
+    + '取其余项之和则是**谎报一个能验证的期望值**');
+  const nullRow = readAudit(store).filter((r) => r.event === 'apply-profile' && r.profile === 'selftest-sum-null').at(-1);
+  eq(nullRow.expectedDeltaTokens, null, '台账里也必须是 null（不许只改返回值）');
 });
 
 // ══════════════ 汇总 ══════════════

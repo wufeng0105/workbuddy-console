@@ -14,7 +14,7 @@
  *   node src/cli.mjs verify  <handleId>                 验证是否真生效
  *     --baseline <n> --observed <n> --expected <n>      手工给三个数字（不自动对照）
  *     --restarted                                       规则面专用：确认 WorkBuddy 已重启过
- *   node src/cli.mjs restore <backupId>                 还原
+ *   node src/cli.mjs restore <backupId>                 还原（需 --confirm；--dry-run 预演）
  *
  * 专家档位（N 套人设一键切换）：
  *   node src/cli.mjs profiles / profile-save <名称> / profile-plan <id> / profile-apply <id> / profile-verify <id>
@@ -31,7 +31,7 @@
  *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console，可用 WORKBUDDY_CONSOLE_HOME）
  *   --version <v>   覆盖版本探测
  *   --json          机器可读输出
- *   --confirm       厂商文件写入的显式确认
+ *   --confirm       写操作的显式确认（厂商文件写入 / 还原）
  */
 
 import process from 'node:process';
@@ -263,13 +263,55 @@ async function main(argv) {
     }
 
     case 'restore': {
-      const r = engine.restore(f._[1], { dryRun: f['dry-run'] === true });
+      const backupId = f._[1];
+      const dryRun = f['dry-run'] === true;
+      if (typeof backupId !== 'string' || !backupId.trim()) {
+        console.error('❌ 缺少备份 id —— 先 `node src/cli.mjs backups` 看有哪些备份。');
+        return process.exitCode = 1;
+      }
+      /**
+       * ⚠️ CLI 也必须有同意闸门（F2）。
+       *
+       * 曾经：`/api/restore` 修好了（confirm + dryRun + `checkRestoreGate`），
+       * 但 CLI 的 `restore` 直调 `engine.restore`：既不要 `--confirm`、也不过闸门。
+       * 一条命令就能在 WorkBuddy 运行中覆盖/删除厂商文件，而且它对"备份时本不存在"
+       * 的条目执行的是**删除**。同一类写操作两套规矩，等于给闸门留了个后门。
+       */
+      if (!dryRun && f.confirm !== true) {
+        console.error(
+          '❌ [CONFIRMATION_REQUIRED] 还原会覆盖甚至删除目标文件，需显式确认。\n'
+          + `   预演（不写盘）：node src/cli.mjs restore ${backupId} --dry-run\n`
+          + `   确认后执行：    node src/cli.mjs restore ${backupId} --confirm`,
+        );
+        return process.exitCode = 1;
+      }
+      // 与 HTTP 路径**同一道**闸门：还原是写操作，必须与 apply 过同一套规矩
+      if (!dryRun) {
+        const gateBlock = engine.checkRestoreGate(backupId);
+        if (gateBlock.blocked) {
+          console.error(`❌ [GATE_BLOCKED] ${gateBlock.reason}`);
+          return process.exitCode = 1;
+        }
+      }
+
+      const r = engine.restore(backupId, { dryRun });
       if (json) return out(r, true);
       console.log(`${r.dryRun ? '（预演）' : ''}备份 ${r.id}  创建于 ${r.createdAt}`);
       for (const x of r.results) {
-        console.log(`  ${x.action === 'noop' ? '＝' : x.action === 'restore' ? '↩' : '✕'} ${x.absPath}  ${x.drift ? '(有漂移)' : ''}`);
+        const mark = x.ok === false ? '✕' : x.action === 'noop' ? '＝' : x.action === 'restore' ? '↩' : x.action === 'delete' ? '✕' : '?';
+        console.log(`  ${mark} ${x.absPath}  ${x.drift ? '(有漂移)' : ''}`
+          + `${x.ok === false ? `  失败 [${x.error?.code ?? 'ERR'}] ${x.error?.message ?? ''}` : ''}`);
       }
-      console.log(`\n共 ${r.changed.length} 项发生变化`);
+      console.log(`\n共 ${r.changed.length} 项发生变化${r.failed?.length ? `，${r.failed.length} 项失败` : ''}`);
+      // 还原前副本落点必须说出来，否则用户不知道"被删的东西去哪找回"
+      if (r.savedDir) console.log(`还原前的当前内容已另存：${r.savedDir}`);
+      /**
+       * 部分/完全失败必须非零退出 —— 不许把"半还原"说成成功（与 replay/approval 同一纪律）。
+       */
+      if (r.status !== 'ok') {
+        console.error(`\n❌ 还原${r.status === 'partial' ? '部分失败' : '失败'}（status=${r.status}）—— 见上面逐条明细`);
+        process.exitCode = 1;
+      }
       return undefined;
     }
 
@@ -286,6 +328,18 @@ async function main(argv) {
       const s = await startConsole({
         root: typeof f.root === 'string' ? f.root : undefined,
         port: f.port !== undefined ? Number(f.port) : 0,
+        /**
+         * `--store` 必须真的传下去。
+         *
+         * 曾经的缺陷：这里只传 root/port，`--store` 被解析了却丢掉，
+         * 于是 `serve --store X` 实际用的是**默认**数据目录（`~/.workbuddy-console`），
+         * 而帮助文案承诺它生效。隔离运行的语义因此是假的：
+         * 审计、备份都落进了真实数据目录。
+         *
+         * （这条是排查"fixture 起服务污染真实 baselines/"时抓出来的：
+         *   先是发现 baselinesDir 忽略 store，再顺着发现 store 根本没传进来。）
+         */
+        store: typeof f.store === 'string' ? f.store : undefined,
       });
       console.log('workbuddy-console 已启动');
       console.log(`  WorkBuddy ${s.version}    配置根 ${s.configRoot}`);

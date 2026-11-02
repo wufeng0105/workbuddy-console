@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { backupsDir, ensureDir, tildify } from './paths.mjs';
+import { backupsDir, stateDir, ensureDir, tildify } from './paths.mjs';
 import { BackupMissingError, IntegrityError } from './errors.mjs';
 
 /** @param {Buffer|string} data */
@@ -96,53 +96,137 @@ export function listBackups(storeRoot) {
 }
 
 /**
+ * 还原前副本的文件名：`key` 的 sha256 前 16 位。
+ *
+ * 与 `verify/readback.mjs` 的 `state/readback/<hash>.json` 同一套做法（同一算法、同一截断）：
+ * 只要知道备份条目的 `key`，就能复算出文件名，不需要额外的映射表。
+ * @param {string} key
+ */
+function preRestoreName(key) {
+  return `${crypto.createHash('sha256').update(String(key)).digest('hex').slice(0, 16)}.bin`;
+}
+
+/**
  * 还原。先报漂移（当前值 vs 备份值），再回写。
+ *
+ * ⚠️ 两条硬要求（F2/F7，都是实测过的数据丢失）：
+ *
+ *   ① **删除或覆盖之前，先把目标当前的字节留一份副本**。
+ *      曾经：对"备份时本不存在"的条目直接 `fs.rmSync(absPath, {force:true})`，
+ *      删前不留任何副本 —— 实测删除后**全 store 递归搜不到被删内容的任何一个字节**，
+ *      即"还原"把用户后来写的文件永久删掉了。现在每次删除/覆盖前把当前字节落到
+ *      `<store>/state/restore-pre/<backupId>/<key 的 hash>.bin`，并写 `index.json` 供人按路径找回。
+ *      （dryRun 不落任何东西——预演承诺"不写盘"。）
+ *
+ *   ② **逐条目 try/catch**：一条失败继续下一条，失败原样带回 `results`。
+ *      曾经是裸循环：第二条 EISDIR 一抛，第一条已还原、后面全部不执行，
+ *      调用方还拿不到"到底改了什么"（F7 实测：半还原 + 零台账）。
+ *
  * @param {{storeRoot:string, id:string, dryRun?:boolean}} opts
  */
 export function restoreBackup({ storeRoot, id, dryRun = false }) {
   const m = readManifest(storeRoot, id);
   const dir = path.join(backupsDir(storeRoot), id);
   const results = [];
+  const saved = [];
 
-  for (const e of m.entries) {
-    const currentExists = fs.existsSync(e.absPath);
-    const currentSha = currentExists ? sha256(fs.readFileSync(e.absPath)) : null;
+  /** 还原前副本目录（懒创建：没东西要覆盖/删除时不留下空目录） */
+  const preRoot = dryRun ? null : path.join(stateDir(storeRoot), 'restore-pre', id);
+  let preDir = null;
 
-    if (!e.existed) {
-      // 备份时本不存在 → 还原 = 删除后来创建的
-      const action = currentExists ? 'delete' : 'noop';
-      if (!dryRun && currentExists) fs.rmSync(e.absPath, { force: true });
-      results.push({ key: e.key, absPath: tildify(e.absPath), action, drift: currentExists });
-      continue;
-    }
-
-    const storedPath = path.join(dir, e.stored);
-    if (!fs.existsSync(storedPath)) {
-      throw new IntegrityError(`备份文件缺失：${e.stored}`, { id, key: e.key });
-    }
-    const buf = fs.readFileSync(storedPath);
-    const storedSha = sha256(buf);
-    if (storedSha !== e.sha256) {
-      throw new IntegrityError(`备份内容校验失败（sha256 不符）：${e.key}`, {
-        id, key: e.key, expected: e.sha256, actual: storedSha,
-      });
-    }
-
-    const drift = currentSha !== e.sha256;
-    const action = drift ? 'restore' : 'noop';
-    if (!dryRun && drift) {
-      ensureDir(path.dirname(e.absPath));
-      fs.writeFileSync(e.absPath, buf);
-    }
-    results.push({
-      key: e.key,
-      absPath: tildify(e.absPath),
-      action,
-      drift,
-      currentSha,
-      manifestSha: e.sha256,
-    });
+  /**
+   * 把"马上要被覆盖/删除的当前字节"存一份。
+   * 存不下就让这一条失败（抛出 → 记为 error）—— 宁可不还原，也不无声删数据。
+   * @param {string} key @param {string} absPath
+   */
+  function saveCurrent(key, absPath) {
+    if (!preRoot) return;
+    const st = fs.statSync(absPath);
+    if (!st.isFile()) return;    // 目录不在这里造副本；删除它的那一步会自己失败（EISDIR）
+    const buf = fs.readFileSync(absPath);
+    preDir ??= ensureDir(preRoot);
+    const file = preRestoreName(key);
+    fs.writeFileSync(path.join(preDir, file), buf);
+    saved.push({ key, absPath: tildify(absPath), file, bytes: buf.length, sha256: sha256(buf) });
   }
 
-  return { id, dryRun, createdAt: m.createdAt, results };
+  for (const e of m.entries) {
+    try {
+      const currentExists = fs.existsSync(e.absPath);
+      const currentSha = currentExists ? sha256(fs.readFileSync(e.absPath)) : null;
+
+      if (!e.existed) {
+        // 备份时本不存在 → 还原 = 删除后来创建的。**删前留副本**。
+        const action = currentExists ? 'delete' : 'noop';
+        if (!dryRun && currentExists) {
+          saveCurrent(e.key, e.absPath);
+          fs.rmSync(e.absPath, { force: true });
+        }
+        results.push({ key: e.key, absPath: tildify(e.absPath), action, ok: true, drift: currentExists });
+        continue;
+      }
+
+      const storedPath = path.join(dir, e.stored);
+      if (!fs.existsSync(storedPath)) {
+        throw new IntegrityError(`备份文件缺失：${e.stored}`, { id, key: e.key });
+      }
+      const buf = fs.readFileSync(storedPath);
+      const storedSha = sha256(buf);
+      if (storedSha !== e.sha256) {
+        throw new IntegrityError(`备份内容校验失败（sha256 不符）：${e.key}`, {
+          id, key: e.key, expected: e.sha256, actual: storedSha,
+        });
+      }
+
+      const drift = currentSha !== e.sha256;
+      const action = drift ? 'restore' : 'noop';
+      if (!dryRun && drift) {
+        saveCurrent(e.key, e.absPath);       // **覆盖前留副本**
+        ensureDir(path.dirname(e.absPath));
+        fs.writeFileSync(e.absPath, buf);
+      }
+      results.push({
+        key: e.key,
+        absPath: tildify(e.absPath),
+        action,
+        ok: true,
+        drift,
+        currentSha,
+        manifestSha: e.sha256,
+      });
+    } catch (err) {
+      // 逐条目容错：一条失败继续下一条，失败原样带回（供 engine 写 status:'partial'）
+      results.push({
+        key: e.key,
+        absPath: tildify(e.absPath),
+        action: 'error',
+        ok: false,
+        error: { code: err?.code ?? 'ERR', message: err?.message ?? String(err) },
+      });
+    }
+  }
+
+  // 还原前副本的索引：只按 key 的 hash 命名，人眼认不出是哪个文件，故附一份可读清单
+  if (preDir && saved.length) {
+    fs.writeFileSync(
+      path.join(preDir, 'index.json'),
+      `${JSON.stringify({ backupId: id, createdAt: new Date().toISOString(), entries: saved }, null, 2)}\n`,
+      'utf8',
+    );
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  return {
+    id,
+    dryRun,
+    createdAt: m.createdAt,
+    results,
+    /** 全部条目成功 */
+    ok: failed.length === 0,
+    /** 部分成功（既不是全成也不是全败）—— 调用方据此写 status:'partial' */
+    partial: failed.length > 0 && results.some((r) => r.ok),
+    /** 还原前副本落点（dryRun 或没东西要备份时为 null），供界面/CLI 直接告诉用户"去哪找回" */
+    savedDir: preDir ? tildify(preDir) : null,
+    saved,
+  };
 }

@@ -715,3 +715,32 @@ h1, h2, h3 { margin: 0; }
   margin-top: 8px;
   padding-top: 12px;
 }
+
+/* 多行结果提示：一条写操作可能要分几件事说（正文/切换/验证） */
+.flash-line + .flash-line { margin-top: 4px; }
+
+/* ══════════════ 风格正文编辑器 ══════════════ */
+/* 说明这张卡管的是"指针"而不是"内容"——不要让界面暗示它不给的能力 */
+.style-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-3);
+}
+
+.style-editor {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--hover);
+}
+
+.style-editor-meta { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; flex-wrap: wrap; }
+
+.style-editor .input-text { min-height: 220px; }
+
+.style-plan { display: inline-flex; align-items: center; gap: 6px; }
+
+.diff-add { color: var(--ok, #2f9e5f); font-family: var(--mono); }
+.diff-del { color: var(--bad, #c8402f); font-family: var(--mono); }

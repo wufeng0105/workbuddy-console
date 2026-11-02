@@ -44,6 +44,31 @@ class StubNode {
     this.checked = false;
     this.value = '';
     this.id = '';
+    /**
+     * `then` —— **故意声明成非函数**。
+     *
+     * 审计的 Proxy 插桩报过"已执行路径上唯一被访问、stub 没定义的成员是 `then`"。
+     * 追下去发现来源是本文件自己的 harness：`async function boot() { … return root }`
+     * 返回的是一个 StubNode，于是 Promise 解析它会读 `root.then`。
+     *
+     * 所以这里**不能**给一个真的 thenable 实现：`then` 一旦是函数，`await boot()`
+     * 就会走 thenable 解析路径；而"用节点自己兑现自己"按规范是无限自激
+     * （then(resolve) → resolve(node) → 再读 then …），测试会直接挂死。
+     * 声明成 undefined 是**显式**表达"StubNode 不是 thenable"，
+     * 让"这里读过 then"这件事有一个可读的落点，而不是靠"反正没定义"偶然正确。
+     */
+    this.then = undefined;
+  }
+
+  /**
+   * 自身或祖先链上是否有 disabled —— 真实浏览器对 disabled 控件的**可信**点击不派发事件。
+   * 读的是 `disabled` 属性（IDL 反射 content attribute），与浏览器一致。
+   */
+  isDisabled() {
+    for (let n = this; n; n = n.parentNode) {
+      if (n.disabled === true) return true;
+    }
+    return false;
   }
 
   get className() { return this.attributes.class ?? ''; }
@@ -58,7 +83,10 @@ class StubNode {
     if (k === 'value') this.value = String(v);
     if (k === 'title') this.attributes.title = String(v);
   }
-  removeAttribute(k) { delete this.attributes[k]; }
+  removeAttribute(k) {
+    delete this.attributes[k];
+    if (k === 'disabled') this.disabled = false;
+  }
 
   append(...kids) {
     for (const k of kids) {
@@ -80,20 +108,52 @@ class StubNode {
     const l = this.listeners[type];
     if (l) this.listeners[type] = l.filter((x) => x !== fn);
   }
-  /** 派发事件（真实浏览器行为；测试模拟"用户输入"必须走它，否则 input 监听不会被触发） */
+  /**
+   * 派发事件（真实浏览器行为；测试模拟"用户输入"必须走它，否则 input 监听不会被触发）
+   *
+   * ⚠️ 与 `click()` 刻意**不同**：真实 DOM 里 `dispatchEvent()` 是**不可信**输入，
+   * disabled 元素照样会收到监听器。真正的浏览器只拦"用户激活"那一路。
+   * 所以这里不加 disabled 判定 —— 加了就等于把 app.js 的守卫搬到 stub 里替它把关。
+   */
   dispatchEvent(ev) {
     const type = typeof ev === 'string' ? ev : ev?.type;
     const event = typeof ev === 'string' ? { type, target: this } : { target: this, ...ev };
     for (const fn of this.listeners[type] ?? []) fn(event);
     return true;
   }
-  /** 触发 click（含 onclick 属性） */
+
+  /**
+   * 触发一次**可信** click（等价于用户真的用鼠标点了它）。
+   *
+   * 为什么必须遵守 `disabled`：`web/app.js` 防双击双写的**唯一**机制就是禁用按钮
+   * （`runBusy` → `setBusyDom(true)`，见 app.js:1561 / :1577）。stub 若不拦，
+   * 任何"点两次"的断言都恒绿 —— 也就是在假 DOM 上通过，这正是 I2 名不副实的根因。
+   *
+   * 关于"真浏览器里 dispatchEvent 也绕过 disabled"：那是**不可信**输入被刻意允许的
+   * （规范如此）。CDP 的 `Input.dispatchMouseEvent` 才是可信输入，它会遵守 disabled；
+   * 本方法模拟的是后者。要模拟前者请用 `dispatchEvent({ type: 'click' })`。
+   */
   click() {
+    if (this.isDisabled()) return false;   // 可信点击：disabled 控件收不到
     const ev = { target: this, preventDefault() {}, stopPropagation() {} };
     for (const fn of this.listeners.click ?? []) fn(ev);
     const oc = this.attributes.onclick;
     if (typeof oc === 'function') oc(ev);
+    return true;
   }
+
+  /**
+   * 真实 API：`app.js:555` 打开站内对话框时调 `input.focus?.()`。
+   * 记录一次调用（`_focused`）而不是空实现 —— 将来要断言"打开对话框就聚焦"时有据可查。
+   */
+  focus() { this._focused = true; }
+
+  /**
+   * 真实 API：`app.js:2113` 守护页「快照归档」按钮调
+   * `document.getElementById('guard-timeline')?.scrollIntoView(...)`，**没有可选链**，
+   * stub 缺它就会真 `TypeError`（审计 gates/WP7/PROBE-scrollIntoView.log 复现过）。
+   */
+  scrollIntoView() { this._scrolledIntoView = true; }
 
   /** 文本内容：自身文本 + 所有后代文本 */
   get textContent() {
@@ -173,7 +233,12 @@ class StubDocument {
 /** @type {{apiCalls: Array<{path:string, opts:any}>, mode:string, respond:(p:string,a:any)=>any}} */
 let H;
 
-function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null } = {}) {
+/** api() 传给 fetch 的 body 是 JSON **字符串**（见 web/core.js:31）——这里统一解析回来 */
+const bodyOf = (opts) => {
+  try { return JSON.parse(opts?.body ?? '{}'); } catch { return {}; }
+};
+
+function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null, restorePreview = null } = {}) {
   const doc = new StubDocument();
   const apiCalls = [];
 
@@ -183,12 +248,33 @@ function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], 
       e.code = 'UNAUTHORIZED';
       throw e;
     }
+    /**
+     * 写事务失败注入（B5）：只让 `/apply` 挂，其余域照常 ——
+     * 这样页面会走 doApply 的 onError 分支，而不是被 reloadAll 的域错误横幅遮住。
+     * 注意 message **不含**错误码：于是"提示里必须有 EPERM"这条断言真的在验 `e.code` 被读了。
+     */
+    if (mode === 'apply-down' && /\/apply$/.test(p)) {
+      const e = new Error('数据目录写不进去');
+      e.code = 'EPERM';
+      throw e;
+    }
     if (p === '/api/overview') return overview;
     if (p === '/api/doctor') return { version: '5.9.3', anchors: [], handles };
     if (p === '/api/profiles') return profiles;
     if (p === '/api/approval') return { levels: [], prompts: [], rules: null };
     if (p === '/api/drift') return drift ?? { ok: false, reason: 'no bundle', results: [], needReplay: [] };
     if (p.startsWith('/api/audit')) return audit ?? [];
+    /**
+     * 按备份还原（B7）。`doRestore` 是两步走：先 dryRun 预演、再 confirm 执行。
+     * 这里的两发返回值必须不同 —— 否则"确认前就执行了"会被同样的一份响应掩盖。
+     */
+    if (p === '/api/restore') {
+      const body = bodyOf(opts);
+      if (body.dryRun === true) {
+        return restorePreview ?? { changed: [], willDelete: [], backupId: body.backupId };
+      }
+      return { changed: ['x'], deleted: [], backupId: body.backupId };
+    }
     if (p === '/api/baseline') return { available: true, versionKey: '5.9.3(t)', capturedAt: '2026-11-01T00:00:00Z', entries: {}, ledgers: [] };
     if (p.includes('/probe')) {
       if (mode === 'probe-down') { const e = new Error('probe 失败'); e.code = 'EPERM'; throw e; }
@@ -253,6 +339,67 @@ async function boot() {
 }
 
 const readHead = () => fs.readFileSync(APP_JS, 'utf8');
+
+/* ══════════════ 行为断言的公共工具（WP11 加） ══════════════ */
+
+/** 等异步落地（render / 请求 / queueMicrotask）。行为断言里统一用它，不散落魔法数 */
+const tick = (ms = 120) => new Promise((r) => setTimeout(r, ms));
+
+/** 进「个性化」并展开标题含 `titlePart` 的卡；render 会重建整棵树，所以取用前一律重新查 */
+async function expandCustomizeCard(root, titlePart) {
+  const nav = root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化');
+  assert.ok(nav, '找不到「个性化」导航');
+  nav.click();
+  await tick(100);
+  const find = () => root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes(titlePart));
+  let card = find();
+  assert.ok(card, `找不到标题含「${titlePart}」的卡`);
+  if (card.dataset.open !== 'true') {
+    card.querySelector('.acc-head').click();
+    await tick(180);
+    card = find();
+  }
+  assert.ok(card, `展开后找不到标题含「${titlePart}」的卡`);
+  return card;
+}
+
+/**
+ * 只取「最近动态」表格里的三态标记。
+ * 本 stub 的 `A B` 后代选择器是"逐级交集过滤"而非真后代匹配（见文件顶部 stub 说明），
+ * 所以按 class 取全量、再顺着祖先链自己判断归属（T16 也是这么做的）。
+ */
+function ledgerMarks(root) {
+  return root.querySelectorAll('.mk').filter((m) => {
+    let p = m.parentNode;
+    let sawEvt = false;
+    while (p) {
+      if (p.classList.contains('ledger-evt')) sawEvt = true;
+      if (p.classList.contains('ledger') && sawEvt) return true;
+      p = p.parentNode;
+    }
+    return false;
+  });
+}
+
+const SOUL_HANDLE = {
+  id: 'personalization.soul', title: '人设设定（SOUL.md）', writeClass: 'user-data', anchorOk: true,
+};
+
+/** 打开 SOUL 卡、在编辑器里真打一段字（派发 input）、返回最新卡与按钮 */
+async function openSoulEditor(root, typedSuffix = '') {
+  const card = await expandCustomizeCard(root, 'SOUL');
+  const ta = card.querySelectorAll('#editor')[0];
+  assert.ok(ta, '找不到编辑器（#editor）');
+  const typed = typedSuffix ? `${ta.value}${typedSuffix}` : null;
+  if (typed !== null) {
+    ta.value = typed;
+    ta.dispatchEvent({ type: 'input' });   // 必须派发：否则草稿不会被记录
+  }
+  const applyBtn = card.querySelectorAll('.btn-primary').find((b) => b.textContent.trim() === '应用');
+  assert.ok(applyBtn, '找不到「应用」按钮');
+  return { card, ta, typed, applyBtn };
+}
 /* ══════════════ 静态结构断言（不需要跑起来） ══════════════ */
 
 test('P0/T11：S.busy 只允许一处置位、一处复位，且复位在 finally 里', () => {
@@ -618,6 +765,101 @@ test('I7：厂商参考件必须能"只读查看"（不能编辑 ≠ 不能看�
   assert.match(readOnly, /el\('pre'/, '只读区用 <pre> 保留原文换行');
 });
 
+test('F6：枚举卡的下拉框与按钮必须在同一层（否则永远对不齐）', async () => {
+  /**
+   * 实测过的缺陷：`actions()` 自己返回一个带 `margin-top:12px` 的 `.row`，
+   * 枚举分支又把它 append 进**另一个** `.row` → 嵌套两层 flex，
+   * 内层的 margin-top 把按钮推下去（真机实测：高度差 2.6px、中心偏移 6px、sameParent=false）。
+   * `align-items:center` 只作用于同层子元素 —— 跨层就失效，所以这是结构错，不是调参问题。
+   */
+  const handles = [
+    { id: 'personalization.tone-style', title: '回复风格（toneStyle）', writeClass: 'user-data', anchorOk: true },
+  ];
+  await loadApp({
+    mode: 'ok',
+    handles,
+    probeOverride: {
+      'personalization.tone-style': {
+        handle: { id: 'personalization.tone-style', title: '回复风格（toneStyle）', writeClass: 'user-data' },
+        state: { exists: true, value: 'friendly', allowedValues: ['efficient', 'friendly', 'socratic'], text: 'friendly', bytes: 8 },
+      },
+    },
+  });
+  const root = await boot();
+  root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化').click();
+  await new Promise((r) => setTimeout(r, 120));
+  const card = root.querySelectorAll('.acc').find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('回复风格'));
+  assert.ok(card, '找不到 toneStyle 卡');
+  if (card.dataset.open !== 'true') card.querySelector('.acc-head').click();
+  await new Promise((r) => setTimeout(r, 150));
+
+  const sel = card.querySelectorAll('#editor')[0];
+  const applyBtn = card.querySelectorAll('button').find((b) => b.textContent.trim() === '应用');
+  assert.ok(sel, '找不到下拉框');
+  assert.ok(applyBtn, '找不到应用按钮');
+  assert.equal(applyBtn.parentNode, sel.parentNode,
+    '「应用」与下拉框必须是同一个父元素的子节点（嵌套 .row 会让它们错位）');
+  assert.equal(sel.parentNode.className, 'row', '共同父元素应当是 .row');
+});
+
+test('F4：toneStyle 卡必须提供「编辑这一档正文」的入口', async () => {
+  /**
+   * D4：toneStyle 是指针，正文在 style-<id>.md。用户的任务是"把这一档改成我想要的样子"，
+   * 不该拆成跨两张卡。这个入口就是那件事的落点。
+   */
+  const handles = [
+    { id: 'personalization.tone-style', title: '回复风格（toneStyle）', writeClass: 'user-data', anchorOk: true },
+    { id: 'style.friendly', title: '风格内容 · 友好（style-friendly.md）', writeClass: 'vendor-file', anchorOk: true },
+  ];
+  await loadApp({
+    mode: 'ok',
+    handles,
+    probeOverride: {
+      'personalization.tone-style': {
+        handle: { id: 'personalization.tone-style', title: '回复风格（toneStyle）', writeClass: 'user-data' },
+        state: { exists: true, value: 'friendly', allowedValues: ['efficient', 'friendly'], text: 'friendly', bytes: 8 },
+      },
+      'style.friendly': {
+        handle: { id: 'style.friendly', title: '风格内容 · 友好（style-friendly.md）', writeClass: 'vendor-file' },
+        state: { exists: true, text: '# Style: Friendly\n\ncontent', bytes: 24, isActive: true, writeAccess: true },
+      },
+    },
+  });
+  const root = await boot();
+  root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化').click();
+  await new Promise((r) => setTimeout(r, 120));
+  const card = root.querySelectorAll('.acc').find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('回复风格'));
+  if (card.dataset.open !== 'true') card.querySelector('.acc-head').click();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const editBtn = card.querySelectorAll('button').find((b) => b.textContent.includes('编辑这一档的正文'));
+  assert.ok(editBtn, 'toneStyle 卡必须有「编辑这一档的正文」按钮');
+
+  editBtn.click();
+  await new Promise((r) => setTimeout(r, 200));
+  const card2 = root.querySelectorAll('.acc').find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('回复风格'));
+  const ta = card2.querySelectorAll('#style-editor')[0];
+  assert.ok(ta, '点开后必须出现正文编辑器');
+  assert.match(String(ta.value ?? ''), /Style: Friendly/, '编辑器要预填该档现有正文');
+  const saveBtn = card2.querySelectorAll('button').find((b) => b.textContent.includes('保存正文并切到这一档'));
+  assert.ok(saveBtn, '必须有「保存正文并切到这一档」按钮（用户选定：保存即顺手切）');
+  const code = stripComments(readHead());
+  assert.match(code, /confirm-vendor/, '写厂商文件必须带确认勾选框（铁律 5）');
+});
+test('F9：枚举卡不给「还原到最初基线」，文本卡必须保留', async () => {
+  /**
+   * 枚举的全部合法值就在下拉框里 —— 想回到 `efficient`，选它 + 应用即可。
+   * 「还原到最初基线」做的正是"替你选中基线里记的那个值"，对枚举属于功能重叠；
+   * 而且它与「应用」并排会被读成"撤销"（用户实测就是这么问的："为什么还原的是 efficient"）。
+   *
+   * 文本/规则卡相反：正文字数任意、没法凭记忆重建，「还原到最初」是唯一的路，必须留。
+   */
+  const code = stripComments(readHead());
+  const fn = /function actionButtons\(h, getNext\) \{[\s\S]*?\n\}/.exec(code)?.[0] ?? '';
+  assert.ok(fn, '找不到 actionButtons');
+  assert.match(fn, /isEnum/, '必须按"是不是枚举"分流（否则枚举卡又会冒出还原按钮）');
+  assert.match(fn, /if \(!isEnum\) \{/, '还原按钮必须被 !isEnum 守卫住');
+});
 test('P0/T12：API 全 401 时，一轮渲染不得自激重排（曾经的 401 次）', async () => {
   const { } = await loadApp({ mode: 'down' });
   const root = await boot();
@@ -645,6 +887,84 @@ test('P0/T12：probe 单点失败会被"记住"，不会无限重拉', async () 
   await new Promise((r) => setTimeout(r, 150));
   const second = probeCalls();
   assert.equal(second, first, `probe 被重复调用 ${second - first} 次——失败没有被记住（D1 复发）`);
+});
+
+/* ══════════════ WP9 · F1 的前端腿（探测失败 ≠ 空内容）══════════════ */
+
+test('F1（前端）：探测失败时展开的卡不渲染编辑器，也没有可点的「应用」', async () => {
+  /**
+   * 致命缺陷的另一条腿（F1）：`accCard` 里的 `const st = pr?.state ?? {}` 把
+   * "没读到"变成了"内容本来就是空的"。后果：
+   *   `editorArea` 的 `if (!st) return '读取中…'` 守卫形同虚设 →
+   *   渲染出**空的、可编辑的** textarea → `getNext()` 返回 `''` → 点「应用」把整个文件写成空。
+   * 实测证据：`gates/WP3/exp-G-probe-failed-editor.log`（`#editor` 存在、`value=""`、
+   * `disabled=false`、「应用」可点）。
+   *
+   * 本断言直接盯住"失败态不许出现写入入口"：既不许有 #editor，也不许有可点的 .btn-primary。
+   */
+  const handles = [
+    { id: 'personalization.soul', title: '人设设定（SOUL.md）', writeClass: 'user-data', anchorOk: true },
+  ];
+  await loadApp({ mode: 'probe-down', handles });
+  const root = await boot();
+  const nav = root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化');
+  nav.click();
+  await new Promise((r) => setTimeout(r, 120));
+
+  const card = root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('SOUL'));
+  assert.ok(card, '找不到 SOUL 卡');
+  if (card.dataset.open !== 'true') card.querySelector('.acc-head').click();
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 重新取一次：render 会重建整棵子树
+  const card2 = root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('SOUL'));
+  assert.ok(card2, '展开后找不到 SOUL 卡');
+
+  assert.equal(card2.querySelectorAll('#editor').length, 0,
+    '探测失败时**不许**渲染 #editor（空的 textarea 会让用户以为文件本来就是空的，一点「应用」就清空）');
+
+  const clickablePrimary = card2.querySelectorAll('.btn-primary').filter((b) => b.disabled !== true);
+  assert.equal(clickablePrimary.length, 0,
+    `探测失败时不许有可点的「应用」（实际 ${clickablePrimary.length} 个）——拿不到现状就不允许写`);
+
+  // 文案必须说清"读不到"，并给一个**真的能点**的重试（否则"点重试"是死指针）
+  assert.match(card2.textContent, /读取失败/, '必须明说读取失败，而不是伪装成空内容');
+  const retry = card2.querySelectorAll('button').find((b) => b.textContent.trim() === '重试');
+  assert.ok(retry, '失败态必须提供可点的「重试」按钮');
+  assert.notEqual(retry.disabled, true, '「重试」按钮必须可点');
+});
+
+test('F1（前端回归）：style 参考件卡探测失败时仍能只读地显示"读取失败"（不许因 st=null 崩掉）', async () => {
+  /**
+   * 修 F1 时改了 `accCard` 里 `st` 的取值（`?? {}` → `?? null`）。参考件卡（style.*）
+   * 在构造摘要时会无保护地读 `st.text` / `st.sha256` —— 若没改可选链，探测失败时这里会抛 TypeError，
+   * 把"读取失败"的卡片直接炸没。本断言守住"既有正确行为不被改坏"：
+   *   · 不崩；· 明说探测失败；· 仍然是只读（没有 textarea）；· 只有「重试」，没有可编辑入口。
+   */
+  const handles = [
+    { id: 'style.friendly', title: '风格内容 · 友好（style-friendly.md）', writeClass: 'vendor-file', anchorOk: true },
+  ];
+  await loadApp({ mode: 'probe-down', handles });
+  const root = await boot();
+  root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化').click();
+  await new Promise((r) => setTimeout(r, 120));
+
+  const card = root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('风格内容'));
+  assert.ok(card, '找不到 style 参考件卡');
+  if (card.dataset.open !== 'true') card.querySelector('.acc-head').click();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const card2 = root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('风格内容'));
+  assert.ok(card2, '展开后找不到参考件卡（st=null 时构造摘要抛错会把它炸掉）');
+  assert.match(card2.textContent, /探测失败|读取失败/, '必须明说读不到内容');
+  assert.equal(card2.querySelectorAll('textarea').length, 0, '参考件卡永远不许出现可编辑 textarea（I7 只读设计不变）');
+  assert.equal(card2.querySelectorAll('.read-only-text').length, 0, '读不到内容时不许伪造一个空的只读正文');
+  const retry = card2.querySelectorAll('button').find((b) => b.textContent.trim() === '重试');
+  assert.ok(retry, '失败态必须给「重试」按钮');
 });
 
 test('P0/T13：overview 取不到时，健康状态不得显示为绿色成功', async () => {
@@ -733,4 +1053,308 @@ test('P2/T16：最近动态里 verify 事件必须按 verdict 分色，不得一
   const text = root.querySelector('.ledger')?.textContent ?? '';
   assert.ok(/生效/.test(text) && /未生效/.test(text) && /无法判定/.test(text),
     '三类验证必须在界面上用文字区分，不能只靠颜色');
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * WP11 · B 组：7 条空转断言 → 真行为断言
+ *
+ * 背景（审计 07-assertions-frontend.md F3 / 红灯全表）：
+ *   M1 / M5 / M6 / M16 / H1 这五条，把对应修复**改回缺陷态**之后 `npm test` 仍然全绿；
+ *   `doRestore` 的删除同意闸门**完全没有断言**（reg02）；I4 被 T16 兜住、
+ *   但自己那条静态断言单独看是空转。
+ *
+ * 共同点：它们都只看**源码文本**（"函数体里有没有出现过 runBusy(" "有没有 TTL 常量名"），
+ * 而文本存在 ≠ 机制生效。下面每条都改成**走一遍用户真的会走的那条路**，再读结果。
+ *
+ * 每条都做了三证（改回缺陷态 / 正常态 / 删掉被测字段），原始输出在
+ * .zhll/audit2/gates/WP11/ ，结论见 .zhll/audit2/exec-WP11.md。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+test('I2（行为）：双击「应用」只写一次 —— 第一下之后按钮必须立刻 disabled', async () => {
+  /**
+   * 为什么必须改写：M1 证明"删掉 setBusyDom(true)"（app.js:1561，防双击双写的**唯一**机制）
+   * 之后整轮 51 条断言全绿；M23 证明"干净地绕开 runBusy"只让两条**文本**断言变红，
+   * 没有任何一条断言真的点过两次。I2 因此名不副实。
+   *
+   * 本断言真的点两次（stub 的 click() 已改成遵守 disabled = 可信输入语义），
+   * 数真正发出去的 `/apply` 请求条数。
+   */
+  await loadApp({ mode: 'ok', handles: [SOUL_HANDLE] });
+  const root = await boot();
+  const { applyBtn } = await openSoulEditor(root, '\n- 这一行只许写进去一次');
+
+  assert.equal(applyBtn.disabled, false, '尚未开始写事务时「应用」不该是禁用的');
+
+  H.apiCalls.length = 0;
+  // 第一下：真用户点击
+  assert.equal(applyBtn.click(), true, '按钮可点时 click() 应该真的派发出去');
+  /**
+   * 同步时点：fetch 已经发出（我们的 stub fetch 在 await 前就记账）、promise 还没落地。
+   * 此刻 app.js 的防重机制必须已经把按钮禁掉，否则第二下就是第二次写盘。
+   */
+  assert.equal(applyBtn.disabled, true,
+    '点第一下之后「应用」必须立刻 disabled —— 这是 app.js 唯一的防双击双写手段');
+
+  // 第二下：用户手快又点一下。可信点击对 disabled 控件不派发
+  assert.equal(applyBtn.click(), false, 'disabled 的按钮不许再派发 click（可信输入语义）');
+  await tick(220);
+
+  const applyCalls = H.apiCalls.filter((c) => /\/apply$/.test(c.path));
+  assert.equal(applyCalls.length, 1, `双击必须只写一次，实际发了 ${applyCalls.length} 次 /apply`);
+});
+
+test('I2/M16（行为）：写事务进行中不重建 DOM —— #editor 必须是同一个节点实例', async () => {
+  /**
+   * 为什么必须改写：M16 证明"在 runBusy 开头加回 render()"（真实用户报告过的那个缺陷）
+   * 之后整轮全绿 —— 原来那条断言只 grep 源码里 runBusy 开头有没有 render。
+   *
+   * 这里不读源码，只问一个事实：写入进行中，编辑器那个 DOM 节点还是不是**同一个对象**。
+   * render() 一旦跑过，整棵树被 clear + 重建，就是新对象（且用户没提交的输入被冲成探测值）。
+   */
+  await loadApp({ mode: 'ok', handles: [SOUL_HANDLE] });
+  const root = await boot();
+  const { ta, typed, applyBtn } = await openSoulEditor(root, '\n- 忙态期间不许丢我');
+  assert.ok(typed, '测试自己要先打出字来');
+
+  H.apiCalls.length = 0;
+  applyBtn.click();
+
+  assert.equal(H.app.__state.busy, true, '点击之后应处于忙态（fetch 尚未落地）');
+  const during = root.querySelectorAll('#editor')[0];
+  assert.ok(during, '忙态期间 #editor 必须还在 —— 否则下面那条"引用相等"会因为两个 null 相等而空转');
+  assert.equal(during, ta,
+    '忙态期间 #editor 必须还是同一个节点实例：重建 DOM 会把它换成新节点，'
+    + '用户没提交的输入随之被冲成探测值（M16 那个"点了应用内容却没变"的缺陷）');
+
+  await tick(220);
+  assert.equal(H.app.__state.busy, false, '事务结束后忙态必须复位（否则界面永久锁死）');
+});
+
+test('I1（行为）：textarea 里没提交的输入必须跨 render 存活（切页往返）', async () => {
+  /**
+   * 为什么必须改写：M5（删 textarea 的 rememberField）单独犯 → 全绿；
+   * M16（runBusy 开头 render）单独犯 → 全绿；只有 M17（两个半缺陷一起犯）才红。
+   * 也就是说这条不变量只认"两个半缺陷的合取"，任一半复发都抓不住。
+   *
+   * 下面分别在三证里验证：**任一半**单独改回去都必须红（见 exec-WP11.md）。
+   * 断言本身走的是用户路径：打字 → 切页往返（真 render）→ 回来看还在不在。
+   */
+  await loadApp({ mode: 'ok', handles: [SOUL_HANDLE] });
+  const root = await boot();
+  const { ta, typed } = await openSoulEditor(root, '\n\n- 我手动加的这一行必须活过 render');
+  assert.ok(typed, '测试自己要先打出字来');
+
+  // 切页往返 = 一次真 render（render() 会 clear + 重建整棵树）
+  const go = (label) => {
+    const b = root.querySelectorAll('.nav-tab').find((x) => x.textContent.trim() === label);
+    assert.ok(b, `找不到导航「${label}」`);
+    b.click();
+  };
+  go('总览');
+  await tick(60);
+  go('个性化');
+  await tick(180);
+
+  const card2 = root.querySelectorAll('.acc')
+    .find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('SOUL'));
+  assert.ok(card2, '往返后找不到 SOUL 卡');
+  if (card2.dataset.open !== 'true') { card2.querySelector('.acc-head').click(); await tick(180); }
+
+  const after = root.querySelectorAll('#editor')[0];
+  assert.ok(after, '往返后找不到 #editor');
+  assert.notEqual(after, ta,
+    '这里必须已经换成新节点 —— 若还是旧节点说明 render 没发生，下面的断言会空转');
+  assert.equal(after.value, typed,
+    '切页往返之后 textarea 必须还是用户打的内容；变回探测到的原文说明 render 把它冲掉了');
+});
+
+test('I6（行为）：探测缓存过期才重探 —— 未过期不重拉、过期必须真重探', async () => {
+  /**
+   * 为什么必须改写：M6 证明"probeStale 恒 return false"（TTL 判定失效，页面永远显示旧值）
+   * 之后全绿 —— 原来那条断言只查源码里有没有 PROBE_TTL_MS 这个名字。
+   *
+   * 做法：注入假时钟。进「个性化」页会走 customizeWork() 里那段
+   * `refreshStaleProbes()` 判据（app.js:699），所以"切页往返"就是触发点。
+   */
+  const realNow = Date.now;
+  let clock = Date.parse('2026-11-02T00:00:00Z');
+  Date.now = () => clock;
+  try {
+    await loadApp({ mode: 'ok', handles: [SOUL_HANDLE] });
+    const root = await boot();
+    const probeCalls = () => H.apiCalls.filter((c) => /\/probe$/.test(c.path)).length;
+    const go = (label) => {
+      const b = root.querySelectorAll('.nav-tab').find((x) => x.textContent.trim() === label);
+      assert.ok(b, `找不到导航「${label}」`);
+      b.click();
+    };
+
+    go('个性化');
+    await tick(180);
+    const base = probeCalls();
+    assert.ok(base >= 1, '进页时至少应该有一次探测（否则基线不成立，后面的比较无意义）');
+
+    // ① 未过期（+5 秒）：切页往返不许重拉
+    clock += 5 * 1000;
+    go('总览');
+    await tick(60);
+    go('个性化');
+    await tick(200);
+    assert.equal(probeCalls(), base,
+      `缓存未过期时不许重新探测（实际多拉了 ${probeCalls() - base} 次）——否则每次切页都打 18 个请求`);
+
+    // ② 过期（+10 分钟）：必须真的重新探测
+    clock += 10 * 60 * 1000;
+    go('总览');
+    await tick(60);
+    go('个性化');
+    await tick(250);
+    assert.equal(probeCalls(), base + 1,
+      `缓存过期后必须重新探测一次（实际变化 ${probeCalls() - base}）——`
+      + '不重探就等于让用户照着过期的"当前内容"去改，违反状态契约');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('H1（行为）：写事务失败必须带错误码报出来，且忙态复位', async () => {
+  /**
+   * 为什么必须改写：H1 证明"删掉 `if (onError) onError(e); else throw e;`"
+   * （写事务失败静默吞掉，违铁律 6「禁止假装成功」）之后全绿。
+   * 原来那条只 grep 源码里有没有 runBusy 调用 —— 9 个写事务失败时什么都不说的样子它看不见。
+   *
+   * 这里让 `/apply` 真的失败（EPERM），断言页面上的失败提示**带错误码**、且 S.busy 复位。
+   */
+  await loadApp({ mode: 'apply-down', handles: [SOUL_HANDLE] });
+  const root = await boot();
+  const { applyBtn } = await openSoulEditor(root, '\n- 这次写入会失败');
+
+  H.apiCalls.length = 0;
+  applyBtn.click();
+  await tick(250);
+
+  const text = root.textContent;
+  assert.match(text, /写入失败/, '写事务失败必须在页面上明说 —— 静默吞掉就是"假装成功"');
+  assert.match(text, /EPERM/, `失败提示必须带错误码（用户才知道是权限/目录问题），实际文案：${text.slice(0, 400)}`);
+  assert.equal(H.app.__state.busy, false, '失败之后忙态必须复位（否则所有按钮永久禁用）');
+});
+
+test('I4（行为）：三个 verdict 给三个不同 class，未知 verdict 落非成功一侧', async () => {
+  /**
+   * 为什么必须改写：M3 证明"映射查表退回硬编码"之后 I4 单独仍是绿的（被 T16 兜住），
+   * 而 I4 本体只是 grep `effective … mk-ok` 的字面共存 —— 三态映射塌成一态它看不出来。
+   *
+   * 这条不问"源码里有没有 mk-ok"，只问渲染结果：
+   *   ① 三个 verdict 必须映射到**三个互不相同**的 class（不许两态同色）；
+   *   ② 未知 verdict（将来上游加了新结论）必须落在**非成功**一侧 ——
+   *      "无法判定不得显示为成功"是铁律 6，未知值更只能是"无法判定"。
+   */
+  const audit = [
+    { at: '2026-11-01T01:00:00Z', event: 'verify', handle: 'personalization.soul', verdict: 'effective' },
+    { at: '2026-11-01T01:01:00Z', event: 'verify', handle: 'personalization.user', verdict: 'ineffective' },
+    { at: '2026-11-01T01:02:00Z', event: 'verify', handle: 'personalization.identity', verdict: 'undetermined' },
+    { at: '2026-11-01T01:03:00Z', event: 'verify', handle: 'personalization.custom-prompt', verdict: 'brand-new-verdict' },
+  ];
+  await loadApp({
+    mode: 'ok',
+    overview: {
+      version: '5.9.3', configRoot: 'c', storeRoot: 's',
+      health: { ok: true, anchors: 11, anchorFailures: 0, handles: 18 },
+      gate: { appRunning: false }, drift: { available: false },
+      customized: [], unknown: [], todos: [], recent: audit, backups: [], counts: {},
+    },
+    handles: [],
+  });
+  const root = await boot();
+  if (!root.querySelector('.ledger')) {
+    const nav = root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '总览');
+    assert.ok(nav, '找不到「总览」导航');
+    nav.click();
+    await tick(60);
+  }
+
+  const marks = ledgerMarks(root);
+  assert.equal(marks.length, 4, `应渲染出 4 条动态（实际 ${marks.length}）`);
+  const [ok, bad, warn, unknown] = marks.map((m) => m.className);
+
+  assert.notEqual(ok, bad, `生效与未生效必须是不同的 class（实际都渲染成 ${ok}）—— 这就是 D7`);
+  assert.notEqual(ok, warn, `生效与无法判定必须是不同的 class（实际都渲染成 ${ok}）`);
+  assert.notEqual(bad, warn, `未生效与无法判定必须是不同的 class（实际都渲染成 ${bad}）`);
+  assert.ok(!/(^|\s)mk-ok(\s|$)/.test(unknown),
+    `未知 verdict 必须落在非成功一侧（实际 ${unknown}）—— 未知值画成绿就是"把无法判定说成成功"`);
+});
+
+test('回归/删除闸门（行为）：还原会删除"备份时不存在"的文件时，必须先确认再发 /api/restore', async () => {
+  /**
+   * 为什么必须加：审计 reg02 —— `doRestore` 的 `willDelete` + `askConfirm` 整段
+   * **零覆盖**：把它整段删掉，整轮仍然全绿。而它是"删除不可逆地丢内容"的唯一一道闸门。
+   *
+   * 断言四件事（顺序即用户路径）：
+   *   ① 第一发必须只是 dryRun 预演（先算清会删什么）；
+   *   ② 有删除项 → 必须先出现确认对话框，且**用户同意之前**绝不许发实际还原；
+   *   ③ 点「取消」→ 仍然不许发实际还原，并且明说"没有修改任何文件"；
+   *   ④ 再来一次点「继续」→ 这时才发确认过的实际还原。
+   */
+  const backups = [{ id: 'bk-20261102-1', createdAt: '2026-11-02T00:00:00Z', entries: 3, reason: 'apply personalization.soul' }];
+  await loadApp({
+    mode: 'ok',
+    handles: [SOUL_HANDLE],
+    overview: {
+      version: '5.9.3', configRoot: 'c', storeRoot: 's',
+      health: { ok: true, anchors: 11, anchorFailures: 0, handles: 1 },
+      gate: { appRunning: false }, drift: { available: false },
+      customized: [], unknown: [], todos: [], recent: [], backups, counts: {},
+    },
+    restorePreview: { changed: ['C:/x/SOUL.md'], willDelete: [{ absPath: 'C:\\x\\DROPPED.md' }] },
+  });
+  const root = await boot();
+  const nav = (label) => {
+    const b = root.querySelectorAll('.nav-tab').find((x) => x.textContent.trim() === label);
+    assert.ok(b, `找不到导航「${label}」`);
+    b.click();
+  };
+  nav('守护');
+  await tick(150);
+
+  /** 时间线里的「还原」按钮（每次 render 后都要重查：节点会被重建） */
+  const restoreBtn = () => {
+    const row = root.querySelectorAll('.tl-row')[0];
+    assert.ok(row, '找不到备份时间线的行');
+    const b = row.querySelectorAll('button').find((x) => x.textContent.trim() === '还原');
+    assert.ok(b, '备份时间线里必须有「还原」按钮');
+    return b;
+  };
+  const restores = () => H.apiCalls.filter((c) => c.path === '/api/restore');
+  const executions = () => restores().filter((c) => bodyOf(c.opts).confirm === true);
+
+  restoreBtn().click();
+  await tick(200);
+
+  assert.equal(restores().length, 1, `第一发必须只有 dryRun 预演（实际 ${restores().length} 发）`);
+  assert.equal(bodyOf(restores()[0].opts).dryRun, true, '第一发必须是 dryRun 预演：先把"将删哪些文件"算清楚');
+  assert.equal(executions().length, 0, '用户还没同意，绝不许先发实际还原');
+
+  const dlg = root.querySelector('.dlg-overlay');
+  assert.ok(dlg, '备份里有"备份时不存在"的条目 → 还原必须先弹确认（删掉是不可逆的）');
+  assert.match(dlg.textContent, /删除/, `确认框必须说清会删除文件，实际文案：${dlg.textContent.slice(0, 200)}`);
+
+  // ③ 取消
+  const cancel = dlg.querySelectorAll('button').find((b) => b.textContent.trim() === '取消');
+  assert.ok(cancel, '确认框必须有「取消」');
+  cancel.click();
+  await tick(200);
+  assert.equal(executions().length, 0, '点了「取消」之后绝不许发实际还原');
+  assert.match(root.textContent, /已取消还原/, '取消必须明说"没有修改任何文件"，不许静默什么都不做');
+
+  // ④ 重新来一次，这回同意
+  assert.equal(root.querySelector('.dlg-overlay'), null, '取消之后对话框必须收起');
+  restoreBtn().click();
+  await tick(200);
+  const dlg2 = root.querySelector('.dlg-overlay');
+  assert.ok(dlg2, '第二次还原也必须先弹确认（不是只弹一次就永久放行）');
+  const ok2 = dlg2.querySelectorAll('button').find((b) => b.textContent.trim() === '继续');
+  assert.ok(ok2, '确认框必须有「继续」');
+  ok2.click();
+  await tick(250);
+  assert.equal(executions().length, 1, `确认之后必须恰好发一发实际还原（实际 ${executions().length} 发）`);
 });

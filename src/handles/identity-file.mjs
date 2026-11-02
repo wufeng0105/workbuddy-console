@@ -18,6 +18,7 @@ import path from 'node:path';
 import { sha256 } from '../core/backup.mjs';
 import { estimateTokens, estimateCost } from '../core/tokens.mjs';
 import { diffLines, renderDiff } from '../core/diff.mjs';
+import { ConsoleError } from '../core/errors.mjs';
 import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 
 /** 身份文件注入上限（字符）。证据：authority-snapshot.js:53 `Ls=1e4` */
@@ -123,7 +124,17 @@ export function createIdentityFileHandle({ id, title, anchorKey, modeAvailabilit
     },
 
     // ── 4. 写入（备份由 engine 在调用前完成，铁律 1）────────────
-    async apply(ctx, { next = '' } = {}) {
+    async apply(ctx, { next } = {}) {
+      /**
+       * 与引擎那道 CRITICAL 防线对齐（F1 的把手层）。
+       *
+       * 引擎已经拦住 `next === undefined`，但工厂这里曾有 `{ next = '' }` 默认值：
+       * 一旦有人绕过引擎直调把手（或以后新增的调用点忘了传），"漏参数"会再次
+       * 变成"把整个身份文件写成空"。默认值就是缺陷本身，删掉它并显式拒绝。
+       */
+      if (next === undefined) {
+        throw new ConsoleError('INPUT_MISSING', `未提供写入内容（next）—— 拒绝把 ${this.title} 写成空。`);
+      }
       const { path: abs } = ctx.resolve(this.target);
       const clipped = truncateToInjectionLimit(next);
       fs.mkdirSync(path.dirname(abs), { recursive: true });

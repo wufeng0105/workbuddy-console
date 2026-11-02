@@ -53,6 +53,22 @@ function meta(h) {
  */
 export function createEngine({
   configRoot, storeRoot, version, actor = 'cli', sessionStartOf, appStateProbe,
+  /**
+   * 最初基线账本目录（可选）。
+   *
+   * 为什么需要这个参数：默认位置是**项目目录** `baselines/`（铁律 4 的例外条款——
+   * 账本随仓库维护、gitignore 排除）。但那样一来，任何**隔离运行**都还会往真实账本目录写：
+   * 拿 fixture 起一次服务（`--root`/`--store` 都指到临时目录），启动时的自动补建
+   * 就会把合成账本 `5.9.3(0000).json` 落进真实 `baselines/`，
+   * UI 于是显示"共 2 套账本"，用户分不清哪本是出厂快照、哪本是测试垃圾。
+   *
+   * （实测复现过两次：第一次误判成自测 T8 的锅，第二次用 fixture 起服务时抓到真凶——
+   *   自测早就修好了 `WORKBUDDY_BASELINES_DIR`，起服务这条路没人管。）
+   *
+   * 规则：显式传入 > WORKBUDDY_BASELINES_DIR > 项目默认。
+   * 调用方（服务端）只在**显式指定了非默认 store** 时才传，所以正常用户路径不受影响。
+   */
+  baselinesDir: explicitBaselinesDir,
 }) {
   const resolver = createResolver({ configRoot, version });
   /** 可注入的进程状态探测 —— 让闸门可测试（生产默认查真实进程） */
@@ -98,6 +114,43 @@ export function createEngine({
   function anchorFor(h) {
     if (typeof h.resolveTarget === 'function') return h.resolveTarget(ctx);
     return resolver.resolve(h.target);
+  }
+
+  /**
+   * 写后审计的保护壳（F6）。
+   *
+   * 为什么必须有：`appendAudit` 曾经裸露在"文件已经写完"之后。`store/state` 不可写时——
+   * 目标文件**已改**、调用方收到"失败"、`audit.jsonl` **零行**、异常里**没有 `backupId`**。
+   * 用户既不知道写已经发生，也不知道有一份备份可以还原；双失败时真实原因（EPERM）
+   * 还会被审计异常（EEXIST）顶掉。
+   *
+   * 现在：审计失败**不吞掉**，也不伪装成功——抛一个可判定的错误：
+   *   - 错误码 `AUDIT_WRITE_FAILED`；
+   *   - 异常对象带 `backupId`（告诉调用方"写已经发生，有备份可退"）；
+   *   - 文案明说"已完成，但台账没写成"。
+   * **不**做"审计失败就回滚文件"：写入与台账不在一个事务里，回滚做不到原子，
+   * 只会把"文件已改"变成"文件被回滚了一半"，比如实报告更糟。
+   *
+   * @param {object} record 审计记录
+   * @param {{backupId?:string|null, wrote?:boolean}} [opts]
+   */
+  function auditAfterWrite(record, { backupId = null, wrote = true } = {}) {
+    try {
+      appendAudit(storeRoot, record);
+    } catch (e) {
+      const err = new ConsoleError(
+        'AUDIT_WRITE_FAILED',
+        (wrote
+          ? `操作已完成${backupId ? `（备份 ${backupId} 可还原）` : ''}，但台账记录失败`
+          : '台账记录失败（本次是预演，未写盘）')
+        + `：${e?.code ?? 'ERR'} ${e?.message ?? e}`,
+        { backupId, wrote },
+      );
+      err.backupId = backupId;
+      err.written = wrote;
+      err.cause = e;
+      throw err;
+    }
   }
 
   // ── 1. 探测 ────────────────────────────────────────────────
@@ -211,10 +264,21 @@ export function createEngine({
     const isTextHandle = writesWholeFile && typeof next === 'string';
 
     // 期望增量按**截断后**文本计算（把手自己知道注入上限），落进台账供 verify 自动对照
+    //
+    // ⚠️ 这里必须把 preview 的 **warnings 也留下来**，不能只取 expectedDeltaTokens。
+    // 曾经（D2）只取增量、把 warnings 扔掉 —— 于是 style 把手那条
+    // 「该档位当前未生效，改这个文件不会影响任何请求」永远送不到用户眼前：
+    // 前端不调 /plan，apply 又把它丢了，两处都断 → 警告彻底不可达。
+    // 这正好是本项目存在的理由（防"写成功但效果为零"）在自己代码里失守。
     let expectedDeltaTokens = null;
+    let previewWarnings = [];
+    let previewIsActive = null;
     if (typeof h.preview === 'function') {
       try {
-        expectedDeltaTokens = (await h.preview(ctx, { next })).expectedDeltaTokens ?? null;
+        const pv = await h.preview(ctx, { next });
+        expectedDeltaTokens = pv.expectedDeltaTokens ?? null;
+        previewWarnings = Array.isArray(pv.warnings) ? pv.warnings : [];
+        if (typeof pv.isActive === 'boolean') previewIsActive = pv.isActive;
       } catch { /* 预览失败不阻断写入（写入本身仍有备份兜底） */ }
     }
 
@@ -279,21 +343,28 @@ export function createEngine({
     try {
       written = await h.apply(ctx, { next });
     } catch (e) {
-      appendAudit(storeRoot, {
-        event: 'apply',
-        handle: h.id,
-        anchor: h.target,
-        path: tildify(anchor.path),
-        backupId: manifest.id,
-        bytesBefore: Buffer.byteLength(before, 'utf8'),
-        expectedDeltaTokens,
-        gateKind: g.kind,
-        actor,
-        changed: false,
-        status: 'failed',
-        error: { code: e.code ?? 'ERR', message: e.message },
-        reason: reason ?? `apply ${h.id}`,
-      });
+      /**
+       * 失败台账：**审计再失败也不许顶掉真实原因**（F6 的"二次伤害"）。
+       * 曾经 `store/state` 与目标文件同时不可写时，用户看到的是审计的 EEXIST，
+       * 而真正该看的 EPERM 被吃掉了。
+       */
+      try {
+        appendAudit(storeRoot, {
+          event: 'apply',
+          handle: h.id,
+          anchor: h.target,
+          path: tildify(anchor.path),
+          backupId: manifest.id,
+          bytesBefore: Buffer.byteLength(before, 'utf8'),
+          expectedDeltaTokens,
+          gateKind: g.kind,
+          actor,
+          changed: false,
+          status: 'failed',
+          error: { code: e.code ?? 'ERR', message: e.message },
+          reason: reason ?? `apply ${h.id}`,
+        });
+      } catch { /* 保留原始异常 e：它才是用户要看的失败原因 */ }
       // 把备份 id 带进异常，让调用方知道"有一份备份，可以还原"
       if (e && typeof e === 'object') e.backupId = manifest.id;
       throw e;
@@ -345,10 +416,17 @@ export function createEngine({
         gate: g,
         verification: h.verification,
         expectedDeltaTokens: null,
+        /** 预览阶段的警告（如"这一档当前未生效"）——noop 也要如实带出 */
+        previewWarnings,
+        isActive: previewIsActive,
       };
     }
 
-    appendAudit(storeRoot, {
+    /**
+     * 写已经落盘，台账这一笔**必须**保护起来（F6）：
+     * 审计失败时不许让用户以为"写入失败"——异常会带 `backupId` 并明说"已写入、台账失败"。
+     */
+    auditAfterWrite({
       event: 'apply',
       handle: h.id,
       anchor: h.target,
@@ -361,7 +439,7 @@ export function createEngine({
       actor,
       changed: contentChanged,
       status: 'ok',
-    });
+    }, { backupId: manifest.id });
 
     // 把把手自己的结果**展开到顶层**，方便调用方直接读（同时保留 written 原样）
     //
@@ -378,6 +456,14 @@ export function createEngine({
       verification: h.verification,
       expectedDeltaTokens,
       contentChanged: before !== after,
+      /**
+       * 预览阶段的全部警告。**必须带出去**（D2）：
+       * style 把手的「当前未生效」「不可写」这些提醒只在这里，
+       * 丢掉就等于把"写了也白写"这件事瞒下来。
+       */
+      previewWarnings,
+      /** 该把手原本是"当前生效"的那一份吗（style.* 用；其它把手为 null） */
+      isActive: previewIsActive,
     };
   }
 
@@ -549,7 +635,17 @@ export function createEngine({
     return {
       profile: { id: profile.id, name: profile.name },
       items,
-      expectedDeltaTokens: items.reduce((s, i) => s + (i.expectedDeltaTokens ?? 0), 0),
+      /**
+       * ⚠️ 任一项估不出增量 ⇒ 整体 `null`，**不许** `?? 0` 兜底（F3）。
+       *
+       * `?? 0` 把"估不出来"折成"预期零变化"，于是下游判据走
+       * 「预期无变化 + 实测无变化 → effective」——**改动完全没进请求也报 ✅ 生效**。
+       * 单个把手的 noop 早已按"null = 判不了"修过，档位这条同类路径漏了。
+       * `null` 一路传下去，`token-delta` 会说"缺少理论增量 → undetermined"。
+       */
+      expectedDeltaTokens: items.some((i) => i.expectedDeltaTokens == null)
+        ? null
+        : items.reduce((s, i) => s + i.expectedDeltaTokens, 0),
       needsConfirm: items.some((i) => i.writeClass === 'vendor-file'),
       blocked: items.some((i) => i.gate.blocked),
     };
@@ -606,8 +702,17 @@ export function createEngine({
       }
     }
 
-    const expectedDeltaTokens = previews.reduce((s, p) => s + (p.expectedDeltaTokens ?? 0), 0);
-    appendAudit(storeRoot, {
+    /**
+     * 同上（F3）：任一项估不出增量 ⇒ 整体 `null`。
+     * 折成 0 会让 `verifyProfile` 把"改动完全没进请求"报成"✅ 生效"——
+     * 实测姿势：档位里含一个头部通道把手（`prompt.welcomemode-*`，其 preview 明确
+     * 返回 `expectedDeltaTokens: null`，因为头部通道无法用 token 估增量）。
+     */
+    const expectedDeltaTokens = previews.some((p) => p.expectedDeltaTokens == null)
+      ? null
+      : previews.reduce((s, p) => s + p.expectedDeltaTokens, 0);
+    /** 多把手事务的审计同样受保护（F6）：文件已经写了，台账失败要如实说，不许伪装成"整件事失败" */
+    auditAfterWrite({
       event: 'apply-profile',
       profile: profile.id,
       profileName: profile.name,
@@ -619,7 +724,7 @@ export function createEngine({
       files: [...targets.values()].map((t) => t.key),
       expectedDeltaTokens,
       actor,
-    });
+    }, { backupId: manifest.id });
 
     return {
       profile: profile.id,
@@ -664,7 +769,18 @@ export function createEngine({
     const capture = autoCapture({
       configRoot,
       applyAtMs: Number.isFinite(applyAtMs) ? applyAtMs : Date.now(),
-      expectedDelta: lastApply.expectedDeltaTokens ?? undefined,
+      /**
+       * ⚠️ 原样透传，**不许** `?? undefined`（F3）。
+       *
+       * 三个值必须保持可区分：
+       *   - 数字（含 0）→ 真的算出了理论增量（0 = 确实不该动，可以判 effective）；
+       *   - `null` → 估不出来（必须判 undetermined）；
+       *   - 字段缺失 → 老台账，同样按"估不出来"处理。
+       * `?? undefined` 把 null 悄悄换成 undefined，看似结果一样，实则抹掉了
+       * "null 是有意义的状态"这条语义——下一个消费点只要写 `expectedDelta ?? 0`，
+       * 把"没生效"报成"生效"的缺陷就原地复活。
+       */
+      expectedDelta: lastApply.expectedDeltaTokens,
       sessionStartOf,
     });
     if (capture.blockedReason) {
@@ -768,14 +884,15 @@ export function createEngine({
     const okCount = replayed.filter((r) => r.ok).length;
     const failed = replayed.filter((r) => !r.ok);
 
-    appendAudit(storeRoot, {
+    /** 重放也是写事务：台账失败要如实报告（F6），并把 backupId 挂到异常上 */
+    auditAfterWrite({
       event: 'replay',
       backupId: manifest.id,
       handles: plan.map((p) => p.h.id),
       ok: okCount,
       failed: failed.length,
       actor,
-    });
+    }, { backupId: manifest.id });
 
     return {
       backupId: manifest.id,
@@ -950,13 +1067,14 @@ export function createEngine({
       }
     }
 
-    appendAudit(storeRoot, {
+    /** 审批面写入后的台账同样受保护（F6） */
+    auditAfterWrite({
       event: 'apply-approval',
       level,
       backupId: manifest.id,
       faces: done.map((d) => ({ face: d.face, ok: d.ok })),
       actor,
-    });
+    }, { backupId: manifest.id });
 
     return {
       level,
@@ -1160,10 +1278,58 @@ export function createEngine({
   }
 
   function restore(backupId, { dryRun = false } = {}) {
-    const r = restoreBackup({ storeRoot, id: backupId, dryRun });
-    const changed = r.results.filter((x) => x.action !== 'noop');
-    appendAudit(storeRoot, { event: 'restore', backupId, dryRun, changed: changed.length, actor });
-    return { ...r, changed };
+    let r;
+    try {
+      r = restoreBackup({ storeRoot, id: backupId, dryRun });
+    } catch (e) {
+      /**
+       * **整体**失败（备份不存在 / manifest 损坏）：也必须留台账，且异常带 `backupId`（F6/F7）。
+       * 审计再失败也不能顶掉真实原因 —— 这里是"补一笔"，不是"换个错抛出去"。
+       */
+      try {
+        appendAudit(storeRoot, {
+          event: 'restore',
+          backupId,
+          dryRun,
+          changed: 0,
+          status: 'failed',
+          error: { code: e?.code ?? 'ERR', message: e?.message ?? String(e) },
+          actor,
+        });
+      } catch { /* 保留原始异常 */ }
+      if (e && typeof e === 'object' && e.backupId === undefined) e.backupId = backupId;
+      throw e;
+    }
+
+    // `changed` 只算真正动了文件的（restore/delete）；`error` 条目不是"变化"
+    const changed = r.results.filter((x) => x.action === 'restore' || x.action === 'delete');
+    const failed = r.results.filter((x) => !x.ok);
+    /** 三态：全成 / 部分成 / 全败 —— 不再只有"成了"与"抛异常"两种 */
+    const status = r.ok ? 'ok' : (r.partial ? 'partial' : 'failed');
+
+    /**
+     * 审计**无论成败**都写（F6/F7）。
+     *
+     * 曾经：审计裸露在写之后，而 `restoreBackup` 是裸循环 ——
+     * 实测"第一条目已还原、第二条目 EISDIR 中断，restore 审计 0 行"（半还原 + 零台账）。
+     * 现在逐条目失败明细、状态三态、还原前副本落点一起进台账。
+     */
+    auditAfterWrite({
+      event: 'restore',
+      backupId,
+      dryRun,
+      changed: changed.length,
+      status,
+      failed: failed.map((x) => ({
+        key: x.key,
+        code: x.error?.code ?? 'ERR',
+        message: x.error?.message ?? '',
+      })),
+      savedDir: r.savedDir,
+      actor,
+    }, { backupId, wrote: !dryRun });
+
+    return { ...r, changed, failed, status };
   }
 
   function backups() { return listBackups(storeRoot); }
@@ -1206,7 +1372,8 @@ export function createEngine({
   // 用户无法分辨哪本是出厂快照、哪本是测试垃圾。
   // 现在允许经 `WORKBUDDY_BASELINES_DIR` 覆盖 —— 自测必须指向临时目录，
   // 生产默认位置保持不变（不搬动既有真实账本）。
-  const baselinesDir = () => (process.env.WORKBUDDY_BASELINES_DIR?.trim()
+  const baselinesDir = () => (explicitBaselinesDir?.trim()
+    || process.env.WORKBUDDY_BASELINES_DIR?.trim()
     || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'baselines'));
 
   /** 旧位置（storeRoot/baselines、storeRoot/baseline.json）→ 项目目录 baselines/ 的迁移 */
@@ -1306,7 +1473,21 @@ export function createEngine({
     if (!current) return { available: false, versionKey: key, ledgers };
     const entries = {};
     for (const [k, v] of Object.entries(current.entries)) {
-      entries[k] = { kind: v.kind, sha256: v.sha256, chars: v.content ? v.content.length : 0 };
+      /**
+       * 只给**短值**类条目带 `content`（`kind: 'value'` 且够短）。
+       *
+       * 为什么要带：界面上「还原」按钮需要说清"还原到什么"，否则只能写"还原"两个字，
+       * 用户不悬停就不知道它会把值改回哪一个（D6）。
+       * 为什么只给短的：真实账本 152 KB，绝大多数体积是全文本（SOUL.md 等）；
+       * 枚举/字段值只有几个字符，带上不增加负担，又是标签真正需要的那个信息。
+       */
+      const small = v.kind === 'value' && typeof v.content === 'string' && v.content.length <= 120;
+      entries[k] = {
+        kind: v.kind,
+        sha256: v.sha256,
+        chars: v.content ? v.content.length : 0,
+        ...(small ? { content: v.content } : {}),
+      };
     }
     return { available: true, versionKey: key, capturedAt: current.capturedAt, entries, ledgers };
   }
@@ -1361,24 +1542,28 @@ export function createEngine({
         }
       }
     } catch (e) {
-      appendAudit(storeRoot, {
-        event: 'restore',
-        handle: id,
-        anchor: h.target,
-        path: tildify(st.path ?? ''),
-        backupId: manifest.id,
-        bytesBefore: Buffer.byteLength(st.text ?? '', 'utf8'),
-        actor,
-        changed: false,
-        status: 'failed',
-        error: { code: e.code ?? 'ERR', message: e.message },
-        reason: 'restore-baseline',
-      });
+      // 审计再失败也不许顶掉真实原因（F6 的"二次伤害"）
+      try {
+        appendAudit(storeRoot, {
+          event: 'restore',
+          handle: id,
+          anchor: h.target,
+          path: tildify(st.path ?? ''),
+          backupId: manifest.id,
+          bytesBefore: Buffer.byteLength(st.text ?? '', 'utf8'),
+          actor,
+          changed: false,
+          status: 'failed',
+          error: { code: e.code ?? 'ERR', message: e.message },
+          reason: 'restore-baseline',
+        });
+      } catch { /* 保留原始异常 e */ }
       if (e && typeof e === 'object') e.backupId = manifest.id;
       throw e;
     }
 
-    appendAudit(storeRoot, {
+    /** 写已经落盘，台账这一笔必须受保护（F6） */
+    auditAfterWrite({
       event: 'restore',
       handle: id,
       anchor: h.target,
@@ -1389,7 +1574,7 @@ export function createEngine({
       changed,
       status: 'ok',
       reason: 'restore-baseline',
-    });
+    }, { backupId: manifest.id });
     return { handle: id, changed, backupId: manifest.id, kind: entry.kind, ledger: key };
   }
 

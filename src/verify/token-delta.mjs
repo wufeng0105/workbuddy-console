@@ -33,10 +33,29 @@ export function evaluateTokenDelta({
 
   const delta = observedTokens - baselineTokens;
 
+  /**
+   * ⚠️ `null` **不是 0**（F3 的消费端）。
+   *
+   * `null` / 字段缺失 = "理论增量估不出来"（例如头部通道、或档位里有一项无法估算 →
+   * 上游按 `null` 传播）。绝不能落到下面「预期无变化（|期望|≤噪声）」那条分支：
+   * 一旦把"估不出"折成 0，**改动完全没进请求**也会被报成 `effective`
+   * （实测姿势：档位 Σ 期望 0 + 实测 Δ0 → 「预期无变化，实测 Δ0」→ 判生效）。
+   *
+   * 单独一支而不是只靠 `!Number.isFinite`：把语义写在判据里，
+   * 下一个改这里的人不会误以为 null 可以当 0 用。
+   */
+  if (expectedDelta == null) {
+    return {
+      verdict: 'undetermined',
+      reason: `没有理论增量（expectedDelta 为 null/缺失）；仅观测到 Δ${delta} tokens，无法判定`,
+      delta,
+    };
+  }
+
   if (!Number.isFinite(expectedDelta)) {
     return {
       verdict: 'undetermined',
-      reason: `缺少理论增量；仅观测到 Δ${delta} tokens，无法判定`,
+      reason: `理论增量不是有限数（${String(expectedDelta)}）；仅观测到 Δ${delta} tokens，无法判定`,
       delta,
     };
   }

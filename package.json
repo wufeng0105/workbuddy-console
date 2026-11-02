@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check:contracts": "node -e \"import('./src/core/contracts.mjs').then(m=>console.log('contracts ok:', m.HANDLE_STEPS.length, 'steps,', m.VERIFY_STRATEGIES.length, 'verify strategies'))\"",
+    "check:contracts": "node scripts/check-contracts.mjs",
     "test": "node --test \"test/**/*.test.mjs\"",
     "test:frontend": "node --test test/frontend.test.mjs",
     "test:launcher": "node --test test/launcher.test.mjs",

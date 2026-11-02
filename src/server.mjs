@@ -60,9 +60,22 @@ function safeJoin(base, rel) {
 /**
  * @param {{configRoot:string, storeRoot:string, version?:string}} opts
  */
-export function createConsoleServer({ configRoot, storeRoot, version }) {
+export function createConsoleServer({ configRoot, storeRoot, version, isolatedBaselines = false }) {
   registerAll();
-  const engine = createEngine({ configRoot, storeRoot, version, actor: 'web' });
+  /**
+   * 隔离运行（显式给了非默认 `--store`）时，最初基线账本也放到那个 store 下。
+   *
+   * 为什么：默认位置是**项目目录** `baselines/`，那是给正常使用准备的（账本随仓库维护）。
+   * 但隔离运行的目的是"不碰真实数据"——如果账本还往项目目录写，
+   * 启动时的自动补建就会把 fixture 的合成账本落进真实账本目录（实测踩过两次）。
+   */
+  const engine = createEngine({
+    configRoot,
+    storeRoot,
+    version,
+    actor: 'web',
+    baselinesDir: isolatedBaselines ? path.join(storeRoot, 'baselines') : undefined,
+  });
   const token = crypto.randomBytes(24).toString('base64url');
 
   // 启动时补建「最初基线」——只在缺失时捕获，绝不覆盖（不可修改语义）
@@ -189,8 +202,26 @@ export function createConsoleServer({ configRoot, storeRoot, version }) {
       if (op === 'probe' && method === 'GET') return engine.probe(id);
       if (op === 'plan' && method === 'POST') return engine.plan(id, { next: body.next ?? '' });
       if (op === 'apply' && method === 'POST') {
+        /**
+         * ⚠️ 这里**不许**用 `body.next ?? ''`（F1 的 HTTP 腿，CRITICAL）。
+         *
+         * `??` 把"body 里根本没有 `next` 这个键"与"显式传空串"合并成同一个值 `''`，
+         * 于是引擎那条"漏传 next 就拒绝"的硬防线（`engine.mjs` 的 `next === undefined`）
+         * 在 HTTP 层被**提前绕过**。实测（Lead 亲测）：
+         *   `POST /api/handle/personalization.soul/apply` body `{}`
+         *   → SOUL.md 31 B → 0 B，响应却是 `ok:true`。
+         *
+         * 现在只认"键真的存在"：
+         *   - 键缺失 → 传 `undefined`，交给引擎抛 `INPUT_MISSING`；
+         *   - 显式 `''` / `0` / `false` → 原样传（它们是合法写入值，不许误伤，
+         *     清空文件必须走显式 `next:""`，这是故意的`不便`）；
+         *   - JSON 的 `null` → 也按"没传"拒绝。没有任何把手认 null 作为写入值
+         *     （`identity-file` 的 `truncateToInjectionLimit` 会把非字符串当空文本），
+         *     此前 `?? ''` 同样把它变成空串 —— 那正是"清空文件"这条路。
+         */
+        const hasNext = Object.prototype.hasOwnProperty.call(body, 'next');
         return engine.apply(id, {
-          next: body.next ?? '',
+          next: hasNext && body.next !== null ? body.next : undefined,
           confirm: body.confirm === true,
           reason: typeof body.reason === 'string' ? body.reason : undefined,
         });
@@ -343,7 +374,13 @@ export async function startConsole({ root, store, port } = {}) {
   const configRoot = resolveConfigRoot(root);
   // `store` 与 CLI 的 `--store` 同义（显式参数 > 环境变量 > 默认）
   const storeRoot = resolveStoreRoot(store);
-  const app = createConsoleServer({ configRoot, storeRoot });
+  /**
+   * 显式给了 `--store` = 调用方在要一个**隔离环境**（fixture、e2e、试跑）。
+   * 那就连最初基线账本一起隔离到那个 store 下，别落进项目 `baselines/`。
+   * 不给 `--store` 的正常路径保持原样（账本仍在项目目录，随仓库维护）。
+   */
+  const isolated = typeof store === 'string' && store.trim() !== '' && store !== resolveStoreRoot();
+  const app = createConsoleServer({ configRoot, storeRoot, isolatedBaselines: isolated });
   const { url, port: actual } = await app.listen(port ?? 0);
   const d = app.describe();
   /** 令牌在 createConsoleServer 的作用域里，这里从 app 取 */
