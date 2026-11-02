@@ -131,18 +131,22 @@ test('CLI apply --json：noop 的机器可读输出必须 noop:true / backupId:n
 });
 
 /**
- * 注入一次**可复现的写失败**：把 `<目标>.tmp` 占成一个目录。
+ * 注入一次**可复现的写失败**：把目标文件设为**只读**。
  *
- * 原子写把临时文件建在目标同目录（同卷才能原子 rename），临时名固定为 `<目标>.tmp`；
- * 占住它就能在**不动目标文件**的前提下让写盘必失败 —— 与真 ENOSPC 是同一段代码路径，
- * 差别只在 errno（真盘满由 Lead 的 64 MB VHD 台架跑）。
+ * 换姿势的原因：临时名现在是唯一的（`<目标>.<pid>.<8位随机>.tmp`），
+ * 以前"把 `<目标>.tmp` 占成一个目录"的注入法已经失效。
+ * 只读目标让 `rename` 覆盖报 `EPERM`（Windows 实测），目标字节保持原样 ——
+ * 与真 ENOSPC 落在**同一支**（tmp 写成功之后那一步）。
+ * 「tmp 写就失败」是另一支，由 `src/selftest.mjs` 的 W10 覆盖。
  * @param {string} absPath
  */
 function injectWriteFailure(absPath) {
-  const tmp = `${absPath}.tmp`;
-  fs.rmSync(tmp, { recursive: true, force: true });
-  fs.mkdirSync(tmp);
-  return tmp;
+  fs.chmodSync(absPath, 0o444);
+  return absPath;
+}
+/** @param {string} absPath */
+function clearInjectedWriteFailure(absPath) {
+  try { fs.chmodSync(absPath, 0o666); } catch { /* 文件可能已被删 */ }
 }
 
 test('CLI apply：写盘失败 → 非零退出，文案说清"写入未发生"并给 backupId/恢复命令，文件逐字节不变', () => {
@@ -164,7 +168,7 @@ test('CLI apply：写盘失败 → 非零退出，文案说清"写入未发生"�
     try {
       r = runCli(applyArgs(f), env);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      clearInjectedWriteFailure(tmp);
     }
     const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
 
@@ -212,7 +216,7 @@ test('CLI restore：还原写回失败 → 该条目说清文件状态，目标�
     try {
       r = runCli(['restore', id, '--confirm', '--root', f.cfg, '--store', f.store], env);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      clearInjectedWriteFailure(tmp);
     }
     const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
 

@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { stateDir, ensureDir } from './paths.mjs';
+import { writeFileAtomic } from './atomic-write.mjs';
 
 export const BUNDLE_SCHEMA_VERSION = 1;
 
@@ -79,9 +80,8 @@ export async function buildBundle({ storeRoot, handles, ctx }) {
 
   const file = bundleFile(storeRoot);
   ensureDir(path.dirname(file));
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(bundle, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+  // 统一到一处实现（曾经这里自带一份固定名 tmp+rename；固定名会在两个进程同时写时互踩）
+  writeFileAtomic(file, `${JSON.stringify(bundle, null, 2)}\n`);
 
   return { bundle, file };
 }

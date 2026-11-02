@@ -12,12 +12,25 @@
  *   - 任一步失败都删掉临时文件并原样抛出，**目标文件一个字节都不动**。
  *   - 目录不存在这类前置错误原样抛（由 `mapWriteError` 统一翻译）。
  *
- * ⚠️ 临时文件名固定为 `<目标>.tmp`（照抄参照物，不另发明）。
- *   好处之一是可**注入**：把 `<目标>.tmp` 占成一个目录，就能在真工作树里
- *   造出一次"写盘必失败"而不碰目标文件本身 —— 三证里的红/绿两条都靠它。
+ * ⚠️ 临时文件名是**唯一**的：`<目标>.<pid>.<8位随机>.tmp`。
+ *
+ *   曾经它是固定的 `<目标>.tmp`（照抄参照物）。同一进程内其实安全（write+rename 两行同步，
+ *   Node 不会在里面插队），但**两个进程**同时写同一个目标就会互踩：
+ *
+ *     A: 写 tmp（完整）        B: 写 tmp（把 A 的内容截断重写）
+ *     A: rename tmp → 目标     ← 目标拿到的是 **B 的内容**，而 A 报了成功（假成功）
+ *     B: rename tmp → 目标     ← tmp 已被移走 → ENOENT → B 报失败
+ *
+ *   pid 隔离进程，随机后缀隔离同进程内的重复调用。**必须与目标同目录**不许变（同卷才能原子 rename）。
+ *
+ * ⚠️ 唯一名的代价是"崩溃残件不再被下次写自动覆盖"，所以写之前会 best-effort 清一遍
+ *   **同一目标、同一命名模式、且 mtime 超过 `STALE_TMP_MS`** 的兄弟 `.tmp`（见 `sweepStaleTmpFor`）。
+ *   绝不动 1 小时以内的 —— 那可能是另一个进程正在写的。
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { ConsoleError } from './errors.mjs';
 import { tildify } from './paths.mjs';
 
@@ -37,9 +50,66 @@ export const WRITE_NOT_HAPPENED = '写入未发生，目标文件未被修改';
  */
 const WRITE_ATTEMPT = Symbol.for('wbc.atomicWrite.attempted');
 
-/** 临时文件路径：与目标同目录（同卷），文件名固定 —— 与 `profiles.mjs` 一致。 @param {string} absPath */
+/**
+ * 崩溃残件的判定阈值。
+ *
+ * 为什么是 1 小时：唯一名不会被下次写覆盖，所以要主动清；但**绝不能清掉正在写的**。
+ * 一次原子写的窗口是毫秒级，1 小时是三个数量级以上的余量——宁可留下垃圾，
+ * 也不误删另一个进程刚写好、正要 rename 的临时文件。
+ */
+export const STALE_TMP_MS = 60 * 60 * 1000;
+
+/**
+ * 临时文件路径：与目标**同目录**（同卷才能原子 rename），文件名**唯一**。
+ *
+ * 唯一性由两段保证：`process.pid` 隔离进程，4 字节随机隔离同进程内的重复调用。
+ * 不许改成固定名——那会让两个进程同时写同一目标时互踩（见文件头的推演）。
+ *
+ * @param {string} absPath
+ * @returns {string}
+ */
 export function tmpPathFor(absPath) {
-  return `${absPath}.tmp`;
+  return `${absPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+}
+
+/**
+ * 这个名字是不是"某个目标的临时兄弟"。
+ *
+ * 严格匹配 `<basename>.<数字>.<8位十六进制>.tmp`，**只认我们自己造的**——
+ * 清理与断言都靠它，松一点就可能误删用户的文件。
+ *
+ * @param {string} absPath 目标绝对路径
+ * @param {string} name 同目录下的文件名（不是路径）
+ * @returns {boolean}
+ */
+export function isTmpSiblingFor(absPath, name) {
+  const base = path.basename(absPath);
+  return new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.\\d+\\.[0-9a-f]{8}\\.tmp$`).test(name);
+}
+
+/**
+ * best-effort 清掉崩溃残件：同一目标、同一命名模式、且 mtime 早于 `maxAgeMs`。
+ *
+ * 三条纪律：**绝不抛错**（清不掉就跳过）、**绝不删不匹配模式的**、**绝不动阈值以内的**。
+ *
+ * @param {string} absPath
+ * @param {{maxAgeMs?:number, now?:number}} [opts]
+ * @returns {string[]} 被删掉的文件名（供断言；失败时为已删成功的那些）
+ */
+export function sweepStaleTmpFor(absPath, { maxAgeMs = STALE_TMP_MS, now = Date.now() } = {}) {
+  const removed = [];
+  let names;
+  try { names = fs.readdirSync(path.dirname(absPath)); } catch { return removed; }
+  for (const n of names) {
+    if (!isTmpSiblingFor(absPath, n)) continue;
+    const p = path.join(path.dirname(absPath), n);
+    try {
+      if (now - fs.statSync(p).mtimeMs < maxAgeMs) continue; // 可能是别人正在写的
+      fs.rmSync(p, { force: true });
+      removed.push(n);
+    } catch { /* best-effort：清不掉不影响本次写 */ }
+  }
+  return removed;
 }
 
 /**
@@ -50,6 +120,8 @@ export function tmpPathFor(absPath) {
  * @returns {{path:string, bytes:number, tmp:string}}
  */
 export function writeFileAtomic(absPath, data) {
+  // 先清崩溃残件（best-effort，绝不影响本次写）。唯一名的代价就是它。
+  sweepStaleTmpFor(absPath);
   const tmp = tmpPathFor(absPath);
   try {
     fs.writeFileSync(tmp, data, typeof data === 'string' ? 'utf8' : undefined);

@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { profilesDir, ensureDir } from './paths.mjs';
 import { ConsoleError } from './errors.mjs';
+import { writeFileAtomic } from './atomic-write.mjs';
 
 export const PROFILE_SCHEMA_VERSION = 1;
 
@@ -107,9 +108,8 @@ export function writeProfile(storeRoot, profile) {
   });
   const dir = ensureDir(profilesDir(storeRoot));
   const target = path.join(dir, `${p.id}.json`);
-  const tmp = `${target}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(p, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, target); // 原子替换，避免半截文件
+  // 统一到一处实现（曾经这里自带一份固定名 tmp+rename；固定名会在两个进程同时写时互踩）
+  writeFileAtomic(target, `${JSON.stringify(p, null, 2)}\n`);
   return p;
 }
 

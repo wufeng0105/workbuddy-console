@@ -10,6 +10,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
 import { createEngine } from './core/engine.mjs';
 import { registerAll } from './handles/index.mjs';
 import { soulHandle } from './handles/personalization.soul.mjs';
@@ -2443,52 +2445,83 @@ await atest('C2：applyProfile 多把手求和 —— 任一项估不出则整�
 console.log('\n【WP12】P3a 收口：R27 原子写 / R28 写失败文案 / R31 畸形 next 不留孤儿备份');
 
 /**
- * 可注入的写失败：把 `<目标>.tmp` 占成一个**目录**。
+ * 可注入的写失败：把 `fs.renameSync` **临时换成抛 ENOSPC**，跑完立刻还原。
  *
- * 为什么用这个姿势：原子写把临时文件建在目标同目录（同卷才能 rename），
- * 临时名固定为 `<目标>.tmp`；占住它就能在**不动目标文件**的前提下让写盘必失败。
- * 它同时是 R27 的实验室复现——差别只在真实故障里那一步是 ENOSPC。
+ * 为什么不是"造一个文件系统条件"：
+ *   · 临时名现在是**唯一**的，以前"把 `<目标>.tmp` 占成目录"的注入法已失效；
+ *   · 换成"把目标设为只读"会**在到达原子写之前**被 `style-file` / `prompt-template`
+ *     的"当前进程不可写"前置检查拦下，报的是另一句话（实测），于是四条路径不落在同一步。
+ * 直接对 syscall 打桩，四条路径**精确落在原子写那一步**，errno 也是真的 ENOSPC。
+ * 它同时覆盖"rename 失败 → 临时文件必须被清掉"。
+ *
+ * 注意：只对**同进程**有效。`test/cli.test.mjs` 走的是真子进程，它另用文件系统注入（见该文件）。
+ * @param {string} _absPath 仅为调用点可读性保留；本注入与目标无关
+ */
+let _origRenameSync = null;
+function injectWriteFailure(_absPath) {
+  if (_origRenameSync) throw new Error('写失败注入还没清除，不许叠加');
+  _origRenameSync = fs.renameSync;
+  fs.renameSync = () => {
+    const e = new Error('ENOSPC: no space left on device, rename');
+    e.code = 'ENOSPC';
+    throw e;
+  };
+  return true;
+}
+function clearInjectedWriteFailure() {
+  if (_origRenameSync) { fs.renameSync = _origRenameSync; _origRenameSync = null; }
+}
+
+/**
+ * 清掉某个目标的**所有**临时兄弟（不论年龄）——只为 fixture 卫生，不参与被测逻辑。
+ * 判定用的是被测模块自己导出的 `isTmpSiblingFor`，避免测试与实现各写一份正则而漂移。
  * @param {string} absPath
  */
-function injectWriteFailure(absPath) {
-  const tmp = `${absPath}.tmp`;
-  fs.rmSync(tmp, { recursive: true, force: true });
-  ensureDir(tmp);
-  return tmp;
+async function clearTmpSiblings(absPath) {
+  const { isTmpSiblingFor } = await import('./core/atomic-write.mjs');
+  const dir = path.dirname(absPath);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const n of names) {
+    if (!isTmpSiblingFor(absPath, n)) continue;
+    try { fs.rmSync(path.join(dir, n), { force: true }); } catch { /* 忽略 */ }
+  }
 }
-/** @param {string} tmp */
-function clearInjectedWriteFailure(tmp) { fs.rmSync(tmp, { recursive: true, force: true }); }
 
 await atest('W1（R27）：原子写失败 → 目标字节一个都不动，且不留半截临时文件', async () => {
   /**
    * 缺陷态（Lead 实测）：裸 `fs.writeFileSync` 先截断再写，真 ENOSPC 下目标 **42 B → 0 B**，
    * 原内容在抛错之前就没了。原子写让"失败"变成"目标从未被打开过"。
    */
-  const { writeFileAtomic } = await import('./core/atomic-write.mjs');
+  const { writeFileAtomic, isTmpSiblingFor } = await import('./core/atomic-write.mjs');
   const target = path.join(fixtureRoot, 'wp12-atomic.txt');
   const ORIGINAL = 'X'.repeat(42);
-  fs.rmSync(`${target}.tmp`, { recursive: true, force: true });
+  await clearTmpSiblings(target);
   fs.writeFileSync(target, ORIGINAL, 'utf8');
   const beforeSha = sha256(fs.readFileSync(target));
 
-  const tmp = injectWriteFailure(target);
+  const token = injectWriteFailure(target); // 打桩：rename 抛 ENOSPC
   let threw = null;
   try { writeFileAtomic(target, 'NEW-CONTENT'); } catch (e) { threw = e; }
-  clearInjectedWriteFailure(tmp);
+  clearInjectedWriteFailure(token);
 
   ok(threw, '注入的写失败必须抛出，不许静默成功');
+  eq(threw.code, 'ENOSPC',
+    `注入的是 rename 抛 ENOSPC，必须原样透出来（实际 ${threw.code}）`);
   eq(fs.readFileSync(target, 'utf8'), ORIGINAL,
     '写失败后目标文件必须逐字节不变（裸 writeFileSync 会先截成 0 B —— 正是实测的 42 B → 0 B）');
   eq(sha256(fs.readFileSync(target)), beforeSha, 'sha256 也必须一致');
+  eq(fs.readdirSync(path.dirname(target)).filter((n) => isTmpSiblingFor(target, n)).length, 0,
+    '失败后不许把临时文件留在目标目录里 —— 那正是"半截文件"留在用户眼前的来源');
 
-  // 第二半：rename 那一步失败（目标本身是个目录）→ 临时文件必须被清掉
+  // 第二半：rename 覆盖一个**已存在的目录**（另一条失败路径）→ 同样不许留残件
   const dirTarget = ensureDir(path.join(fixtureRoot, 'wp12-atomic-dir'));
-  fs.rmSync(`${dirTarget}.tmp`, { recursive: true, force: true });
+  await clearTmpSiblings(dirTarget);
   let threw2 = null;
   try { writeFileAtomic(dirTarget, 'NEW'); } catch (e) { threw2 = e; }
   ok(threw2, 'rename 覆盖一个已存在的目录必须失败（本用例的前提）');
-  ok(!fs.existsSync(`${dirTarget}.tmp`),
-    '失败后不许把临时文件留在目标目录里 —— 那正是"半截文件"留在用户眼前的来源');
+  eq(fs.readdirSync(path.dirname(dirTarget)).filter((n) => isTmpSiblingFor(dirTarget, n)).length, 0,
+    'rename 失败后同样不许留残件');
 });
 
 await atest('W2（R27）：七处写出点全部走 writeFileAtomic（剥注释后，旧的裸写语句必须消失）', async () => {
@@ -2709,7 +2742,7 @@ await atest('W8（R27 · 还原写回）：还原时写回失败 → 目标不�
   const ORIGINAL = 'RESTORE-ORIGINAL-42-BYTES-0123456789\n';
   const CURRENT = 'RESTORE-CURRENT-DRIFTED-CONTENT-ABCDEF\n';
   fs.rmSync(target, { force: true });
-  fs.rmSync(`${target}.tmp`, { recursive: true, force: true });
+  await clearTmpSiblings(target);
   fs.writeFileSync(target, ORIGINAL, 'utf8');
 
   const manifest = createBackup({
@@ -2747,6 +2780,133 @@ await atest('W9（R28）：errno 映射**只有一份** —— HTTP 不再自带
   ok(!server.includes('ENOSPC'),
     'HTTP 腿不许再自带 errno 分支（映射表只留一份，反例就是曾经那句 DISK_FULL）');
   ok(cli.includes('mapWriteError('), 'CLI 腿必须调共享的 mapWriteError（曾经它连一句话都没有）');
+});
+
+await atest('W10（R27）：临时文件写不进去（父目录不存在）→ 目标不动、不留残件、不顺手造目录', async () => {
+  /**
+   * 这一条与 W1 是**两条不同的失败路径**，别混为一谈：
+   *   · W1 注入的是"tmp 写成功、**rename** 失败"（只读目标）；
+   *   · W10 注入的是"**tmp 写就失败**"（父目录根本不存在）。
+   * 真 ENOSPC 落在哪一支取决于盘满发生在哪一步，两条都得有断言。
+   */
+  const { writeFileAtomic } = await import('./core/atomic-write.mjs');
+  const missingDir = path.join(fixtureRoot, 'wp12-no-such-dir');
+  fs.rmSync(missingDir, { recursive: true, force: true });
+  const target = path.join(missingDir, 'x.txt');
+  let threw = null;
+  try { writeFileAtomic(target, 'NEW'); } catch (e) { threw = e; }
+  ok(threw, '父目录不存在时必须抛，不许静默成功');
+  ok(!fs.existsSync(missingDir), '不存在的父目录不许被顺手造出来（写盘只负责写文件）');
+});
+
+await atest('W11（R27 · 并发冒烟）：多进程同写同一目标 → 终值永远是**一份完整内容**，绝不混合/半截', async () => {
+  /**
+   * 固定临时名（`<目标>.tmp`）时的真实危害：
+   *   A 写 tmp 完整 → B 把 tmp 截断重写 → A 的 rename 搬走的是 **B 的临时文件**
+   *   ⇒ 目标上是 B 的内容、而 A 报了成功（内容错配 + 假成功），B 再 rename 拿到 ENOENT。
+   *
+   * ⚠️ 这条只能当**冒烟**，不能当确定性守卫 —— 确定性守卫是 W13 的契约断言。原因：
+   *   Windows 上两个进程同时 `rename` 到同一个目标时，可能有一个拿到**瞬时 EPERM**
+   *   （目标在另一方的 rename 期间被占用）。实测：4 进程 × 60 次 × 200 KB，
+   *   **唯一名方案下也仍有 2–3 个进程在某一轮拿到 EPERM**。那不是本缺陷，
+   *   是平台行为：并发写同一目标，调用方本来就该重试。
+   *   ⇒ 所以这里**不许**断言"无一失败"（那样正确实现也红，是本断言的第一版踩的坑）。
+   *
+   * 断言的是用户真正在意的不变量：**目标永远是一份完整内容**（不混合、不半截），
+   * 失败也是**明确的系统错误**而不是假成功。内容错配是竞态，稳定断言不了，
+   * 由 W13 从契约层（临时名唯一）确定性地钉住。
+   */
+  const { isTmpSiblingFor } = await import('./core/atomic-write.mjs');
+  const target = path.join(fixtureRoot, 'wp12-race.txt');
+  await clearTmpSiblings(target);
+  fs.writeFileSync(target, 'INIT', 'utf8');
+
+  const childFile = path.join(os.tmpdir(), `wbc-atomic-race-${process.pid}.mjs`);
+  fs.writeFileSync(childFile, [
+    `import { writeFileAtomic } from ${JSON.stringify(new URL('./core/atomic-write.mjs', import.meta.url).href)};`,
+    'const [target, id, n, kb] = process.argv.slice(2);',
+    // payload 必须**够大**：竞态窗口正比于"写临时文件"的耗时，十几字节的窗口太窄，
+    // 连固定名都撞不出来（实测：8 KB 起才稳定复现）。200 KB 也不是虚构 ——
+    // 风格正文 / 提示词模板本来就是这个量级。
+    'const payload = "W".repeat(Number(kb) * 1024);',
+    'for (let i = 0; i < Number(n); i += 1) writeFileAtomic(target, `${payload}WRITER-${id}-${i}`);',
+    '',
+  ].join('\n'), 'utf8');
+
+  const WRITERS = 4;
+  const ITERS = 60;
+  const KB = 200;
+  /**
+   * ⚠️ 必须用**异步** `spawn` 并发起、再一起等：`spawnSync` 是**串行**的，
+   * 四个子进程会一个跑完再跑下一个 —— 那样这条断言"看着在测并发，其实在测串行"，
+   * 改成固定临时名也照样全绿（第一版就是这么空转的，被三证的①抓出来）。
+   */
+  const spawnAsync = (args) => new Promise((resolve) => {
+    const p = spawn(process.execPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    p.stderr.on('data', (d) => { err += d.toString(); });
+    p.on('close', (code) => resolve({ status: code, stderr: err }));
+    p.on('error', (e) => resolve({ status: -1, stderr: String(e) }));
+  });
+  const runs = await Promise.all(
+    Array.from({ length: WRITERS }, (_, id) => spawnAsync([childFile, target, String(id), String(ITERS), String(KB)])),
+  );
+  fs.rmSync(childFile, { force: true });
+
+  const okRuns = runs.filter((r) => r.status === 0);
+  const failed = runs.filter((r) => r.status !== 0);
+  ok(okRuns.length >= 1, `至少要有一个写者成功，实际 ${okRuns.length}/${WRITERS}`);
+  for (const r of failed) {
+    ok(/EPERM|EACCES|ENOENT|EBUSY/.test(r.stderr),
+      `失败必须是可识别的系统错误（并发下允许瞬时 EPERM），实际：${r.stderr.split('\n').slice(0, 2).join(' | ')}`);
+  }
+  const content = fs.readFileSync(target, 'utf8');
+  ok(new RegExp(`^W{${KB * 1024}}WRITER-\\d+-\\d+$`).test(content),
+    `终值必须是一份**完整**的单写者内容（混合/半截就是互踩），实际长度 ${content.length}、开头 ${content.slice(0, 20)}`);
+  eq(fs.readdirSync(path.dirname(target)).filter((n) => isTmpSiblingFor(target, n)).length, 0,
+    '并发写完之后不许留残件');
+});
+
+await atest('W12（R27 · 崩溃残件）：只清"旧的"，绝不动"刚写的"', async () => {
+  /**
+   * 唯一名的代价：崩溃残件不再被下次写覆盖，所以要主动清 —— 但清了"正在写的"就是新缺陷。
+   * 这条钉的就是那个边界：超过 `STALE_TMP_MS` 的清掉，阈值以内的**一个都不许动**。
+   */
+  const { sweepStaleTmpFor } = await import('./core/atomic-write.mjs');
+  const target = path.join(fixtureRoot, 'wp12-sweep.txt');
+  await clearTmpSiblings(target);
+  fs.writeFileSync(target, 'X', 'utf8');
+
+  const oldTmp = `${target}.1111.deadbeef.tmp`;
+  const freshTmp = `${target}.2222.cafebabe.tmp`;
+  fs.writeFileSync(oldTmp, 'stale', 'utf8');
+  fs.writeFileSync(freshTmp, 'in-flight', 'utf8');
+  const twoHoursAgo = Date.now() / 1000 - 7200;
+  fs.utimesSync(oldTmp, twoHoursAgo, twoHoursAgo);
+
+  const removed = sweepStaleTmpFor(target);
+  eq(removed.length, 1, `只应清掉 1 个（旧的），实际清了 ${removed.length} 个：${removed.join(',')}`);
+  ok(!fs.existsSync(oldTmp), '超过阈值的残件必须被清掉（否则唯一名会在用户目录里攒垃圾）');
+  ok(fs.existsSync(freshTmp), '阈值以内的**绝不许动** —— 那可能是另一个进程正在写的');
+  await clearTmpSiblings(target);
+});
+
+await atest('W13（R27 · 临时名契约）：同一目标的两次取值必须不同、同目录、且能被模式认出来', async () => {
+  /**
+   * W11 是**行为**证据（真子进程撞车）；这条是**契约**证据（不依赖时序，永远可复现）。
+   * 两条一起才完整：只留 W11 会因窗口概率而偶发漏判，只留这条会丢掉"真的不会互踩"的行为证明。
+   */
+  const { tmpPathFor, isTmpSiblingFor } = await import('./core/atomic-write.mjs');
+  const target = path.join(fixtureRoot, 'wp13-contract.txt');
+  const a = tmpPathFor(target);
+  const b = tmpPathFor(target);
+  ok(a !== b, `同一目标的两次临时名必须不同（固定名会让两个进程互踩），实际都是 ${path.basename(a)}`);
+  eq(path.dirname(a), path.dirname(target),
+    '临时文件必须与目标**同目录** —— 跨卷 rename 会退化成复制，原子性没了');
+  ok(isTmpSiblingFor(target, path.basename(a)), `自己造的临时名必须能被 isTmpSiblingFor 认出：${path.basename(a)}`);
+  ok(a.includes(`.${process.pid}.`), `临时名必须带 pid（进程间隔离），实际 ${path.basename(a)}`);
+  ok(!isTmpSiblingFor(target, `${path.basename(target)}.tmp`),
+    '旧的固定名 `<目标>.tmp` **不许**被认成合法临时名（否则清理会误删别人留下的东西）');
 });
 
 // ══════════════ 汇总 ══════════════
