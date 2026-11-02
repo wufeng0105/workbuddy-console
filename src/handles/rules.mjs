@@ -40,12 +40,31 @@ export function createRuleDomainHandle({ domain, id, title }) {
 
   /** 校验"下一步规则"的输入 */
   function normalizeOp(next) {
-    if (!next || typeof next !== 'object') {
-      throw new ConsoleError('INVALID_VALUE', '需要 { from, to, actions?, paths? } 形式的操作描述');
+    /**
+     * 报错要说清**到底哪里不对**（残余 R44④）。
+     * 曾经的实现只判断 from/to 合不合法，于是所有"形态错"都报同一句
+     * 「动作必须是 allow/ask/deny，收到 undefined → undefined」—— 用户会去查动作取值，
+     * 而真正的问题可能是"键名写成了 action"或"根本没给 --set"。猜错的成本比不猜高。
+     */
+    const SHAPE = '{ "from": "ask", "to": "allow", "actions": ["read","write"], "paths": ["D:\\\\work"] }';
+    if (next === undefined || next === null) {
+      throw new ConsoleError('INPUT_MISSING',
+        `规则把手必须先给出"要做哪个操作"（JSON 对象）：${SHAPE}\n  用 --set <文件> 给出——plan 也要它才算得出差异。`,
+        { hint: SHAPE });
+    }
+    if (typeof next !== 'object' || Array.isArray(next)) {
+      throw new ConsoleError('INVALID_VALUE',
+        `规则把手要的是 JSON **对象**，收到的是 ${Array.isArray(next) ? '数组' : typeof next}。期望形如：${SHAPE}`,
+        { received: Array.isArray(next) ? 'array' : typeof next, hint: SHAPE });
     }
     const { from, to, actions, paths } = next;
+    const keys = Object.keys(next);
     if (!['allow', 'ask', 'deny'].includes(from) || !['allow', 'ask', 'deny'].includes(to)) {
-      throw new ConsoleError('INVALID_VALUE', `动作必须是 allow/ask/deny，收到 ${from} → ${to}`);
+      const likely = keys.length ? `你给的键是 ${keys.map((k) => `"${k}"`).join('、')}` : '你给的是空对象';
+      throw new ConsoleError('INVALID_VALUE',
+        `缺少 ${from === undefined ? '"from"' : ''}${from === undefined && to === undefined ? ' 和 ' : ''}${to === undefined ? '"to"' : ''}`
+        + `（取值必须是 allow/ask/deny）。${likely} —— 注意键名是 "from"/"to"，不是 "action"。期望形如：${SHAPE}`,
+        { received: keys, hint: SHAPE });
     }
     const acts = Array.isArray(actions) && actions.length ? actions : ['read', 'write', 'delete'];
     for (const a of acts) {
@@ -94,7 +113,12 @@ export function createRuleDomainHandle({ domain, id, title }) {
         text,
         bytes: Buffer.byteLength(text, 'utf8'),
         sha256: text ? sha256(Buffer.from(text, 'utf8')) : null,
-        token: { tokens: null, chars: text.length, cjk: 0, other: text.length },
+        /**
+         * ⚠️ 字段名必须是 `tokens`（复数），与其它把手一致 —— **同物异名会打崩 CLI**（残余 R38）。
+         * 这里曾经叫 `token`（单数），而 `cli.mjs` 的 probe 打印读的是 `state.tokens.tokens`，
+         * 于是三个 rules 把手的默认输出直接 `TypeError` 崩栈（`--json` 那条路径不崩，所以一直没被发现）。
+         */
+        tokens: { tokens: null, chars: text.length, cjk: 0, other: text.length },
         domain,
         presetVersion: r.presetVersion,
         customized: r.customized,
@@ -130,6 +154,17 @@ export function createRuleDomainHandle({ domain, id, title }) {
       const w = writeDomainRules(cur.text, domain, promoted.rules);
       const afterText = typeof w === 'string' ? w : w.text;
       const diff = diffLines(cur.text, afterText);
+      /**
+       * ⚠️ 这里对 `writeDomainRules` 的调用是**假设性**的（只为算出 diff 文本）。
+       * 命中 0 条时 `apply` 会在写之前就抛 `NO_RULES_MATCHED`，**什么都不会写** ——
+       * 所以 customized 也**不会**被翻。预览必须与 apply 的实际行为一致，不许多报（R44①）。
+       */
+      const wrote = promoted.changed > 0;
+      const customizedFlipped = wrote && typeof w === 'object' && w.customizedFlipped === true;
+      const changedTotal = promoted.changed + (customizedFlipped ? 1 : 0);
+      const changedPaths = customizedFlipped
+        ? [...promoted.changedPaths, `sandbox.orderedRules.${domain}.customized`]
+        : promoted.changedPaths;
 
       return {
         path: cur.path,
@@ -142,10 +177,24 @@ export function createRuleDomainHandle({ domain, id, title }) {
         truncated: false,
         dropped: 0,
         warnings,
-        changed: promoted.changed,
-        changedPaths: promoted.changedPaths.slice(0, 40),
+        changed: changedTotal,
+        changedPaths: changedPaths.slice(0, 40),
+        customizedFlipped,
         bytesDelta: Buffer.byteLength(afterText, 'utf8') - Buffer.byteLength(cur.text, 'utf8'),
         op,
+        /**
+         * 这次 apply 会不会被拒（残余 R44①）。
+         *
+         * 背景：`plan` 对"命中 0 条"照样 exit 0，而 `apply` 会 `NO_RULES_MATCHED` exit 1。
+         * 于是"拿 plan 当预检"会得到**假阳性**——用户以为这个方案能落地。
+         * plan 的职责就是"告诉你真跑会发生什么"，所以它必须把这件事说出来。
+         */
+        willFail: promoted.changed === 0
+          ? {
+            code: 'NO_RULES_MATCHED',
+            message: `没有规则命中（当前没有 ${op.actions.join('/')} = ${op.from} 且匹配的条目）—— 直接 apply 会被拒绝`,
+          }
+          : null,
       };
     },
 
@@ -159,6 +208,12 @@ export function createRuleDomainHandle({ domain, id, title }) {
       }
       const w = writeDomainRules(cur.text, domain, promoted.rules);
       const afterText = typeof w === 'string' ? w : w.text;
+      /** 见 preview 的同名说明：customized 被翻动也是一次真实改动，必须计进"改动清单"（R40） */
+      const customizedFlipped = typeof w === 'object' && w.customizedFlipped === true;
+      const changedTotal = promoted.changed + (customizedFlipped ? 1 : 0);
+      const changedPaths = customizedFlipped
+        ? [...promoted.changedPaths, `sandbox.orderedRules.${domain}.customized`]
+        : promoted.changedPaths;
       // 原子写（R27）：这是 settings.json —— 截断它等于把整份规则表清零
       writeFileAtomic(cur.path, afterText);
 
@@ -167,15 +222,16 @@ export function createRuleDomainHandle({ domain, id, title }) {
         storeRoot: ctx.storeRoot,
         key: this.id,
         snapshot: promoted.rules,
-        meta: { domain, op, changed: promoted.changed, path: cur.path },
+        meta: { domain, op, changed: changedTotal, customizedFlipped, path: cur.path },
       });
 
       return {
         path: cur.path,
         bytes: Buffer.byteLength(afterText, 'utf8'),
         writeMode: typeof w === 'string' ? 'targeted' : w.mode,
-        changed: promoted.changed,
-        changedPaths: promoted.changedPaths.slice(0, 40),
+        changed: changedTotal,
+        changedPaths: changedPaths.slice(0, 40),
+        customizedFlipped,
         /** 提示必须重启 */
         restartRequired: true,
       };

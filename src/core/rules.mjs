@@ -108,6 +108,7 @@ export function writeDomainRules(settingsText, domain, rules) {
   if (!dom) throw new ConsoleError('RULE_DOMAIN_MISSING', `域 ${domain} 不存在`);
 
   // 标记为已定制 —— 与 WorkBuddy 自己的语义一致（customized 字段就是干这个的）
+  const wasCustomized = dom.customized === true;
   const nextDom = { ...dom, rules, customized: true };
   const nextSandboxOrdered = { ...parsed.sandbox.orderedRules, [domain]: nextDom };
   const nextSandbox = { ...parsed.sandbox, orderedRules: nextSandboxOrdered };
@@ -118,6 +119,12 @@ export function writeDomainRules(settingsText, domain, rules) {
     return {
       text: `${JSON.stringify(next, null, 2)}${normalized.endsWith('\n') ? '\n' : ''}`,
       mode: 'reserialize',
+      /**
+       * 这次写会不会**额外**把 `customized` 从非 true 翻成 true（残余 R40）。
+       * 它是一次真实改动，但不在 `rules` 数组里 —— 不报出来，调用方的"改动清单"就会少报一处。
+       * reserialize 分支必然翻（上面 spread 里写死了 true）。
+       */
+      customizedFlipped: !wasCustomized,
     };
   }
 
@@ -149,14 +156,17 @@ export function writeDomainRules(settingsText, domain, rules) {
     newInner = `${inner.replace(/\s+$/, '')},\n  "rules": ${rulesJson}\n`;
   }
 
-  // 顺带把 customized 也叫醒（若存在该字段）
-  const withCustomized = /"customized"\s*:\s*(true|false)/.test(newInner)
+  // 顺带把 customized 也叫醒（**只在字段已存在时** —— 目标格式里没有这个键，就不替它新增）
+  const hasCustomizedField = /"customized"\s*:\s*(true|false)/.test(newInner);
+  const withCustomized = hasCustomizedField
     ? newInner.replace(/("customized"\s*:\s*)(true|false)/, '$1true')
     : newInner;
 
   return {
     text: settingsText.slice(0, span.start + 1) + withCustomized + settingsText.slice(span.end - 1),
     mode: 'targeted',
+    /** 见 reserialize 分支的说明：只有字段存在、且原本不是 true 时，这次写才真的翻了它 */
+    customizedFlipped: hasCustomizedField && !wasCustomized,
   };
 }
 

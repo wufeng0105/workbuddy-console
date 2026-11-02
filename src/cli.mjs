@@ -102,8 +102,26 @@ function out(v, json) {
 
 const VERDICT_BADGE = { effective: '✅ 生效', ineffective: '❌ 未生效', undetermined: '⚠️  无法判定' };
 
-/** 快速上手：从文件头注释里提取，去掉注释符号 */
-function helpText() {
+/**
+ * probe 的"估算 token"一栏要**容错**（残余 R38）。
+ *
+ * 曾经直接读 `state.tokens.tokens`：只要哪个把手没给这个形状，整条默认输出就 `TypeError` 崩栈，
+ * 用户连"路径 / 存在 / 字节"这些最基本的信息都拿不到（`--json` 反而不崩，所以一直没被发现）。
+ * 拿不到就如实说"不适用"，**不许崩**、也不许编一个数。
+ * @param {any} state
+ */
+function tokenEstimateLabel(state) {
+  /**
+   * **只认 `tokens` 这一个名字**，不做"双名兼容"。
+   * 兼容看着稳健，实际是把同物异名又请回来：字段改名后界面照样能显示，
+   * 于是没人会去改那个改名的把手 —— 直到某天另一条路径按 `tokens` 取值时崩掉。
+   * 名字不一致就该**看得见**（这里显示"不适用"，J1 断言会红）。
+   */
+  const n = state?.tokens?.tokens ?? null;
+  return Number.isFinite(n) ? String(n) : '(不适用)';
+}
+
+/** 快速上手：从文件头注释里提取，去掉注释符号 */function helpText() {
   const src = fs.readFileSync(new URL(import.meta.url), 'utf8');
   const block = src.split('*/')[0];
   return block
@@ -120,6 +138,16 @@ async function main(argv) {
   const f = parseArgs(argv);
   const cmd = f._[0];
   const json = f.json === true;
+
+  /**
+   * `--help` 必须**任何位置**都认（残余 R44③）。
+   *
+   * 曾经 `cli.mjs` 根本没有这个分支：`helpText()` 只在"未知命令"的兜底里打印。
+   * 于是 `plan --help` 被当成"没有把手 id"→ 报 `未注册的把手：undefined`；
+   * `plan <id> --help` 更糟——`--help` 被当成"没给 --set"，报一句与帮助毫不相干的校验错。
+   * 用户想看帮助，得到的是两条误导性报错。
+   */
+  if (f.help === true) { console.log(helpText()); return 0; }
 
   const configRoot = resolveConfigRoot(typeof f.root === 'string' ? f.root : undefined);
 
@@ -179,7 +207,7 @@ async function main(argv) {
       console.log(`${r.handle.title}  (${r.handle.id})`);
       console.log(`路径   ${tildify(r.state.path)}`);
       console.log(`存在   ${r.state.exists ? '是' : '否'}`);
-      console.log(`字节   ${r.state.bytes}   估算 token ${r.state.tokens.tokens}`);
+      console.log(`字节   ${r.state.bytes}   估算 token ${tokenEstimateLabel(r.state)}`);
       console.log(`sha256 ${r.state.sha256 ?? '(无)'}`);
       return undefined;
     }
@@ -188,7 +216,17 @@ async function main(argv) {
       const h = engine.doctor().handles.find((x) => x.id === f._[1]);
       const next = f.set !== undefined ? readNextFor(f.set, h?.inputKind) : undefined;
       const p = await engine.plan(f._[1], { next });
-      if (json) return out({ ...p, preview: { ...p.preview, diff: undefined } }, true);
+      /**
+       * plan 的职责是"告诉你真跑会发生什么"（残余 R44①）。
+       * 命中 0 条时 `apply` 会 `NO_RULES_MATCHED` 退出 1，而 plan 曾经照样 exit 0 ——
+       * 拿它当"这个方案行不行"的预检就会得到**假阳性**。所以这里必须把拒绝理由说出来，
+       * 并让退出码也**非零**（脚本才能据此判断）。
+       */
+      const blocked = p.preview?.willFail ?? null;
+      if (json) {
+        if (blocked) process.exitCode = 1;
+        return out({ ...p, preview: { ...p.preview, diff: undefined } }, true);
+      }
       console.log(`${p.handle.title}  →  ${p.anchor.path}`);
       const pv = p.preview;
       if (pv.valueAfter !== undefined) {
@@ -212,6 +250,11 @@ async function main(argv) {
       for (const w of (p.preview.warnings ?? [])) console.log(`⚠️  ${w}`);
       for (const w of p.gate.warnings) console.log(`⚠️  ${w}`);
       if (p.needsConfirm) console.log('⚠️  这是厂商文件写入，必须显式 --confirm');
+      if (blocked) {
+        console.log(`\n❌ 这次 apply 会被拒绝：[${blocked.code}] ${blocked.message}`);
+        console.log('   （plan 退出码已置为非零 —— 拿它当预检不会再得到假阳性。）');
+        process.exitCode = 1;
+      }
       { const iso = isolationLines(f._[1]); if (iso) { console.log(''); for (const l of iso) console.log(l); } }
       return undefined;
     }

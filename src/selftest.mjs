@@ -1195,7 +1195,13 @@ await atest('probe 给出规则数与动作分布', async () => {
 
 await atest('批量操作：只放开 write，不碰 read/delete', async () => {
   const pl = await engineRules.plan('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] } });
-  eq(pl.preview.changed, 3, `应命中 3 条，实际 ${pl.preview.changed}`);
+  eq(pl.preview.changed, 4,
+    `应命中 3 条规则 + customized 被翻动 1 处 = 4，实际 ${pl.preview.changed}`);
+  // ⚠️ 期望值从 3 改成 4 是 **R40 修复的正确后果**，不是为凑绿而放宽：
+  // 旧值 3 编码的正是"少报 customized 那一处"的缺陷行为。这里再钉一条"到底是哪一处"，
+  // 免得将来有人把数字改回去了事。
+  ok(pl.preview.changedPaths.includes('sandbox.orderedRules.file.customized'),
+    `改动清单里必须看得见 customized 那一处：${JSON.stringify(pl.preview.changedPaths.slice(-3))}`);
   ok(pl.preview.diffText.includes('~/.ssh/'), 'diff 应列出命中路径');
 });
 
@@ -1221,7 +1227,7 @@ let rulesApply;
 await atest('apply：只改 write，其余动作与格式保持不变', async () => {
   const before = fs.readFileSync(SETTINGS, 'utf8');
   rulesApply = await engineRules.apply('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] } });
-  eq(rulesApply.changed, 3, '应改 3 条');
+  eq(rulesApply.changed, 4, '应改 3 条规则 + customized 1 处 = 4（R40 修复后计入 customized）');
   const after = JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   const rules = after.sandbox.orderedRules.file.rules;
   eq(rules.filter((r) => r.write === 'allow').length, 4, '应有 4 条 write=allow');
@@ -1266,7 +1272,7 @@ await atest('按路径定向：只改指定路径的规则', async () => {
   const ap = await engineRules.apply('rules.file', {
     next: { from: 'ask', to: 'allow', actions: ['write'], paths: ['~/.ssh/'] },
   });
-  eq(ap.changed, 1, '只应改 1 条');
+  eq(ap.changed, 2, '只应改 1 条规则 + customized 1 处 = 2（R40 修复后计入 customized）');
   const rules = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')).sandbox.orderedRules.file.rules;
   eq(rules.find((r) => r.path === '~/.ssh/').write, 'allow', '指定路径应被改');
   eq(rules.find((r) => r.path === '~/.aws/').write, 'ask', '其他路径不应被动');
@@ -2959,6 +2965,109 @@ await atest('I2（R39）：只在"你显式给了 --root"时才提示 —— 默
     '给了 --root 且厂商面逃逸时必须有内容');
   eq(isolationWarning({ escapes: [], configRoot: 'C:\\cfg', installRoot: 'D:\\inst', requestedRoot: 'C:\\mirror' }), null,
     '给了 --root 但厂商面都被隔离住时，不该提示');
+});
+
+console.log('\n【R38/R40/R44】字段同物异名 · 改动清单完整性 · plan 预检不得假阳性');
+
+await atest('J1（R38）：token 估算字段必须**同名** —— 哪个把手用了别的名字，就会打崩 CLI 默认输出', async () => {
+  /**
+   * 病根是**同物异名**：`rules.mjs` 曾经叫 `token`，其余把手叫 `tokens`，
+   * 而 `cli.mjs` 的 probe 打印读 `state.tokens.tokens` ⇒ 三个 rules 把手的默认输出直接
+   * `TypeError` 崩栈（`--json` 不崩，所以长期没被发现）。
+   * 这条钉的是**类别**而不是那一个把手：任何把手都不许再用 `token` 这个名字。
+   */
+  const e = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+  const bad = [];
+  for (const h of registryList()) {
+    /**
+     * ⚠️ 这里调的是**把手自己的** `probe`，它直接返回 state 本身；
+     * `engine.probe()` 才返回 `{handle, state}` 包装。第一版把这个搞混了，
+     * 写成 `st.state` ⇒ 一直在检查一个空对象 ⇒ **断言恒绿**（三证①当场抓出）。
+     */
+    const s = await h.probe(e.ctx);
+    if (s && typeof s === 'object' && 'token' in s) bad.push(h.id);
+  }
+  eq(bad.join(','), '', `这些把手的估算字段叫 token（应为 tokens）：${bad.join(',') || '（无）'}`);
+});
+
+await atest('J2（R38）：`probe rules.*` 默认输出必须 exit 0 且打出「估算 token」', async () => {
+  // 行为断言：真起 CLI 子进程，走人真正会用的那条**默认输出**路径（`--json` 本来就不崩，不算数）
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+  const r = spawnSync(process.execPath, [cli, 'probe', 'rules.file', '--root', cfg, '--store', store], {
+    encoding: 'utf8', timeout: 30000,
+  });
+  const all = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  eq(r.status, 0, `probe rules.file 必须 exit 0，实际 ${r.status}：${all.slice(0, 200)}`);
+  ok(/估算 token/.test(r.stdout ?? ''), `默认输出必须打出「估算 token」一栏：${(r.stdout ?? '').slice(0, 200)}`);
+  ok(!/未预期的错误/.test(all), `不许再出现「未预期的错误」：${all.slice(0, 200)}`);
+});
+
+await atest('J3（R40）：`customized` 被翻动必须计进改动清单 —— 否则调用方少报一处真实改动', async () => {
+  const { writeDomainRules } = await import('./core/rules.mjs');
+  const mk = (customized) => JSON.stringify({
+    sandbox: {
+      orderedRules: {
+        file: {
+          ...(customized === undefined ? {} : { customized }),
+          rules: [{ path: 'x', read: 'ask', write: 'ask', delete: 'ask' }],
+        },
+      },
+    },
+  }, null, 2);
+  const newRules = [{ path: 'x', read: 'allow', write: 'ask', delete: 'ask' }];
+
+  eq(writeDomainRules(mk(false), 'file', newRules).customizedFlipped, true,
+    'customized 原本 false → 这次写真的会翻它，必须报 true');
+  eq(writeDomainRules(mk(true), 'file', newRules).customizedFlipped, false,
+    'customized 本来就是 true → 没翻，必须报 false');
+  /**
+   * 第三个用例必须走**定点替换**那一支：那里用正则只在"字段已存在"时改写，不会替它新增。
+   * 所以要造一份**非规范格式**（紧凑 JSON）——否则会走 reserialize 分支，而那一支
+   * 是通过 `{...dom, customized: true}` 展开写回的，等于**必然新增**这个键（那是真翻了，该报 true）。
+   */
+  const compactNoKey = JSON.stringify({ sandbox: { orderedRules: { file: { rules: [{ path: 'x', read: 'ask', write: 'ask', delete: 'ask' }] } } } });
+  const targeted = writeDomainRules(compactNoKey, 'file', newRules);
+  eq(targeted.mode, 'targeted', `这份紧凑 JSON 应走定点替换（实际 ${targeted.mode}）`);
+  eq(targeted.customizedFlipped, false,
+    '定点替换下目标里没有 customized 键 → 不会替它新增，必须报 false（不许虚报）');
+  ok(typeof writeDomainRules(mk(false), 'file', newRules).text === 'string', '仍然要返回文本');
+});
+
+await atest('J4（R44①）：命中 0 条时 preview 必须报 willFail —— plan 不许比 apply 乐观', async () => {
+  /**
+   * ⚠️ 必须自带一份**独立 fixture**：本断言块在文件末尾，前面那些规则测试已经把共享 fixture
+   * 的 `ask` 规则改成 `allow` 了（实测：拿共享 fixture 跑，"有命中"那条会 changed=0 而误红）。
+   * 测试之间靠 fixture 传状态是最脆的耦合，这里直接自己造一份。
+   */
+  const h = registryList().find((x) => x.id === 'rules.file');
+  const dir = ensureDir(path.join(fixtureRoot, 'j4-rules'));
+  // 复制共享 fixture 的锚点结构（插件缓存 / 用户目录），只把 settings.json 换成自己的一份。
+  // 不能只造一个空目录：引擎探测不到 WorkBuddy 版本会**硬拒绝猜测**（那是正确行为）。
+  fs.cpSync(cfg, dir, { recursive: true, force: true });
+  fs.writeFileSync(path.join(dir, 'settings.json'), `${JSON.stringify({
+    sandbox: {
+      orderedRules: {
+        file: { presetVersion: 4, customized: false, rules: [{ path: '~/.ssh/', read: 'ask', write: 'ask', delete: 'ask' }] },
+        command: { presetVersion: 1, customized: false, rules: [] },
+        network: { presetVersion: 1, customized: false, rules: [] },
+      },
+    },
+  }, null, 2)}\n`, 'utf8');
+  const e = createEngine({ configRoot: dir, storeRoot: store, appStateProbe: () => false });
+
+  const yes = await h.preview(e.ctx, { next: { from: 'ask', to: 'allow', actions: ['read'] } });
+  ok(yes.changed >= 1, `有命中时 changed 应 ≥1（实际 ${yes.changed}）`);
+  eq(yes.willFail, null, '有命中时不该报 willFail');
+
+  // 用一条必然匹配不到的 paths 过滤造"命中 0 条"
+  const no = await h.preview(e.ctx, {
+    next: { from: 'ask', to: 'allow', actions: ['read'], paths: ['C:\\__wbc_no_such_path__'] },
+  });
+  eq(no.changed, 0, `命中 0 条时 changed 应为 0（实际 ${no.changed}）`);
+  eq(no.willFail?.code, 'NO_RULES_MATCHED',
+    `命中 0 条时 preview 必须报出 apply 会拒绝（实际 ${JSON.stringify(no.willFail ?? null)}）`);
 });
 
 // ══════════════ 汇总 ══════════════
