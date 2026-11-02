@@ -21,6 +21,7 @@ import path from 'node:path';
 import { sha256 } from '../core/backup.mjs';
 import { diffLines, renderDiff } from '../core/diff.mjs';
 import { AnchorMissingError, ConsoleError } from '../core/errors.mjs';
+import { writeFileAtomic } from '../core/atomic-write.mjs';
 import { markerStrategy, buildMarker } from '../verify/marker.mjs';
 
 /** 注入判定用的标记前缀（足够独特，不会与自然文本碰撞） */
@@ -181,7 +182,8 @@ export function createPromptTemplateHandle({ id, title, plugin, fileName }) {
       if (!st.writeAccess) {
         throw new AnchorMissingError(`当前进程不可写：${st.path}`, { path: st.path });
       }
-      fs.writeFileSync(st.path, next, 'utf8');
+      // 原子写（R27）：版本目录里的 prompt.tpl 被截断就等于该模式失去安全前缀
+      writeFileAtomic(st.path, next);
       return {
         path: st.path,
         bytes: Buffer.byteLength(next, 'utf8'),

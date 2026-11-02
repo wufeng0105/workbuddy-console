@@ -20,6 +20,7 @@ import { estimateTokens, estimateCost } from '../core/tokens.mjs';
 import { diffLines, renderDiff } from '../core/diff.mjs';
 import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 import { AnchorMissingError, ConsoleError } from '../core/errors.mjs';
+import { writeFileAtomic } from '../core/atomic-write.mjs';
 import { readActiveToneStyle } from '../core/appconfig.mjs';
 
 const STYLE_DIR_ANCHOR = 'templates.style';
@@ -148,7 +149,8 @@ export function createStyleContentHandle({ styleId, title }) {
           { path: st.path, privilege: 'elevated' },
         );
       }
-      fs.writeFileSync(st.path, next, 'utf8');
+      // 原子写（R27）：厂商文件同样是"覆盖写"，失败时不许留下半截 style-<id>.md
+      writeFileAtomic(st.path, next);
       return {
         path: st.path,
         bytes: Buffer.byteLength(next, 'utf8'),

@@ -40,6 +40,7 @@ import { createEngine } from './core/engine.mjs';
 import { configRoot as resolveConfigRoot, storeRoot as resolveStoreRoot, tildify } from './core/paths.mjs';
 import { registerAll } from './handles/index.mjs';
 import { ConsoleError } from './core/errors.mjs';
+import { mapWriteError } from './core/atomic-write.mjs';
 
 /** @param {string[]} argv */
 function parseArgs(argv) {
@@ -597,8 +598,22 @@ main(process.argv.slice(2)).catch((e) => {
     console.error(`❌ [${e.code}] ${e.message}`);
     if (Object.keys(e.detail ?? {}).length) console.error(`   ${JSON.stringify(e.detail)}`);
     process.exitCode = 1;
-  } else {
-    console.error('❌ 未预期的错误：', e);
-    process.exitCode = 1;
+    return;
   }
+  /**
+   * R28：系统 errno **不许**以裸 `Error: ENOSPC …` + 栈的形式丢给用户 ——
+   * 那既不说"文件现在是什么状态"，也不给恢复入口，而用户会默认"失败＝文件没变"。
+   *
+   * 映射表只有一份（`core/atomic-write.mjs` 的 `mapWriteError`），HTTP 与 CLI 共用；
+   * 这里只兜住"没被引擎翻译过"的漏网 errno。
+   */
+  const mapped = mapWriteError(e, { absPath: typeof e?.path === 'string' && e.path ? e.path : undefined });
+  if (mapped) {
+    console.error(`❌ [${mapped.code}] ${mapped.message}`);
+    console.error(`   ${mapped.hint}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.error('❌ 未预期的错误：', e);
+  process.exitCode = 1;
 });

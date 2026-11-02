@@ -20,6 +20,7 @@ import { sha256 } from '../core/backup.mjs';
 import { diffLines } from '../core/diff.mjs';
 import { ConsoleError } from '../core/errors.mjs';
 import { readRules, summarize, promoteRules, writeDomainRules } from '../core/rules.mjs';
+import { writeFileAtomic } from '../core/atomic-write.mjs';
 import { recordAfterWrite, evaluateReadback } from '../verify/readback.mjs';
 
 /**
@@ -158,7 +159,8 @@ export function createRuleDomainHandle({ domain, id, title }) {
       }
       const w = writeDomainRules(cur.text, domain, promoted.rules);
       const afterText = typeof w === 'string' ? w : w.text;
-      fs.writeFileSync(cur.path, afterText, 'utf8');
+      // 原子写（R27）：这是 settings.json —— 截断它等于把整份规则表清零
+      writeFileAtomic(cur.path, afterText);
 
       // 登记"写入后的期望快照"，供重启后回读比对
       recordAfterWrite({

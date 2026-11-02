@@ -2435,6 +2435,320 @@ await atest('C2：applyProfile 多把手求和 —— 任一项估不出则整�
   eq(nullRow.expectedDeltaTokens, null, '台账里也必须是 null（不许只改返回值）');
 });
 
+// ══════════════ WP12 · P3a 收口：写路径原子化 / 报错说得清 / 畸形输入不留孤儿备份（2026-11-02）══════════════
+// 三条残余是一件事：**写入**在三处极端情况下也要说得清 —— 写失败（R27）、盘满（R28）、输入畸形（R31）。
+// 每条断言都做了三证：① 改回缺陷态 → 红；② 正常态 → 绿；③ 删掉被测守卫/调用 → 仍必须红。
+// 三证原始输出见 `.zhll/audit2/gates/WP12/`。
+
+console.log('\n【WP12】P3a 收口：R27 原子写 / R28 写失败文案 / R31 畸形 next 不留孤儿备份');
+
+/**
+ * 可注入的写失败：把 `<目标>.tmp` 占成一个**目录**。
+ *
+ * 为什么用这个姿势：原子写把临时文件建在目标同目录（同卷才能 rename），
+ * 临时名固定为 `<目标>.tmp`；占住它就能在**不动目标文件**的前提下让写盘必失败。
+ * 它同时是 R27 的实验室复现——差别只在真实故障里那一步是 ENOSPC。
+ * @param {string} absPath
+ */
+function injectWriteFailure(absPath) {
+  const tmp = `${absPath}.tmp`;
+  fs.rmSync(tmp, { recursive: true, force: true });
+  ensureDir(tmp);
+  return tmp;
+}
+/** @param {string} tmp */
+function clearInjectedWriteFailure(tmp) { fs.rmSync(tmp, { recursive: true, force: true }); }
+
+await atest('W1（R27）：原子写失败 → 目标字节一个都不动，且不留半截临时文件', async () => {
+  /**
+   * 缺陷态（Lead 实测）：裸 `fs.writeFileSync` 先截断再写，真 ENOSPC 下目标 **42 B → 0 B**，
+   * 原内容在抛错之前就没了。原子写让"失败"变成"目标从未被打开过"。
+   */
+  const { writeFileAtomic } = await import('./core/atomic-write.mjs');
+  const target = path.join(fixtureRoot, 'wp12-atomic.txt');
+  const ORIGINAL = 'X'.repeat(42);
+  fs.rmSync(`${target}.tmp`, { recursive: true, force: true });
+  fs.writeFileSync(target, ORIGINAL, 'utf8');
+  const beforeSha = sha256(fs.readFileSync(target));
+
+  const tmp = injectWriteFailure(target);
+  let threw = null;
+  try { writeFileAtomic(target, 'NEW-CONTENT'); } catch (e) { threw = e; }
+  clearInjectedWriteFailure(tmp);
+
+  ok(threw, '注入的写失败必须抛出，不许静默成功');
+  eq(fs.readFileSync(target, 'utf8'), ORIGINAL,
+    '写失败后目标文件必须逐字节不变（裸 writeFileSync 会先截成 0 B —— 正是实测的 42 B → 0 B）');
+  eq(sha256(fs.readFileSync(target)), beforeSha, 'sha256 也必须一致');
+
+  // 第二半：rename 那一步失败（目标本身是个目录）→ 临时文件必须被清掉
+  const dirTarget = ensureDir(path.join(fixtureRoot, 'wp12-atomic-dir'));
+  fs.rmSync(`${dirTarget}.tmp`, { recursive: true, force: true });
+  let threw2 = null;
+  try { writeFileAtomic(dirTarget, 'NEW'); } catch (e) { threw2 = e; }
+  ok(threw2, 'rename 覆盖一个已存在的目录必须失败（本用例的前提）');
+  ok(!fs.existsSync(`${dirTarget}.tmp`),
+    '失败后不许把临时文件留在目标目录里 —— 那正是"半截文件"留在用户眼前的来源');
+});
+
+await atest('W2（R27）：七处写出点全部走 writeFileAtomic（剥注释后，旧的裸写语句必须消失）', async () => {
+  /**
+   * 「一处实现，六处调用」的另一半：调用点必须**真的**换掉了。
+   *
+   * 这条**不查"源码里有没有这个词"**，而是双向钉：
+   *   · 正向：每个文件里必须出现 `writeFileAtomic(`（删掉调用即红）；
+   *   · 反向：每个文件里**原来的那句裸写必须一字不剩**（改回缺陷态即红）。
+   * 后者是第三证要求的形状：把 `rename` 那步删掉、留在裸 `writeFileSync` 上 → 必须红。
+   *
+   * 第七处（`core/engine.mjs` 的 `restoreBaseline`）不在 brief 的六处名单里，
+   * 但缺陷同型且是控制台「还原」按钮走的路径 —— 一并钉住，并单独标注。
+   */
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const sites = [
+    ['src/handles/identity-file.mjs', 'fs.writeFileSync(abs, next, \'utf8\')'],
+    ['src/handles/json-field.mjs', 'fs.writeFileSync(abs, w.text, \'utf8\')'],
+    ['src/handles/style-file.mjs', 'fs.writeFileSync(st.path, next, \'utf8\')'],
+    ['src/handles/prompt-template.mjs', 'fs.writeFileSync(st.path, next, \'utf8\')'],
+    ['src/handles/rules.mjs', 'fs.writeFileSync(cur.path, afterText, \'utf8\')'],
+    ['src/core/backup.mjs', 'fs.writeFileSync(e.absPath, buf)'],
+    ['src/core/engine.mjs', 'fs.writeFileSync(st.path, entry.content, \'utf8\')'],
+  ];
+  for (const [rel, oldStmt] of sites) {
+    const src = stripJsComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
+    ok(src.includes('writeFileAtomic('), `${rel}：写出点必须调用 writeFileAtomic（否则写失败会把目标截成 0 B）`);
+    ok(!src.includes(oldStmt), `${rel}：旧的裸写语句还在（${oldStmt}）—— 改回缺陷态了`);
+  }
+});
+
+await atest('W3（R27/R28）：真实把手写入失败 → 目标逐字节不变 + 文案说"写入未发生"并带 handle/backupId', async () => {
+  const { WRITE_NOT_HAPPENED } = await import('./core/atomic-write.mjs');
+  const e = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+  const cases = [
+    ['identity-file', 'personalization.soul', `${ORIGINAL_SOUL}\n- WBC-ATOMIC-001\n`, false],
+    ['json-field', 'personalization.tone-style', 'creative', false],
+    ['style-file', 'style.creative', '风格原子写测试内容。\n', true],
+    ['prompt-template', 'prompt.welcomemode-code', '<personal_files_safety>WBC-ATOMIC-001</personal_files_safety>\n', true],
+  ];
+  for (const [label, id, next, confirm] of cases) {
+    const h = registryList().find((x) => x.id === id);
+    ok(h, `${label}：找不到把手 ${id}`);
+    const st = await h.probe(engineB.ctx);
+    const before = fs.readFileSync(st.path);
+    const tmp = injectWriteFailure(st.path);
+    let threw = null;
+    try { await e.apply(id, { next, confirm }); } catch (err) { threw = err; }
+    clearInjectedWriteFailure(tmp);
+
+    ok(threw, `${label}：注入的写失败必须抛出`);
+    ok(String(threw.message).includes(WRITE_NOT_HAPPENED),
+      `${label}：失败文案必须敢说"${WRITE_NOT_HAPPENED}"（原子写之后这是事实），实际：${threw.message}`);
+    ok(String(threw.message).includes(id), `${label}：失败文案必须带 handle id，实际：${threw.message}`);
+    ok(threw.backupId && String(threw.message).includes(threw.backupId),
+      `${label}：异常必须带 backupId 且文案里能看见（用户要能直接复制恢复命令）`);
+    ok(String(threw.message).includes(path.basename(st.path)),
+      `${label}：失败文案必须带目标路径，实际：${threw.message}`);
+    eq(sha256(fs.readFileSync(st.path)), sha256(before),
+      `${label}：写失败后目标必须逐字节不变（曾经的缺陷是"报失败、文件却已经被截断"）`);
+    // 台账里记的也必须是翻译后的码与文案，否则用户从 audit 里读不出文件状态
+    const row = readAudit(store).filter((r) => r.event === 'apply' && r.handle === id && r.status === 'failed').at(-1);
+    ok(row, `${label}：写失败必须留 status:"failed" 台账`);
+    ok(String(row.error?.message ?? '').includes(WRITE_NOT_HAPPENED),
+      `${label}：台账失败行也必须说清文件状态，实际：${JSON.stringify(row.error)}`);
+  }
+});
+
+await atest('W4（R28）：errno 映射层 —— ENOSPC→DISK_FULL + 状态声明；"不是写失败"不许蹭这句话', async () => {
+  /**
+   * 真 ENOSPC 由 Lead 的 VHD 台架跑（`.zhll/audit2/gates/lead/e4-enospc.mjs`）；
+   * 这里把**映射层**单独钉住：同一个 errno 在两处（HTTP/CLI）必须给出同一句话。
+   */
+  const { mapWriteError, writeFailureError, WRITE_NOT_HAPPENED } = await import('./core/atomic-write.mjs');
+  const ATTEMPTED = Symbol.for('wbc.atomicWrite.attempted');
+  const target = path.join(fixtureRoot, 'wp12-map.txt');
+
+  const enospc = mapWriteError(
+    Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC', path: target, [ATTEMPTED]: true }),
+    { handle: 'personalization.soul', absPath: target, backupId: 'bk-wp12-001' },
+  );
+  eq(enospc.code, 'DISK_FULL', `ENOSPC 必须映射成稳定码 DISK_FULL，实际 ${enospc?.code}`);
+  ok(enospc.message.includes(WRITE_NOT_HAPPENED), `ENOSPC 文案必须带状态声明，实际：${enospc.message}`);
+  ok(enospc.message.includes('personalization.soul'), `必须带 handle id，实际：${enospc.message}`);
+  ok(enospc.message.includes('bk-wp12-001'), `必须带 backupId，实际：${enospc.message}`);
+  ok(enospc.message.includes(path.basename(target)), `必须带目标路径，实际：${enospc.message}`);
+
+  // 异常形态：written 必须是 false（与"写已落盘但台账失败"的 written:true 相对）
+  const err = writeFailureError(
+    Object.assign(new Error('EISDIR: illegal operation on a directory'), { code: 'EISDIR', path: target, [ATTEMPTED]: true }),
+    { handle: 'personalization.soul', absPath: target, backupId: 'bk-wp12-002' },
+  );
+  eq(err.written, false, '写失败异常必须标明"写没有发生"（written:false）');
+  eq(err.backupId, 'bk-wp12-002', '异常必须带 backupId');
+  eq(err.errno, 'EISDIR', '未归类的 errno 必须原样保留（不许吞掉真实原因）');
+  ok(err.message.includes(WRITE_NOT_HAPPENED), '未归类 errno 也必须加**同一句**状态声明');
+
+  // 反向（防"硬说"）：**不是**写尝试失败的读错误不许蹭这句话
+  const readErr = Object.assign(new Error('ENOENT: no such file or directory, open'), { code: 'ENOENT', path: target });
+  const mappedRead = mapWriteError(readErr, { absPath: target });
+  ok(mappedRead, 'ENOENT 仍应给出可判定的码（不回归成 INTERNAL）');
+  ok(!mappedRead.message.includes(WRITE_NOT_HAPPENED),
+    `读失败不许说"写入未发生"—— 乱说状态声明就是另一种假装：${mappedRead.message}`);
+});
+
+await atest('W5（R31）：整文件把手收到 0/false/{}/[]/true → INPUT_INVALID，backups/ 条目数不变', async () => {
+  const { listBackups } = await import('./core/backup.mjs');
+  const e = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+  const before = fs.readFileSync(SOUL);
+  const n0 = listBackups(store).length;
+
+  for (const v of [0, false, {}, [], true]) {
+    const nBefore = listBackups(store).length;
+    let threw = null;
+    try { await e.apply('personalization.soul', { next: v }); } catch (err) { threw = err; }
+    ok(threw, `next=${JSON.stringify(v)} 必须被拒（缺陷态：TypeError → code=INTERNAL）`);
+    eq(threw.code, 'INPUT_INVALID',
+      `next=${JSON.stringify(v)} 应回 INPUT_INVALID（内容提供了、形态不对），实际 ${threw?.code}`);
+    eq(listBackups(store).length, nBefore,
+      `next=${JSON.stringify(v)} 被拒时**不许**新增备份 —— 孤儿备份正是 R31 的第二个病`
+      + `（曾经引擎在调 h.apply 之前就把备份建好了）`);
+  }
+  eq(listBackups(store).length, n0, '整轮下来 backups/ 条目数必须完全不变');
+  eq(sha256(fs.readFileSync(SOUL)), sha256(before), '被拒时 SOUL.md 必须逐字节不变');
+
+  // 反向（P1 不变式不许被"修过头"）：显式 `''` 仍是合法的"清空文件"
+  const cleared = await e.apply('personalization.soul', { next: '' });
+  eq(fs.readFileSync(SOUL, 'utf8'), '', '显式空串仍必须能清空文件 —— 那是用户意图，是故意的不便');
+  eq(cleared.noop, undefined, '清空不是 noop（内容确实变了）');
+  fs.writeFileSync(SOUL, before);   // 逐字节复原 fixture
+});
+
+await atest('W6（R31 · HTTP 腿）：畸形 next → 400 INPUT_INVALID 且不留孤儿备份；null/缺键仍 INPUT_MISSING', async () => {
+  /**
+   * 用户真正走的那一层也要钉住（AGENTS.md：同一条契约在 HTTP / 前端 / CLI 三层可能各有绕过路径）。
+   * 缺陷态实测：`POST …/apply` body `{"next":0}` → HTTP 400 但 `code=INTERNAL` + 裸 TypeError，
+   * 且 `backups/` 里多了一份孤儿备份。
+   */
+  const { listBackups } = await import('./core/backup.mjs');
+  const { WRITE_NOT_HAPPENED } = await import('./core/atomic-write.mjs');
+  const app = createConsoleServer({ configRoot: cfg, storeRoot: store });
+  const { port } = await app.listen(0);
+  const base = `http://127.0.0.1:${port}`;
+  const headers = { 'X-WBC-Token': app.token, 'Content-Type': 'application/json' };
+  const post = (p, body) => fetch(`${base}${p}`, { method: 'POST', headers, body: JSON.stringify(body) });
+  const before = fs.readFileSync(SOUL);
+  try {
+    for (const v of [0, false, {}, [], true]) {
+      const n0 = listBackups(store).length;
+      const r = await post('/api/handle/personalization.soul/apply', { next: v });
+      eq(r.status, 400, `next=${JSON.stringify(v)} 必须 400，实际 ${r.status}`);
+      const j = await r.json();
+      eq(j.ok, false, '响应不许是 ok:true');
+      eq(j.error.code, 'INPUT_INVALID', `next=${JSON.stringify(v)} 的错误码应为 INPUT_INVALID，实际 ${j.error.code}`);
+      ok(!/INTERNAL/.test(j.error.code), '不许再回 INTERNAL');
+      eq(listBackups(store).length, n0, `next=${JSON.stringify(v)} 被拒时不许留下孤儿备份`);
+    }
+    eq(sha256(fs.readFileSync(SOUL)), sha256(before), '整轮被拒后 SOUL.md 必须逐字节不变');
+
+    // P1 不变式仍在：null / 缺键 → INPUT_MISSING
+    eq((await (await post('/api/handle/personalization.soul/apply', { next: null })).json()).error.code,
+      'INPUT_MISSING', 'null 仍按"没传"处理');
+    eq((await (await post('/api/handle/personalization.soul/apply', {})).json()).error.code,
+      'INPUT_MISSING', '缺键仍是 INPUT_MISSING');
+    // 显式空串仍放行（不许"修过头"）
+    eq((await post('/api/handle/personalization.soul/apply', { next: '' })).status, 200,
+      '显式 next:"" 仍是合法清空');
+    fs.writeFileSync(SOUL, before);
+
+    // R28 的 HTTP 腿：注入写失败 → 400 + 文案说清文件状态 + 文件不变
+    const tmp = injectWriteFailure(SOUL);
+    const nFail = listBackups(store).length;
+    let jf = null;
+    try {
+      jf = await (await post('/api/handle/personalization.soul/apply', { next: 'WBC-WP12-HTTP-FAIL\n' })).json();
+    } finally { clearInjectedWriteFailure(tmp); }
+    eq(jf.ok, false, '写失败不许回 ok:true');
+    ok(String(jf.error.message).includes(WRITE_NOT_HAPPENED),
+      `HTTP 腿的写失败文案也必须说清文件状态，实际：${jf.error?.message}`);
+    ok(String(jf.error.message).includes('personalization.soul'), 'HTTP 腿文案必须带 handle id');
+    eq(sha256(fs.readFileSync(SOUL)), sha256(before), '写失败后 SOUL.md 必须逐字节不变');
+    eq(listBackups(store).length, nFail + 1,
+      '写失败时备份是**该有的**（铁律 1：先备份后写），与"畸形输入不留孤儿备份"不是一回事');
+  } finally {
+    fs.writeFileSync(SOUL, before);
+    await app.close();
+  }
+});
+
+await atest('W7（R31 · 档位）：手搓档位里的畸形值在建备份之前被拒，backups/ 不变', async () => {
+  /**
+   * 档位对象可以是**手搓**的（`applyProfile` 不做 assertProfile，见 F1 断言的由来），
+   * 所以畸形值这条入口在档位链上同样成立 —— 引擎在 `createBackup` 之前就该拒。
+   */
+  const { listBackups } = await import('./core/backup.mjs');
+  const e = createEngine({ configRoot: cfg, storeRoot: store, appStateProbe: () => false });
+  const before = fs.readFileSync(SOUL);
+  const n0 = listBackups(store).length;
+  let threw = null;
+  try {
+    await e.applyProfile({ id: 'wp12-bad-profile', name: '畸形档位', values: { 'personalization.soul': 0 } });
+  } catch (err) { threw = err; }
+  ok(threw, '手搓档位里的畸形值必须被拒');
+  eq(threw.code, 'INPUT_INVALID', `错误码应为 INPUT_INVALID，实际 ${threw?.code}`);
+  eq(listBackups(store).length, n0, '必须在建备份之前拒掉（否则档位链又造出一份孤儿备份）');
+  eq(sha256(fs.readFileSync(SOUL)), sha256(before), 'SOUL.md 不许变');
+});
+
+await atest('W8（R27 · 还原写回）：还原时写回失败 → 目标不被打断成 0 B，条目错误说清文件状态', async () => {
+  /**
+   * 第七处写出点（`core/backup.mjs` 的 restore 写回）。缺陷态：裸 writeFileSync 先截断 ——
+   * "还原"在半途失败会把用户**当前**的内容清成 0 字节，比不还原更糟。
+   */
+  const { createBackup } = await import('./core/backup.mjs');
+  const { WRITE_NOT_HAPPENED } = await import('./core/atomic-write.mjs');
+  const target = path.join(fixtureRoot, 'wp12-restore-target.txt');
+  const ORIGINAL = 'RESTORE-ORIGINAL-42-BYTES-0123456789\n';
+  const CURRENT = 'RESTORE-CURRENT-DRIFTED-CONTENT-ABCDEF\n';
+  fs.rmSync(target, { force: true });
+  fs.rmSync(`${target}.tmp`, { recursive: true, force: true });
+  fs.writeFileSync(target, ORIGINAL, 'utf8');
+
+  const manifest = createBackup({
+    storeRoot: store, reason: 'wp12 restore atomic', entries: [{ key: 'wp12.restore', absPath: target }],
+  });
+  fs.writeFileSync(target, CURRENT, 'utf8');   // 备份后漂移 → 还原一定会写回
+
+  const tmp = injectWriteFailure(target);
+  let r = null;
+  try { r = engine.restore(manifest.id); } finally { clearInjectedWriteFailure(tmp); }
+
+  eq(fs.readFileSync(target, 'utf8'), CURRENT,
+    '写回失败时目标必须是"还原前的原样"，绝不许是被截断的半截文件');
+  const bad = r.results.find((x) => x.key === 'wp12.restore');
+  eq(bad?.ok, false, '该条目必须记为失败');
+  ok(String(bad.error?.message ?? '').includes(WRITE_NOT_HAPPENED),
+    `条目错误必须说清文件状态，实际：${JSON.stringify(bad.error)}`);
+  eq(r.status, 'failed', `整体 status 应为 failed（实际 ${r.status}）`);
+  const row = readAudit(store).filter((x) => x.event === 'restore' && x.backupId === manifest.id).at(-1);
+  eq(row.status, 'failed', '台账同样必须如实记 failed');
+  ok(String(row.failed?.[0]?.message ?? '').includes(WRITE_NOT_HAPPENED), '台账失败明细里也要有状态声明');
+});
+
+await atest('W9（R28）：errno 映射**只有一份** —— HTTP 不再自带 ENOSPC 分支，CLI 也调同一个函数', async () => {
+  /**
+   * 曾经：`server.mjs` 独占一份 `DISK_FULL` 映射，CLI 什么都没有 ——
+   * 同一个 ENOSPC，浏览器里是一句人话，命令行里是裸 `Error: ENOSPC …` + 栈。
+   * 这条钉住"同一层只留一份"：删掉任一侧的调用/守卫即红。
+   */
+  const { fileURLToPath } = await import('node:url');
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = stripJsComments(fs.readFileSync(path.join(repoRoot, 'src/server.mjs'), 'utf8'));
+  const cli = stripJsComments(fs.readFileSync(path.join(repoRoot, 'src/cli.mjs'), 'utf8'));
+  ok(server.includes('mapWriteError('), 'HTTP 腿必须调共享的 mapWriteError');
+  ok(!server.includes('ENOSPC'),
+    'HTTP 腿不许再自带 errno 分支（映射表只留一份，反例就是曾经那句 DISK_FULL）');
+  ok(cli.includes('mapWriteError('), 'CLI 腿必须调共享的 mapWriteError（曾经它连一句话都没有）');
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

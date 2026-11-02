@@ -129,3 +129,100 @@ test('CLI apply --json：noop 的机器可读输出必须 noop:true / backupId:n
     fs.rmSync(f.root, { recursive: true, force: true });
   }
 });
+
+/**
+ * 注入一次**可复现的写失败**：把 `<目标>.tmp` 占成一个目录。
+ *
+ * 原子写把临时文件建在目标同目录（同卷才能原子 rename），临时名固定为 `<目标>.tmp`；
+ * 占住它就能在**不动目标文件**的前提下让写盘必失败 —— 与真 ENOSPC 是同一段代码路径，
+ * 差别只在 errno（真盘满由 Lead 的 64 MB VHD 台架跑）。
+ * @param {string} absPath
+ */
+function injectWriteFailure(absPath) {
+  const tmp = `${absPath}.tmp`;
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp);
+  return tmp;
+}
+
+test('CLI apply：写盘失败 → 非零退出，文案说清"写入未发生"并给 backupId/恢复命令，文件逐字节不变', () => {
+  /**
+   * R27/R28 的用户面。缺陷态（Lead 实测）：
+   *   ① 裸 `fs.writeFileSync` 先截断再写 → 真 ENOSPC 下 SOUL.md 42 B → 0 B；
+   *   ② CLI 只打裸 `Error: ENOSPC …` + 栈（含本机绝对路径），**不说文件现在是什么状态**、
+   *      不给 backupId、不给恢复命令 —— 用户会以为"失败＝文件没变"，而事实相反。
+   */
+  const f = mkFixture();
+  const env = {
+    WORKBUDDY_CONSOLE_HOME: path.join(f.root, 'home'),
+    WORKBUDDY_BASELINES_DIR: path.join(f.root, 'baselines'),
+  };
+  try {
+    const before = fs.readFileSync(f.soul);
+    const tmp = injectWriteFailure(f.soul);
+    let r;
+    try {
+      r = runCli(applyArgs(f), env);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+
+    assert.notEqual(r.status, 0, `写失败必须非零退出（实际 ${r.status}）：${out}`);
+    assert.match(out, /写入未发生，目标文件未被修改/,
+      `文案必须敢说"写入未发生，目标文件未被修改"（原子写之后这是事实）：${out}`);
+    assert.match(out, /personalization\.soul/, `文案必须带 handle id：${out}`);
+    const backup = /备份 id ([0-9A-Za-z:\-]+)/.exec(out) ?? /备份 ([0-9A-Za-z:\-]+)/.exec(out);
+    assert.ok(backup, `文案必须带 backupId（用户要知道去哪还原）：${out}`);
+    assert.match(out, new RegExp(`restore ${backup[1]}`),
+      `必须给出可直接复制的恢复命令：${out}`);
+    assert.doesNotMatch(out, /✅ 已写入/, `失败时绝不许打印"已写入"：${out}`);
+    assert.doesNotMatch(out, /\n\s+at [\w.$]+ \(/,
+      `不许把裸堆栈丢给用户（曾经就是它掩盖了"文件已被截断"这件事）：${out}`);
+    assert.ok(before.equals(fs.readFileSync(f.soul)),
+      '写失败后目标文件必须逐字节不变（缺陷态是被截成 0 字节）');
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('CLI restore：还原写回失败 → 该条目说清文件状态，目标不被截断成半截文件', () => {
+  /**
+   * 第七处写出点（`core/backup.mjs` 的 restore 写回）。缺陷态：裸 writeFileSync 先截断 ——
+   * "还原"在半途失败会把用户**当前**的内容清成 0 字节，比不还原更糟。
+   */
+  const f = mkFixture();
+  const env = {
+    WORKBUDDY_CONSOLE_HOME: path.join(f.root, 'home'),
+    WORKBUDDY_BASELINES_DIR: path.join(f.root, 'baselines'),
+  };
+  try {
+    // 先真写一次，拿到一份覆盖 SOUL.md 的备份
+    const first = runCli(applyArgs(f), env);
+    assert.equal(first.status, 0, `前提：第一次 apply 应成功：${first.stderr ?? ''}`);
+    const id = /备份 ([0-9A-Za-z:\-]+)/.exec(first.stdout)?.[1];
+    assert.ok(id, `前提：必须拿到备份 id：${first.stdout}`);
+
+    // 备份之后再漂移一次 → 还原一定会尝试写回
+    const drifted = `${NEXT_TEXT}- 漂移：WBC-CLI-RESTORE-ATOMIC-001\n`;
+    fs.writeFileSync(f.soul, drifted, 'utf8');
+
+    const tmp = injectWriteFailure(f.soul);
+    let r;
+    try {
+      r = runCli(['restore', id, '--confirm', '--root', f.cfg, '--store', f.store], env);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+
+    assert.notEqual(r.status, 0, `还原失败必须非零退出（实际 ${r.status}）：${out}`);
+    assert.match(out, /写入未发生，目标文件未被修改/,
+      `条目错误必须说清"文件现在是什么状态"：${out}`);
+    assert.match(out, /status=failed|部分失败|还原失败/, `必须如实报失败：${out}`);
+    assert.equal(fs.readFileSync(f.soul, 'utf8'), drifted,
+      '写回失败时目标必须是"还原前的原样"，绝不许是被截断的半截文件');
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});

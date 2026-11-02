@@ -17,6 +17,7 @@ import { createEngine } from './core/engine.mjs';
 import { registerAll } from './handles/index.mjs';
 import { configRoot as resolveConfigRoot, storeRoot as resolveStoreRoot, tildify } from './core/paths.mjs';
 import { ConsoleError } from './core/errors.mjs';
+import { mapWriteError } from './core/atomic-write.mjs';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -213,11 +214,14 @@ export function createConsoleServer({ configRoot, storeRoot, version, isolatedBa
          *
          * 现在只认"键真的存在"：
          *   - 键缺失 → 传 `undefined`，交给引擎抛 `INPUT_MISSING`；
-         *   - 显式 `''` / `0` / `false` → 原样传（它们是合法写入值，不许误伤，
-         *     清空文件必须走显式 `next:""`，这是故意的`不便`）；
-         *   - JSON 的 `null` → 也按"没传"拒绝。没有任何把手认 null 作为写入值
-         *     （`identity-file` 的 `truncateToInjectionLimit` 会把非字符串当空文本），
-         *     此前 `?? ''` 同样把它变成空串 —— 那正是"清空文件"这条路。
+         *   - 显式 `''` → 原样传（清空文件**唯一**的合法写法，故意的不便）；
+         *   - `0` / `false` / `{}` / `[]` / `true` → 也原样传，但**不再**当成什么合法写入值：
+         *     对**整文件把手**它们没有意义（`identity-file` 的 `truncateToInjectionLimit`
+         *     会把非字符串当空文本），引擎会在**建备份之前**按把手类型拒成 `INPUT_INVALID`。
+         *     ⚠️ 这里曾经写着「显式 `''`/`0`/`false` 是合法写入值」——对整文件把手是**错的**：
+         *     它们换不来一次成功的写入，只会换回一个 TypeError **加一份孤儿备份**（R31）。
+         *     HTTP 层不做类型判断（哪些值合法是**把手**的知识，不是传输层的）；
+         *   - JSON 的 `null` → 按"没传"拒绝。没有任何把手认 null 作为写入值。
          */
         const hasNext = Object.prototype.hasOwnProperty.call(body, 'next');
         return engine.apply(id, {
@@ -321,31 +325,18 @@ export function createConsoleServer({ configRoot, storeRoot, version, isolatedBa
 
   /**
    * 把 Node 的系统错误翻译成"用户能据此行动"的错误码。
+   *
+   * ⚠️ 映射表**只有一份**（R28）：实现在 `core/atomic-write.mjs` 的 `mapWriteError`，
+   * HTTP 与 CLI 都调它。曾经这里独占一份 `DISK_FULL` 映射，而 CLI 什么都没有 ——
+   * 同一个 ENOSPC，浏览器里是一句人话，命令行里是裸 `Error: ENOSPC …` + 栈。
+   *
    * @param {any} e
    * @returns {{code:string, message:string, hint:string}|null}
    */
   function mapSystemError(e) {
-    const errno = String(e?.code ?? '');
-    const p = String(e?.path ?? '');
-    const where = p ? `（${p}）` : '';
-    if (errno === 'EPERM' || errno === 'EACCES') {
-      return {
-        code: 'PERMISSION_DENIED',
-        message: `没有权限写入${where}`,
-        hint: '目标可能在受保护目录（如 Program Files），或文件被 WorkBuddy / 安全软件占用。'
-          + '厂商文件需要管理员权限；用户目录下的文件通常是 WorkBuddy 运行中锁住了。',
-      };
-    }
-    if (errno === 'ENOENT') {
-      return { code: 'NOT_FOUND_PATH', message: `目标路径不存在${where}`, hint: '锚点可能失效（WorkBuddy 升级换了目录）——去「守护」页看漂移。' };
-    }
-    if (errno === 'EBUSY' || errno === 'ETXTBSY') {
-      return { code: 'FILE_BUSY', message: `文件被占用${where}`, hint: '先退出 WorkBuddy 再试。' };
-    }
-    if (errno === 'ENOSPC') {
-      return { code: 'DISK_FULL', message: '磁盘空间不足', hint: '清理磁盘后重试。' };
-    }
-    return null;
+    return mapWriteError(e, {
+      absPath: typeof e?.path === 'string' && e.path ? e.path : undefined,
+    });
   }
 
   return {

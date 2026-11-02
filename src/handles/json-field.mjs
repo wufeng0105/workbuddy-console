@@ -16,6 +16,7 @@ import { estimateTokens, estimateCost } from '../core/tokens.mjs';
 import { diffLines, renderDiff } from '../core/diff.mjs';
 import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 import { InvalidValueError } from '../core/errors.mjs';
+import { writeFileAtomic } from '../core/atomic-write.mjs';
 
 /** @param {string} s */
 function escapeRx(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -276,7 +277,8 @@ export function createJsonFieldHandle({
           { field: pathLabel, path: abs },
         );
       }
-      fs.writeFileSync(abs, w.text, 'utf8');
+      // 原子写（R27）：最小改动写入也必须原子落盘，否则 ENOSPC 会把整篇 app-config.json 截成 0 字节
+      writeFileAtomic(abs, w.text);
       return { path: abs, bytes: Buffer.byteLength(w.text, 'utf8'), writeMode: w.mode, value: next };
     },
 

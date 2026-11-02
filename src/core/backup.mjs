@@ -11,6 +11,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { backupsDir, stateDir, ensureDir, tildify } from './paths.mjs';
 import { BackupMissingError, IntegrityError } from './errors.mjs';
+import { writeFileAtomic, mapWriteError } from './atomic-write.mjs';
 
 /** @param {Buffer|string} data */
 export function sha256(data) {
@@ -183,7 +184,9 @@ export function restoreBackup({ storeRoot, id, dryRun = false }) {
       if (!dryRun && drift) {
         saveCurrent(e.key, e.absPath);       // **覆盖前留副本**
         ensureDir(path.dirname(e.absPath));
-        fs.writeFileSync(e.absPath, buf);
+        // 原子写（R27）：还原写回同样是覆盖写；失败时目标必须是"还原前的原样"，
+        // 不能是"被截断成 0 字节的半截文件"（那等于还原把文件弄丢了）
+        writeFileAtomic(e.absPath, buf);
       }
       results.push({
         key: e.key,
@@ -196,12 +199,19 @@ export function restoreBackup({ storeRoot, id, dryRun = false }) {
       });
     } catch (err) {
       // 逐条目容错：一条失败继续下一条，失败原样带回（供 engine 写 status:'partial'）
+      //
+      // ⚠️ 写失败的文案必须说清"文件现在是什么状态"（R28）：走原子写之后，
+      //    「写入未发生，目标文件未被修改」是**事实**；这里与 CLI/HTTP 共用同一份映射，
+      //    不再各自打一句裸 errno。非系统错误（如 ERR_FS_EISDIR）保持原样。
+      const mapped = mapWriteError(err, { absPath: e.absPath });
       results.push({
         key: e.key,
         absPath: tildify(e.absPath),
         action: 'error',
         ok: false,
-        error: { code: err?.code ?? 'ERR', message: err?.message ?? String(err) },
+        error: mapped
+          ? { code: mapped.code, message: mapped.message, hint: mapped.hint, errno: err?.code ?? null }
+          : { code: err?.code ?? 'ERR', message: err?.message ?? String(err) },
       });
     }
   }

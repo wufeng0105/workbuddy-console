@@ -16,6 +16,7 @@ import { appendAudit, readAudit } from './audit.mjs';
 import { diffLines, renderDiff } from './diff.mjs';
 import { estimateCost } from './tokens.mjs';
 import { ConfirmationRequiredError, GateBlockedError, ConsoleError } from './errors.mjs';
+import { writeFileAtomic, mapWriteError, isWriteFailure, writeFailureError } from './atomic-write.mjs';
 import * as registry from './registry.mjs';
 import { isWorkBuddyRunning } from './appstate.mjs';
 import { readActiveToneStyle } from './appconfig.mjs';
@@ -29,6 +30,39 @@ import { previewApproval, findApprovalLevel, combineVerdicts, APPROVAL_LEVELS } 
 import { applyLevel, detectLevel } from './safety-block.mjs';
 import { readRules } from './rules.mjs';
 import { tildify, backupsDir } from './paths.mjs';
+
+/**
+ * 整文件把手的 `next` 必须是**字符串**（R31）。
+ *
+ * 为什么必须显式拦：`0 / false / {} / [] / true` 这类 JSON 值到把手层会变成
+ * `TypeError`（或 `[object Object]`）—— 引擎把它包成 `code=INTERNAL` + 裸堆栈；
+ * 更糟的是**备份已经建好了**：文件一个字节没变，`backups/` 里却留下一份孤儿备份。
+ * 用户看到"内部错误"，去查备份还会以为自己改成功过。
+ *
+ * 语义选择 `INPUT_INVALID` 而不是 `INPUT_MISSING`：
+ *   `INPUT_MISSING` 的含义是"**没有**提供写入内容"（键缺失 / JSON `null`），
+ *   这里内容**提供了**，只是形态不是这个把手能写的。报 MISSING 会把用户引向
+ *   "我是不是忘了传参数"，而真正的问题是"我传错了类型"。
+ *
+ * `''`（显式空串）仍然放行 —— 那是"清空文件"的合法意图，是故意的不便（P1 不变式）。
+ *
+ * @param {object} h @param {any} next
+ */
+function assertWholeFileInput(h, next) {
+  if (h.writesWholeFile !== true) return;
+  if (typeof next === 'string') return;
+  const shape = next === null ? 'null'
+    : Array.isArray(next) ? '数组'
+      : typeof next === 'object' ? '对象'
+        : `${typeof next}（${JSON.stringify(next)}）`;
+  throw new ConsoleError(
+    'INPUT_INVALID',
+    `「${h.title}」是整文件写入的把手，next 必须是字符串，收到 ${shape}。`
+    + `拒绝执行：**未建立备份、未改动文件**。`
+    + `\n  要清空文件请显式传空字符串 ""；结构化值（0 / false / {} / [] / true）对这个把手没有意义。`,
+    { handle: h.id, received: shape, writesWholeFile: true },
+  );
+}
 
 /** @param {object} h */
 function meta(h) {
@@ -211,6 +245,17 @@ export function createEngine({
       );
     }
 
+    /**
+     * R31：畸形 `next`（`0 / false / {} / [] / true`）必须在**建备份之前**拒掉。
+     *
+     * 曾经：引擎先把备份建好，再调 `h.apply` —— 把手层一个 `TypeError` 抛出来，
+     * HTTP 回 400 但 `code=INTERNAL` + 裸堆栈，而 `backups/` 里**已经多了一份孤儿备份**。
+     * 用户以为改成功了/以为留下了一份可还原的快照，其实两边都不是。
+     *
+     * 位置很关键：**在 `createBackup` 之上**。这里拒绝 = 副作用为零（文件未变、无备份、无台账）。
+     */
+    assertWholeFileInput(h, next);
+
     const g = gateCheck(h);
     if (g.blocked) throw new GateBlockedError(g.reason, { handle: h.id, gate: g.kind });
     if (h.writeClass === 'vendor-file' && !confirm) {
@@ -344,6 +389,17 @@ export function createEngine({
       written = await h.apply(ctx, { next });
     } catch (e) {
       /**
+       * 写失败的文案必须说清"文件现在是什么状态"（R28）。
+       *
+       * 原子写带来一个新事实：**写失败 ⇒ 目标文件必然没被改过**。所以这里把裸 errno
+       * 翻译成稳定码，并把这句话、handle id、目标路径、backupId 一起说出来。
+       * 曾经 CLI 只打裸 `Error: ENOSPC …` + 栈，用户会以为"失败＝文件没变"——
+       * 而当时的事实**正相反**（裸 writeFileSync 已把目标截断成 0 字节）。
+       */
+      const mapped = isWriteFailure(e)
+        ? writeFailureError(e, { handle: h.id, absPath: anchor.path, backupId: manifest.id })
+        : e;
+      /**
        * 失败台账：**审计再失败也不许顶掉真实原因**（F6 的"二次伤害"）。
        * 曾经 `store/state` 与目标文件同时不可写时，用户看到的是审计的 EEXIST，
        * 而真正该看的 EPERM 被吃掉了。
@@ -361,13 +417,14 @@ export function createEngine({
           actor,
           changed: false,
           status: 'failed',
-          error: { code: e.code ?? 'ERR', message: e.message },
+          // 台账里也必须是**翻译后**的码与文案（否则用户从 audit 里读不出文件状态）
+          error: { code: mapped?.code ?? 'ERR', message: mapped?.message },
           reason: reason ?? `apply ${h.id}`,
         });
       } catch { /* 保留原始异常 e：它才是用户要看的失败原因 */ }
       // 把备份 id 带进异常，让调用方知道"有一份备份，可以还原"
       if (e && typeof e === 'object') e.backupId = manifest.id;
-      throw e;
+      throw mapped;
     }
 
     const after = fs.existsSync(anchor.path) ? fs.readFileSync(anchor.path, 'utf8') : '';
@@ -675,10 +732,13 @@ export function createEngine({
         );
       }
       const anchor = anchorFor(h);
+      // R31：档位对象可以是**手搓**的（不做 assertProfile，见 F1 断言的由来）——
+      // 畸形值同样必须在建备份之前拒掉，否则又会留下一份孤儿备份
+      assertWholeFileInput(h, next);
       targets.set(anchor.path, { key: anchor.key ?? h.target, absPath: anchor.path });
       const pv = await h.preview(ctx, { next });
       previews.push({ handle: hid, expectedDeltaTokens: pv.expectedDeltaTokens ?? null, warnings: pv.warnings ?? [] });
-      planned.push({ h, next });
+      planned.push({ h, next, anchor });
     }
 
     // 铁律 1：**先**一次备份覆盖全部目标，再动任何一个
@@ -694,11 +754,13 @@ export function createEngine({
     // 逐项 try/catch：中途失败时，前面已落盘的写入**必须**在审计里留下记录。
     // 否则会出现"孤儿备份 + 无台账"——用户看不到自己有东西处于半写状态。
     // 这与 replay() 的纪律一致：先记录发生了什么，再报告成败。
-    for (const { h, next } of planned) {
+    for (const { h, next, anchor } of planned) {
       try {
         written.push({ handle: h.id, ...(await h.apply(ctx, { next })) });
       } catch (e) {
-        failed.push({ handle: h.id, code: e.code ?? 'ERR', message: e.message });
+        // 写失败同样要说清文件状态（R28）：与单把手 apply 共用同一份 errno 映射
+        const m = mapWriteError(e, { handle: h.id, absPath: anchor?.path, backupId: manifest.id });
+        failed.push({ handle: h.id, code: m?.code ?? e.code ?? 'ERR', message: m?.message ?? e.message });
       }
     }
 
@@ -856,8 +918,10 @@ export function createEngine({
         );
       }
       const anchor = anchorFor(h);
+      // R31：重放包是磁盘上的 JSON，可能被改坏 —— 畸形内容同样在备份之前拒掉
+      assertWholeFileInput(h, entry.content);
       backups.set(anchor.path, { key: anchor.key ?? h.target, absPath: anchor.path });
-      plan.push({ h, next: entry.content });
+      plan.push({ h, next: entry.content, anchor });
     }
 
     if (plan.length === 0) {
@@ -872,12 +936,14 @@ export function createEngine({
     });
 
     const replayed = [];
-    for (const { h, next } of plan) {
+    for (const { h, next, anchor } of plan) {
       try {
         const r = await h.apply(ctx, { next });
         replayed.push({ handle: h.id, ok: true, ...r });
       } catch (e) {
-        replayed.push({ handle: h.id, ok: false, error: `${e.code ?? 'ERR'}: ${e.message}` });
+        // 写失败要说清文件状态（R28）：与 apply / applyProfile 共用同一份 errno 映射
+        const m = mapWriteError(e, { handle: h.id, absPath: anchor?.path, backupId: manifest.id });
+        replayed.push({ handle: h.id, ok: false, error: `${m?.code ?? e.code ?? 'ERR'}: ${m?.message ?? e.message}` });
       }
     }
 
@@ -1529,7 +1595,9 @@ export function createEngine({
     try {
       if (entry.kind === 'file') {
         if ((st.text ?? '') !== entry.content) {
-          fs.writeFileSync(st.path, entry.content, 'utf8');
+          // 原子写（R27 的第 7 处，brief 未列）：控制台「还原」按钮走的正是这条路，
+          // 裸 writeFileSync 在 ENOSPC 下会先把目标截断成 0 字节 —— 与那六处是同一个缺陷。
+          writeFileAtomic(st.path, entry.content);
           changed = true;
         }
       } else {
@@ -1542,6 +1610,10 @@ export function createEngine({
         }
       }
     } catch (e) {
+      // 写失败要说清文件状态（R28）：与 apply / replay / 还原同一条映射
+      const mapped = isWriteFailure(e)
+        ? writeFailureError(e, { handle: id, absPath: st.path, backupId: manifest.id })
+        : e;
       // 审计再失败也不许顶掉真实原因（F6 的"二次伤害"）
       try {
         appendAudit(storeRoot, {
@@ -1554,12 +1626,12 @@ export function createEngine({
           actor,
           changed: false,
           status: 'failed',
-          error: { code: e.code ?? 'ERR', message: e.message },
+          error: { code: mapped?.code ?? 'ERR', message: mapped?.message },
           reason: 'restore-baseline',
         });
       } catch { /* 保留原始异常 e */ }
       if (e && typeof e === 'object') e.backupId = manifest.id;
-      throw e;
+      throw mapped;
     }
 
     /** 写已经落盘，台账这一笔必须受保护（F6） */

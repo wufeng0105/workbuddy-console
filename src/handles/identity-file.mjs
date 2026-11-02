@@ -19,6 +19,7 @@ import { sha256 } from '../core/backup.mjs';
 import { estimateTokens, estimateCost } from '../core/tokens.mjs';
 import { diffLines, renderDiff } from '../core/diff.mjs';
 import { ConsoleError } from '../core/errors.mjs';
+import { writeFileAtomic } from '../core/atomic-write.mjs';
 import { evaluateTokenDelta } from '../verify/token-delta.mjs';
 
 /** 身份文件注入上限（字符）。证据：authority-snapshot.js:53 `Ls=1e4` */
@@ -138,7 +139,8 @@ export function createIdentityFileHandle({ id, title, anchorKey, modeAvailabilit
       const { path: abs } = ctx.resolve(this.target);
       const clipped = truncateToInjectionLimit(next);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, next, 'utf8');
+      // 原子写（R27）：裸 writeFileSync 会先把目标截断成 0 字节，真 ENOSPC 下原内容当场就没了
+      writeFileAtomic(abs, next);
       return {
         path: abs,
         bytes: Buffer.byteLength(next, 'utf8'),
