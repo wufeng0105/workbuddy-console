@@ -2909,6 +2909,58 @@ await atest('W13（R27 · 临时名契约）：同一目标的两次取值必须
     '旧的固定名 `<目标>.tmp` **不许**被认成合法临时名（否则清理会误删别人留下的东西）');
 });
 
+console.log('\n【R39】隔离一致性：--root 只换配置树，厂商面另有一棵树');
+
+await atest('I1（R39）：厂商面的合法落点是**两棵树**，两棵都不在才算"逃逸"', async () => {
+  /**
+   * 这条钉的是判据本身。第一版写成"不在配置根下就算逃逸"——**错的**：
+   * 7 个 `style-*.md` 按设计就住在独立的安装树里，而 3 个 `prompt.tpl` 住在配置树的插件缓存里。
+   * 那条判据会把**正确隔离**也报成不一致（实测：给了 INSTALL_DIR 指向镜像，仍报 7 个不一致）。
+   * 正确判据：落在**配置根**或**你指定的安装根**任意一棵里 = 隔离住了；两棵都不在 = 指向真实安装目录。
+   */
+  const { findVendorEscapes } = await import('./core/isolation.mjs');
+  const cfgRoot = path.join(fixtureRoot, 'r39-cfg');
+  const installRoot = path.join(fixtureRoot, 'r39-install');
+  const realInstallStyle = 'C:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\resources\\templates\\style';
+  const handles = [
+    // 落在**你指定的安装根**里 → 隔离住了
+    { id: 'style.isolated', writeClass: 'vendor-file', anchorPath: path.join(installRoot, 'resources', 'app.asar.unpacked', 'resources', 'templates', 'style', 'style-isolated.md') },
+    // 落在**真实安装目录**（两棵树都不在）→ 逃逸
+    { id: 'style.escaped', writeClass: 'vendor-file', anchorPath: path.join(realInstallStyle, 'style-escaped.md') },
+    // 落在**配置树**的插件缓存里 → 合法（prompt.tpl 按设计就住这儿）
+    { id: 'prompt.in-config', writeClass: 'vendor-file', anchorPath: path.join(cfgRoot, 'plugins', 'cache', 'builtin', 'welcomemode-code', '5.9.3', 'prompt.tpl') },
+    // 非厂商面 → 永远不参与
+    { id: 'personalization.soul', writeClass: 'user-data', anchorPath: path.join(cfgRoot, 'user-x', 'SOUL.md') },
+  ];
+
+  // ① 给了**正确的**安装根：只有真机那个逃逸，隔离住的那个不算 —— 这条就是第一版会红的地方
+  const withRoot = findVendorEscapes(handles, { configRoot: cfgRoot, installRoot });
+  eq(withRoot.map((e) => e.id).join(','), 'style.escaped',
+    `给了正确安装根时只该报真机那个，实际：${withRoot.map((e) => e.id).join(',') || '（无）'}`);
+  eq(withRoot[0].reason, 'outside-both-roots', '给了安装根时的原因码');
+
+  // ② 没给安装根：安装树里的两个都隔离不了；配置树里的 prompt 与非厂商面**都不该混进来**
+  const noRoot = findVendorEscapes(handles, { configRoot: cfgRoot, installRoot: null });
+  eq(noRoot.map((e) => e.id).sort().join(','), 'style.escaped,style.isolated',
+    `没给安装根时安装树里的两个都该报，实际：${noRoot.map((e) => e.id).join(',') || '（无）'}`);
+  ok(!noRoot.some((e) => e.id === 'prompt.in-config'),
+    '配置树里的厂商面（prompt.tpl）**不该**被当成逃逸 —— 它本来就在配置树里');
+  ok(!noRoot.some((e) => e.id === 'personalization.soul'), '非厂商面（user-data）永远不参与');
+  ok(noRoot.every((e) => e.reason === 'no-install-root'), '没给安装根时的原因码');
+});
+
+await atest('I2（R39）：只在"你显式给了 --root"时才提示 —— 默认根下写真机是**正确**行为，不许当噪音', async () => {
+  const { isolationWarning } = await import('./core/isolation.mjs');
+  const escapes = [{ id: 'style.a', path: 'C:\\Program Files\\WorkBuddy\\x\\style-a.md', reason: 'no-install-root' }];
+
+  eq(isolationWarning({ escapes, configRoot: 'C:\\cfg', installRoot: null, requestedRoot: null }), null,
+    '没给 --root 时必须**一个字都不提示**（那时写真实安装目录是正确行为，提示会变噪音）');
+  eq(isolationWarning({ escapes, configRoot: 'C:\\cfg', installRoot: null, requestedRoot: 'C:\\mirror' })?.length > 0, true,
+    '给了 --root 且厂商面逃逸时必须有内容');
+  eq(isolationWarning({ escapes: [], configRoot: 'C:\\cfg', installRoot: 'D:\\inst', requestedRoot: 'C:\\mirror' }), null,
+    '给了 --root 但厂商面都被隔离住时，不该提示');
+});
+
 // ══════════════ 汇总 ══════════════
 console.log('\n────────────────────────────────');
 console.log(`通过 ${pass}   失败 ${fail}`);

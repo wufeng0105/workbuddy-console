@@ -28,6 +28,9 @@
  *
  * 全局参数：
  *   --root  <dir>   WorkBuddy 配置根（默认 ~/.workbuddy；可用 WORKBUDDY_CONFIG_DIR）
+ *                   ⚠️ 它**只换配置那棵树**：厂商面（7 个 style.*）另有一棵安装树，
+ *                      由 WORKBUDDY_CONSOLE_INSTALL_DIR 单独决定。只想隔离配置面就够；
+ *                      要**整套**隔离，两者都要给，否则 style.* 仍写真实 Program Files（残余 R39）。
  *   --store <dir>   本工具数据目录（默认 ~/.workbuddy-console，可用 WORKBUDDY_CONSOLE_HOME）
  *   --version <v>   覆盖版本探测
  *   --json          机器可读输出
@@ -38,6 +41,7 @@ import process from 'node:process';
 import fs from 'node:fs';
 import { createEngine } from './core/engine.mjs';
 import { configRoot as resolveConfigRoot, storeRoot as resolveStoreRoot, tildify } from './core/paths.mjs';
+import { findVendorEscapes, isolationWarning, requestedInstallRoot } from './core/isolation.mjs';
 import { registerAll } from './handles/index.mjs';
 import { ConsoleError } from './core/errors.mjs';
 import { mapWriteError } from './core/atomic-write.mjs';
@@ -118,6 +122,20 @@ async function main(argv) {
   const json = f.json === true;
 
   const configRoot = resolveConfigRoot(typeof f.root === 'string' ? f.root : undefined);
+
+  /**
+   * 隔离警告（残余 R39）：`--root` 只换**配置**那棵树，厂商面（7 个 `style.*`）仍指向**真实安装目录**。
+   *
+   * 只在用户**显式给了 `--root`**（意图＝隔离）时才提示；默认根下写真实安装目录是正确行为，提示会变噪音。
+   * 为什么必须说：这个不一致是**静默**的——厂商把手照样报 `writeAccess: true`，
+   * 一次 `apply style.* --confirm` 就把真机 Program Files 里的文件改了，而用户以为在隔离环境里。
+   */
+  const isolationLines = (onlyHandleId) => {
+    const installRoot = requestedInstallRoot();
+    const all = findVendorEscapes(engine.doctor().handles, { configRoot, installRoot });
+    const escapes = onlyHandleId ? all.filter((e) => e.id === onlyHandleId) : all;
+    return isolationWarning({ escapes, configRoot, installRoot, requestedRoot: typeof f.root === 'string' ? f.root : null });
+  };
   const storeRoot = resolveStoreRoot(typeof f.store === 'string' ? f.store : undefined);
   registerAll();
 
@@ -131,7 +149,8 @@ async function main(argv) {
   switch (cmd) {
     case 'doctor': {
       const d = engine.doctor();
-      if (json) return out(d, true);
+      const iso = isolationLines(null);
+      if (json) return out({ ...d, isolation: iso ? { ok: false, warnings: iso } : { ok: true } }, true);
       console.log(`WorkBuddy ${d.version}   （锚点表 ${tildify(d.tableFile)}）`);
       console.log(`配置根 ${d.configRoot}\n数据目录 ${d.storeRoot}\n`);
       console.log('锚点：');
@@ -142,8 +161,9 @@ async function main(argv) {
         console.log(`      锚点 ${h.anchorPath ?? h.error}`);
         console.log(`      验证 ${h.verification.strategy} @ ${h.verification.channel}`);
       }
-      console.log(`\n总判：${d.ok ? '✅ 全部通过' : '❌ 有问题'}`);
-      return process.exitCode = d.ok ? 0 : 1;
+      if (iso) { console.log(''); for (const l of iso) console.log(l); }
+      console.log(`\n总判：${d.ok && !iso ? '✅ 全部通过' : (d.ok ? '❌ 锚点通过，但隔离不一致（见上）' : '❌ 有问题')}`);
+      return process.exitCode = (d.ok && !iso) ? 0 : 1;
     }
 
     case 'list': {
@@ -192,6 +212,7 @@ async function main(argv) {
       for (const w of (p.preview.warnings ?? [])) console.log(`⚠️  ${w}`);
       for (const w of p.gate.warnings) console.log(`⚠️  ${w}`);
       if (p.needsConfirm) console.log('⚠️  这是厂商文件写入，必须显式 --confirm');
+      { const iso = isolationLines(f._[1]); if (iso) { console.log(''); for (const l of iso) console.log(l); } }
       return undefined;
     }
 
@@ -217,6 +238,8 @@ async function main(argv) {
         );
       }
       const next = readNextFor(f.set, h?.inputKind);
+      // 写之前就把"这次会写到哪棵树"说清楚（残余 R39）；默认根下无内容、不打扰
+      { const iso = isolationLines(f._[1]); if (iso) { console.log(''); for (const l of iso) console.log(l); console.log(''); } }
       const r = await engine.apply(f._[1], { next, confirm: f.confirm === true, reason: typeof f.reason === 'string' ? f.reason : undefined });
       if (json) return out(r, true);
       if (r.noop) {

@@ -18,6 +18,7 @@ import { registerAll } from './handles/index.mjs';
 import { configRoot as resolveConfigRoot, storeRoot as resolveStoreRoot, tildify } from './core/paths.mjs';
 import { ConsoleError } from './core/errors.mjs';
 import { mapWriteError } from './core/atomic-write.mjs';
+import { findVendorEscapes, isolationWarning, requestedInstallRoot } from './core/isolation.mjs';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -355,7 +356,20 @@ export function createConsoleServer({ configRoot, storeRoot, version, isolatedBa
     },
     close() { return new Promise((r) => server.close(() => r())); },
     describe() {
-      return { configRoot: tildify(configRoot), storeRoot: tildify(storeRoot), version: engine.resolver.version };
+      /**
+       * 把"厂商面有没有被隔离住"一起报出去（残余 R39）。
+       * 界面本身不显示当前用的是哪个根 —— 于是"用 --root 起了个隔离环境"这件事
+       * 在页面上完全看不出来；这里至少让 `/api/meta` 带上，界面以后可以直接做横幅。
+       * `vendorEscapes` 给**明细**（含路径），启动时可以拿它拼同一条警告。
+       */
+      const installRoot = requestedInstallRoot();
+      const escapes = findVendorEscapes(engine.doctor().handles, { configRoot, installRoot });
+      return {
+        configRoot: tildify(configRoot),
+        storeRoot: tildify(storeRoot),
+        version: engine.resolver.version,
+        isolation: { ok: escapes.length === 0, vendorEscapes: escapes },
+      };
     },
   };
 }
@@ -372,6 +386,21 @@ export async function startConsole({ root, store, port } = {}) {
    */
   const isolated = typeof store === 'string' && store.trim() !== '' && store !== resolveStoreRoot();
   const app = createConsoleServer({ configRoot, storeRoot, isolatedBaselines: isolated });
+  /**
+   * 启动时就把"隔离不一致"说出来（残余 R39）：`--root` 只换配置树，厂商面另有安装树。
+   * 界面不显示根路径，所以不在这里说，用户会以为整套都隔离了。
+   */
+  {
+    const requestedRoot = typeof root === 'string' && root.trim() ? root.trim() : null;
+    const installRoot = requestedInstallRoot();
+    const warn = isolationWarning({
+      escapes: app.describe().isolation.vendorEscapes,
+      configRoot,
+      installRoot,
+      requestedRoot,
+    });
+    if (warn) { console.log(''); for (const l of warn) console.log(l); console.log(''); }
+  }
   const { url, port: actual } = await app.listen(port ?? 0);
   const d = app.describe();
   /** 令牌在 createConsoleServer 的作用域里，这里从 app 取 */
