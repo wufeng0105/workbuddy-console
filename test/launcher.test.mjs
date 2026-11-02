@@ -2,10 +2,18 @@
  * 启动器自测 —— 零依赖，不起真实服务、不开窗口。
  *
  * 覆盖的是"改了会静默坏掉"的那些行为：
- *   · Node 版本门槛（低版本必须拒绝，而不是跑出奇怪的错）
+ *   · Node 版本门槛（低版本必须拒绝，而不是跑出奇怪的错）—— 判定是**行为**断言（R50）
  *   · `--store` / `--root` 是否真的透传（曾经 `--store` 是个假参数）
- *   · 单实例复用判据（在跑就复用，没在跑就起新的）
- *   · 关窗口 = 服务停（shutdown 是否真的监听信号）
+ *   · 单实例复用判据（在跑就复用，没在跑就起新的）—— 判据是**指纹**不是"回 200"（R46）
+ *   · 关窗口 = 服务停（信号走 SIGHUP，行为验证）—— R48
+ *   · `--no-reuse` 不许静默遗弃旧实例（R47）· 端口被占给人话（R49）· 参数有入口、写错硬报错（R51）
+ *
+ * ⚠️ 三类断言的分界（WP24 第 8 条审计后收紧）：
+ *   · **行为断言**：起真子进程，只断言它打印/退出/副作用。
+ *   · **【静态】断言**：只查源码；必须**剥注释**；且**只许用于跨文件数据判据或接线存在性**。
+ *     **不许**用它来守"某个行为还在" —— 实测有三条这么写的断言把实现改成空转后**全绿**（R50），
+ *     其中一条还**钉错了信号**（查 SIGINT/SIGTERM，而真实路径走 SIGHUP）。
+ *   · 每条静态断言都要在注释里写明"为什么不能行为化"；写不出来，就说明它该行为化。
  *
  * 运行：node --test test/launcher.test.mjs
  *
@@ -95,11 +103,26 @@ function mkConfigRoot() {
   return root;
 }
 
-/** 一个**真的会应答**的假控制台：复用判据是"端口真的应答"，不是"文件在" */
-async function startFakeConsole() {
+/**
+ * 一个**真的会应答**的假控制台。
+ *
+ * ⚠️ 它必须带上**指纹**（残余 R46）。曾经复用判据只是"那个端口上的 `/` 回 200"，
+ * 于是任何外来 HTTP 服务都会被当成我们的控制台 —— 启动器打印「已经在跑」、
+ * 把外来地址交给用户、exit 0、根本不起服务（独立审计 WP24 第 2(b) 条实测）。
+ * 真控制台的特征是：不带令牌访问 `/api/overview` → **401** 且响应体是
+ * `{error:{code:'UNAUTHORIZED'}}`。假控制台必须照这个来，否则测的是旧判据。
+ *
+ * @param {{ours?: boolean}} [opts] `ours:false` → 一个**外来**服务器（对什么都回 200）
+ */
+async function startFakeConsole({ ours = true } = {}) {
   const hits = [];
   const srv = http.createServer((req, res) => {
     hits.push(req.url);
+    if (ours && req.url.startsWith('/api/overview')) {
+      res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: '缺少或错误的会话令牌' } }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('ok');
   });
@@ -234,30 +257,88 @@ test('【静态】服务端 startConsole 必须接受 store 参数（service 侧
   assert.match(src, /resolveStoreRoot\(store\)/, '必须把 store 传给 resolveStoreRoot');
 });
 
-test('【静态】关窗口 = 服务停：必须监听 SIGINT / SIGTERM 并真的 close（剥注释后）', () => {
+test('关窗口 = 服务停：**行为**验证停止路径（不是查源码里有没有那几个字符串）', async () => {
   /**
-   * 为什么只能静态：Windows 上 `child.kill('SIGINT')` 是**无条件终止**
-   * （POSIX 信号不存在，libuv 直接 TerminateProcess），孩子的
-   * `process.on('SIGINT', shutdown)` 根本不会跑 —— 于是"行为化"会得到一个
-   * 与实现无关的结论。真信号只能由控制台窗口的 Ctrl+C 产生，测试进程发不出来。
-   * 所以这里退一步钉住"三条接线都在"，并用剥注释挡住"注释里写一遍就算过"。
+   * 这一条原来是纯静态匹配（查源码里有没有 `process.on('SIGINT'` / `'SIGTERM'` /
+   * `await app.close()` / `process.exit(0)`）。独立审计 WP24 第 8 条做了变异实验：
+   * 把 `shutdown()` 改成**空转**、只保留那四个字符串 → **13 pass / 0 fail**。
+   * 更糟的是它**钉错了信号**：真窗口实测关窗口走的是 **SIGHUP**（`CTRL_CLOSE_EVENT`），
+   * 而它只查 SIGINT/SIGTERM —— 守的信号不是那个信号。
+   *
+   * 现在改成行为断言：`--selftest-emit SIGHUP` 让启动器在服务起来后**自己触发**那个信号，
+   * 我们看它有没有真的打出「✔ 已停止。」并退出 0。
+   * 这条能红在两种缺陷上：① 删掉 SIGHUP 接线（没人监听 ⇒ 不会停）；
+   * ② `shutdown()` 变成空转（同样不会打出「已停止」）。
    */
-  const src = stripLaunch();
-  assert.match(src, /process\.on\('SIGINT'/, '必须处理 Ctrl+C');
-  assert.match(src, /process\.on\('SIGTERM'/, '必须处理 terminate');
-  assert.match(src, /await app\.close\(\)/, 'shutdown 必须真的关掉 http server');
-  assert.match(src, /process\.exit\(0\)/, 'shutdown 必须真的退出进程');
+  const store = mkStore('wbc-launch-stop-');
+  try {
+    const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open',
+      '--selftest-emit', 'SIGHUP'], { timeoutMs: 15000 });
+    assert.equal(r.code, 0,
+      `收到 SIGHUP 后应当优雅停止并退出 0（实际 code=${r.code} how=${r.how}）：${r.out.slice(0, 500)}`);
+    assert.match(r.out, /SELFTEST-LISTENERS:SIGHUP=true/,
+      `必须真的注册了 SIGHUP（关窗口在 Windows 上走的就是它）：${r.out.slice(0, 500)}`);
+    assert.match(r.out, /✔ 已停止。/,
+      `收到信号后必须走完停止路径（shutdown 空转时这句话不会出现）：${r.out.slice(0, 500)}`);
+  } finally {
+    fs.rmSync(store, { recursive: true, force: true });
+  }
 });
 
-test('【静态】启动失败时给可行动的提示，而不是只抛栈（剥注释后）', () => {
+test('Node 版本门槛的**判定**必须真的生效（行为），常量与 engines 一致是另一条', async () => {
   /**
-   * 为什么只能静态：要触发这条分支得让 `startConsole` 真失败（权限被拒 / 数据目录写不进）。
-   * 造这个环境需要改 ACL 或占住目录，代价与风险都超出"零依赖自测"，
-   * 而且失败原因在不同机器上不一定是 EPERM/EACCES，行为断言会变成碰运气。
+   * 原来是纯静态：只查 `MIN_NODE_MAJOR = 20` 这个**常量存在**、且与 package.json 的
+   * `engines` 一致。独立审计 WP24 第 8 条把**整段判定删掉**（常量留着）→ 13 pass / 0 fail。
+   * 这正是工程契约里点名的"常量定义了、没进判定"（残余 R8）。
+   *
+   * 修法：把判定抽成纯函数 `checkNodeVersion()`（`src/core/nodereq.mjs`），
+   * 断言改成**真的去问它**。跨文件一致性（常量 vs engines）留在下面的静态断言里，
+   * 那本来就是数据判据，静态查更硬。
    */
+  const { checkNodeVersion } = await import('../src/core/nodereq.mjs');
+  assert.equal(checkNodeVersion('18.20.4', 20).ok, false, '18 必须被拒');
+  assert.equal(checkNodeVersion('20.0.0', 20).ok, true, '20.0.0 必须放行（边界）');
+  assert.equal(checkNodeVersion('v20.11.1', 20).ok, true, '带 v 前缀的也要认');
+  assert.equal(checkNodeVersion('22.3.0', 20).ok, true, '更高的必须放行');
+  assert.equal(checkNodeVersion('', 20).ok, false, '空字符串 ⇒ 解析不出 ⇒ 必须**拒绝**（铁律 3：不猜）');
+  assert.equal(checkNodeVersion('nonsense', 20).ok, false, '乱码 ⇒ 同样必须拒绝，不许当成满足');
+  assert.equal(checkNodeVersion('20.11.1', 20).major, 20, '主版本号要真的解析出来');
+  assert.equal(checkNodeVersion('nonsense', 20).major, null, '解析不出来时主版本号必须是 null（可判定的信号）');
+});
+
+test('【静态】版本门槛常量与 package.json engines 必须一致（跨文件数据判据）', () => {
   const src = stripLaunch();
-  assert.match(src, /EPERM\|EACCES/, '必须识别权限错误并给出提示（数据目录写不进去是实测踩过的坑）');
-  assert.match(src, /WORKBUDDY_CONSOLE_HOME/, '必须告诉用户可以改数据目录');
+  const m = /MIN_NODE_MAJOR\s*=\s*(\d+)/.exec(src);
+  assert.ok(m, '找不到 MIN_NODE_MAJOR（剥掉注释后仍必须有真声明）');
+  const engines = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).engines?.node ?? '';
+  assert.match(engines, new RegExp(`>=\\s*${m[1]}`),
+    `MIN_NODE_MAJOR=${m[1]} 必须与 package.json engines（${engines}）一致`);
+});
+
+test('启动失败时必须给可行动的提示（**行为**：真造一个写不进去的数据目录）', async () => {
+  /**
+   * 原来也是纯静态（查 `EPERM|EACCES` 与 `WORKBUDDY_CONSOLE_HOME` 两个字符串）。
+   * WP24 的 M3 把提示整段关进 `if (false)` → 13 pass / 0 fail。
+   *
+   * 现在真造一次失败：把一个**普通文件**当路径前缀给 `--store`，
+   * 于是 `store/state` 永远建不出来（ENOTDIR）—— 与实现无关的确定性失败。
+   * 然后看它有没有说"数据目录写不进去"并给出 `WORKBUDDY_CONSOLE_HOME` 这条路。
+   */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wbc-launch-fail-'));
+  const blocker = path.join(dir, 'not-a-dir');
+  fs.writeFileSync(blocker, 'x', 'utf8');
+  try {
+    const r = await runLaunch(['--store', path.join(blocker, 'sub'), '--app-state', 'closed', '--no-open'],
+      { timeoutMs: 12000 });
+    assert.equal(r.code, 1, `启动失败必须 exit 1（实际 ${r.code}）：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /启动失败/, `必须明说启动失败：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /数据目录写不进去/,
+      `必须指出是数据目录的问题（而不是只抛栈）：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /WORKBUDDY_CONSOLE_HOME/,
+      `必须给一条可行动的出路：${r.out.slice(0, 400)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /* ══════════ 启动器逻辑 · 行为腿（真子进程） ══════════ */
@@ -440,6 +521,100 @@ test('真实探测返回布尔 true 时必须走引导分支（R29 回归，行�
   } finally {
     fs.rmSync(store, { recursive: true, force: true });
   }
+});
+
+test('R46：外来 HTTP 服务占着旧端口时，**不许**被当成"我们的控制台"（行为）', async () => {
+  /**
+   * 独立审计 WP24 第 2(b) 条：复用判据原来只看"那个端口上的 `/` 回 200"。
+   * 让一个**外来**服务器占住陈旧 `console-url.txt` 里的端口后，启动器会
+   * 打印「✔ 控制台已经在跑，直接打开它」、把**外来地址**交给用户、exit 0、**根本不起服务**
+   * （外来服务器日志里确实收到了一次 `GET /`）。
+   *
+   * 现在判据是**指纹**：不带令牌访问 `/api/overview` 必须是 401 且响应体形如
+   * `{error:{code:'UNAUTHORIZED'}}`。外来服务器（对什么都回 200）必须被识破，
+   * 启动器要**自己起一个**。
+   */
+  const store = mkStore('wbc-launch-r46-');
+  const foreign = await startFakeConsole({ ours: false });
+  try {
+    writeConsoleUrl(store, foreign.url);
+    const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open'],
+      { waitFor: /控制台已启动/, timeoutMs: 15000 });
+    assert.equal(r.how, 'waitFor',
+      `外来服务占着端口时必须自己起一个，不许宣称"已经在跑"：${r.out.slice(0, 400)}`);
+    assert.doesNotMatch(r.out, /已经在跑/,
+      `外来服务器绝不能被认成我们的控制台：${r.out.slice(0, 400)}`);
+  } finally {
+    await foreign.close();
+    fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test('R47：`--no-reuse` 遇到已在跑的实例，必须**拒绝**并说清后果（非交互默认保守）', async () => {
+  /**
+   * 独立审计 WP24 第 3 条：`--no-reuse` 会起第二个实例并**覆盖** `console-url.txt`，
+   * 旧实例还活着、API 还好用，但**没有任何入口指向它** —— 留下一个孤儿。
+   * 本工程在审计之前就已经手工停掉过**两个真实孤儿**（一个 4 小时、一个 24 小时）。
+   *
+   * 现在：非交互（测试里 stdin 是 ignore）拿不到确认 ⇒ **拒绝**，退出码 4，且绝不能已经起了第二个。
+   */
+  const store = mkStore('wbc-launch-r47-');
+  const fake = await startFakeConsole();
+  try {
+    writeConsoleUrl(store, fake.url);
+    const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open', '--no-reuse'],
+      { timeoutMs: 12000 });
+    assert.equal(r.code, 4,
+      `--no-reuse 遇到在跑的实例、又拿不到确认时必须拒绝（期望 exit 4，实际 ${r.code}）：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /已经有一个控制台在跑/, `必须告诉用户旧的还在：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /失去入口/, `必须说清"旧实例会怎样"：${r.out.slice(0, 400)}`);
+    assert.doesNotMatch(r.out, /控制台已启动/, '拒绝时**绝不许**已经起了第二个服务');
+    assert.equal(fake.hits.length, 1, `应当只探测一次，实际 ${fake.hits.length} 次`);
+  } finally {
+    await fake.close();
+    fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test('R49：端口被占时必须给人话，而不是把裸 EADDRINUSE 丢给用户（行为）', async () => {
+  /**
+   * 独立审计 WP24 第 6 条：`--port` 被占时只回裸 `EADDRINUSE` + exit 1，没有任何可行动的提示。
+   * 现在必须说清"端口被占"，并给出换端口的办法。
+   */
+  const store = mkStore('wbc-launch-r49-');
+  const squatter = await startFakeConsole();
+  const busyPort = new URL(squatter.url).port;
+  try {
+    const r = await runLaunch(['--store', store, '--app-state', 'closed', '--no-open', '--port', busyPort],
+      { timeoutMs: 12000 });
+    assert.equal(r.code, 1, `端口被占时应 exit 1（实际 ${r.code}）：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /端口被占用/, `必须明说端口被占：${r.out.slice(0, 400)}`);
+    assert.match(r.out, /--port 8080/, `必须给出换端口的办法：${r.out.slice(0, 400)}`);
+    assert.doesNotMatch(r.out, /^❌ 启动失败：listen EADDRINUSE/m,
+      `不许把裸 errno 当作唯一解释：${r.out.slice(0, 400)}`);
+  } finally {
+    await squatter.close();
+    fs.rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test('R51：`--help` 必须列全部参数与退出码；未知参数必须硬报错（行为）', async () => {
+  /**
+   * 独立审计 WP24 第 7 条：`--help` 只打印操作卡，**8 个参数一个都不出现**（README 也没有）；
+   * 且拼错的参数被**静默忽略** —— 实测 `--stroe X` 无任何抱怨、静默回落到默认 store，
+   * 用户以为改到了数据目录，其实没有。
+   */
+  const help = await runLaunch(['--help'], { timeoutMs: 10000 });
+  assert.equal(help.code, 0, `--help 应 exit 0（实际 ${help.code}）：${help.out.slice(0, 300)}`);
+  for (const flag of ['--port', '--store', '--root', '--no-open', '--no-reuse', '--yes', '--app-state', '--help']) {
+    assert.ok(help.out.includes(flag), `--help 必须列出 ${flag}：${help.out.slice(0, 600)}`);
+  }
+  assert.match(help.out, /退出码/, `--help 必须给出退出码含义（WP24 第 6 条：全仓库没有文档）：${help.out.slice(0, 600)}`);
+
+  const bad = await runLaunch(['--stroe', 'X'], { timeoutMs: 10000 });
+  assert.equal(bad.code, 2, `未知参数必须 exit 2（实际 ${bad.code}）：${bad.out.slice(0, 300)}`);
+  assert.match(bad.out, /未知参数：--stroe/, `必须点名那个参数：${bad.out.slice(0, 300)}`);
+  assert.match(bad.out, /--store/, `必须给出"你是不是想写 --store"：${bad.out.slice(0, 300)}`);
 });
 
 test('【静态】默认状态必须来自真实进程探测，不许猜（剥注释后）', () => {

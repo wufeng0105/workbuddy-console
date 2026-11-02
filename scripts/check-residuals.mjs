@@ -110,6 +110,39 @@ for (const d of docs) {
 const unknown = [...referenced].filter((id) => !defined.has(id) && !defined.has(`${id}b`));
 if (unknown.length) fail(`这些编号被引用了却没有定义：${unknown.sort().join('、')}`);
 
+// ── ⑦ 已兑现的残余，别处不许还写着"未兑现" ──────────────────
+/**
+ * 这一条是残余 R45 那个类里**可以**机械化的部分。
+ *
+ * 真实发生过三次：R9/R8（被独立审计抓出）、R27/R28/R29/R31（Lead 复核时发现）、
+ * 以及 README 里仍写着「⚠️ 这一条当前未兑现（残余 R29）」—— 而 R29 早就修了。
+ * 判据：如果本表把某条标成 `已兑现`，那么其它文档里**同一行**（或紧邻上下各一行）
+ * 提到这个编号时，就不许出现"未兑现"；同时该行若已含"已修/已兑现"字样则放行
+ * （那是在描述修复本身，不是过期声明）。
+ */
+const doneIds = rows
+  .filter((r) => (r.cells[2] ?? '').replace(/\*\*/g, '').trim().startsWith('已兑现'))
+  .map((r) => r.id);
+const staleHits = [];
+for (const d of docs) {
+  const p = path.join(REPO, d);
+  if (!fs.existsSync(p)) continue;
+  const dl = fs.readFileSync(p, 'utf8').split(/\r?\n/);
+  for (let i = 0; i < dl.length; i += 1) {
+    const window = [dl[i - 1] ?? '', dl[i], dl[i + 1] ?? ''].join('\n');
+    if (!/未兑现/.test(window)) continue;
+    if (/已兑现|已修|已修复/.test(window)) continue;   // 在描述修复本身，放行
+    for (const id of doneIds) {
+      if (new RegExp(`\\b${id}\\b`).test(window)) {
+        staleHits.push(`${d}:${i + 1} 把 ${id} 写成了未兑现，而本表已标为「已兑现」`);
+      }
+    }
+  }
+}
+if (staleHits.length) {
+  for (const h of staleHits) fail(`过期声明 —— ${h}`);
+}
+
 // ── 报告 ────────────────────────────────────────────────────
 const okCount = rows.filter((r) => (r.cells[2] ?? '').replace(/\*\*/g, '').trim().startsWith('已兑现')).length;
 console.log(`残余表机检（${FILE}）`);

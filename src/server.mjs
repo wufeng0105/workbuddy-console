@@ -406,22 +406,36 @@ export async function startConsole({ root, store, port } = {}) {
   /** 令牌在 createConsoleServer 的作用域里，这里从 app 取 */
   const token = app.token;
 
-  // 把带令牌的 URL 落一份，便于重开控制台（该文件含令牌，只在用户数据目录内）
-  //
-  // 为什么要落"全部入口"而不只是首页：
-  //   令牌每次启动都变，人手抄链接必然出错（已发生过一次：贴了上一轮的旧令牌，
-  //   页面打开全是 401）。所以把**每种可用地址**都写进文件，用完直接复制。
-  const dir = path.join(storeRoot, 'state');
-  fs.mkdirSync(dir, { recursive: true });
-  const urlFile = path.join(dir, 'console-url.txt');
-  const lines = [
-    `# workbuddy-console · 启动于 ${new Date().toISOString()}`,
-    `# 令牌随每次启动变化；本文件每次启动重写`,
-    ``,
-    `# 控制台`,
-    url,
-  ];
-  fs.writeFileSync(urlFile, `${lines.join('\n')}\n`, 'utf8');
+  /**
+   * ⚠️ 从这一行往下，**服务已经在监听了**。
+   *
+   * 所以后面任何一步失败（建 `state/` 目录、写 URL 文件）都必须**先把服务关掉再抛**：
+   * 否则那个监听中的 http server 会一直吊着事件循环 —— 调用方明明拿到了失败、却退不出去。
+   * 这不是理论问题：`launch.mjs` 承诺"启动失败 ⇒ exit 1"，而实测这条路上它**挂着不退**，
+   * 因为 `app.listen()` 成功之后 `mkdirSync(store/state)` 才抛 ENOTDIR。
+   * （独立审计 WP24 第 6 条把"错误路径不可行动"报上来的同一片区域，这次连"退不出去"一起修。）
+   */
+  try {
+    // 把带令牌的 URL 落一份，便于重开控制台（该文件含令牌，只在用户数据目录内）
+    //
+    // 为什么要落"全部入口"而不只是首页：
+    //   令牌每次启动都变，人手抄链接必然出错（已发生过一次：贴了上一轮的旧令牌，
+    //   页面打开全是 401）。所以把**每种可用地址**都写进文件，用完直接复制。
+    const dir = path.join(storeRoot, 'state');
+    fs.mkdirSync(dir, { recursive: true });
+    const urlFile = path.join(dir, 'console-url.txt');
+    const lines = [
+      `# workbuddy-console · 启动于 ${new Date().toISOString()}`,
+      `# 令牌随每次启动变化；本文件每次启动重写`,
+      ``,
+      `# 控制台`,
+      url,
+    ];
+    fs.writeFileSync(urlFile, `${lines.join('\n')}\n`, 'utf8');
 
-  return { app, url, port: actual, urlFile, ...d };
+    return { app, url, port: actual, urlFile, ...d };
+  } catch (e) {
+    try { await app.close(); } catch { /* 关不掉也不能盖掉真实原因 */ }
+    throw e;
+  }
 }
