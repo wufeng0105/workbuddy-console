@@ -9,12 +9,15 @@ src/
 ├─ core/       Core（框架 · 少变）—— 契约 / 引擎 / 注册表 / 备份 / 漂移 / 锚点
 ├─ handles/    把手适配器（Data · 多变）—— 一个把手一个文件
 ├─ anchors/    锚点表（Data · 多变）—— 按 WorkBuddy 版本
-└─ verify/     验证策略实现（三条 + 回读）
+└─ verify/     验证策略实现（三条：标记法 / token 增量法 / 重启后回读）
 ```
 
 **判断一个改动该放哪**：改 `core/` = 改框架（应当罕见）；加 `handles/` 或 `anchors/` = 加数据（常态）。
 
-## 实现状态
+## 模块落点（在不在仓库里）
+
+> 本表只答一件事：**这个模块在不在**。**兑现状态**（有没有会变红的断言守住）不在这里声明
+> ——见 [`../DOC-OUTLINE.md`](../DOC-OUTLINE.md)「已知残余」。「已实现」在本组不是状态词。
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
@@ -24,7 +27,7 @@ src/
 | `core/profiles.mjs` | ✅ 已实现 | 档位（源状态）存取：原子写、结构校验、损坏可见；**存用户数据目录，不进仓库** |
 | `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份；**档位多把手事务**（一次备份 / 一条审计 / 整体还原） |
 | `core/trace.mjs` | ✅ 已实现 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
-| `core/replay.mjs` | ✅ 已实现 | 版本重放：建包（存锚点键不存路径）、漂移检测（5 类）、重放（一次事务 + 如实报告失败） |
+| `core/replay.mjs` | ✅ 已实现 | 版本重放：建包（存锚点键不存路径）、漂移检测（**声明 5 类、实际产出 3 类**，见残余 R7）、重放（一次事务 + 如实报告失败） |
 | `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
 | `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |
 | `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
@@ -57,3 +60,9 @@ src/
 ## 用户数据不在仓库内
 
 `profiles` / `backups` / 状态一律放 `%USERPROFILE%\.workbuddy-console\`（铁律 4，本仓库是 public）。
+
+## 接哪篇
+
+**分层与本篇的落点**由本篇定义。**契约与事务语义**在 [framework](../docs/framework.md)；
+**有哪些面**在 [handles](../docs/handles.md)；前端约束见 [web/README](../web/README.md)。
+兑现状态不在这里声明——见 [DOC-OUTLINE](../DOC-OUTLINE.md) 残余表。

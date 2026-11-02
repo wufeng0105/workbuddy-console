@@ -41,21 +41,43 @@
 
 | 把手 | 位置 | 提权 | 升级 |
 |---|---|---|---|
-| `style.{creative,efficient,friendly,professional,sarcastic,socratic,straightforward}` | `C:\Program Files\WorkBuddy\resources\app.asar.unpacked\resources\templates\style\` | **是** | **疑失效**（待实测 #6） |
+| `style.{creative,efficient,friendly,professional,sarcastic,socratic,straightforward}` | `C:\Program Files\WorkBuddy\resources\app.asar.unpacked\resources\templates\style\` | **是** | **疑失效**（升级行为未验，残余 R12） |
 
 > ⚠️ **一条静默失败**：编辑**非当前生效**的档位等于什么都没做——`toneStyle` 决定读哪一个文件。
 > 工具对此 preview 显著告警、verify 判 `undetermined`（前置条件不成立），**不会**因为实测 Δ=0 就报"未生效"。
 
 当前账号对安装目录**实际可写**（探针 `writeAccess: true` 如实报告，不是假定）。
 
-### 只能看，不能改（2026-11-02 补）
+### 正文在哪改（2026-11-02 修）
 
-这七张卡**不提供编辑**（写它要提权 + 逐次确认），但**必须能看**——
-原来它们只显示一行摘要（字符数 + sha），想确认"当前生效的风格到底写了什么"时无处可看。
+这七张卡本身是**参考件**：卡头可点，展开后是只读全文（能复制、不能改），并标出当前是否生效；
+写操作只有「校验 / 拉取 / 还原」，还原需在展开区单独勾选厂商确认。
 
-现在：卡头可点，展开后是**只读**全文（能复制、不能改），并标出当前是否生效。
-写操作仍然只有「拉取 / 还原」，且**还原**要在展开区单独勾选「我确认这是厂商文件」——
-那个勾选框是"一次写操作的授权"，刻意与只读内容分开，不混在内容区里。
+**改正文的入口在「回复风格（toneStyle）」卡上**，不在这些卡里。原因是用户的实际任务是
+
+> "把 friendly 这档改成我想要的样子"
+
+那是**一件事**，不该拆成"去另一张卡找 `style.friendly`"+"应用"+"再回来切档位"。
+所以那卡提供内联编辑器，保存时一次做完三件事并分条报告：
+
+| 步骤 | 说明 |
+|---|---|
+| 写正文 | 写 `style-<id>.md`，需勾选厂商确认（铁律 5） |
+| 顺手切 | 把 `toneStyle` 切到刚编辑的这一档（**用户选定**：编辑某档的意图就是"我要用它"） |
+| 验证 | 跑一次 `verify`，给三态结论；拿不到 trace 就如实报「无法判定」 |
+
+**枚举卡与文本卡在「还原」上的差别**（2026-11-02）：`toneStyle` 是七档枚举，
+下拉框里就有全部合法值——想回到 `efficient`，选它 + 应用即可。
+所以这张卡**不提供「还原到最初基线」**（功能重叠，且与「应用」并排会被读成"撤销"）。
+`SOUL.md` / `USER.md` / `IDENTITY.md` / `prompt.*` / `rules.*` 相反：正文与规则没法凭记忆重建，
+「还原到最初基线」是唯一的路，必须保留。
+
+写入前会调 `/plan` 预演，把 diff 行数、token 成本与**全部警告**摆在编辑器里——
+包括"这一档当前未生效，改了不影响任何请求"（写入前它是真的；切换成功后会收口，不再照抄）。
+
+> ⚠️ **这条路径目前只有这一处。** 后端在每个把手的 `apply` 里都会算出 `previewWarnings`，
+> 但界面只有本编辑器读了它；**其余 11 个把手（`personalization.*` 4 个 + `prompt.*` 3 个 + `rules.*` 3 个 + 枚举指针）
+> 的警告到不了用户眼前**——残余 R4。
 
 ## 提示词模板（3 个）
 
@@ -66,7 +88,7 @@
 | `prompt.welcomemode-{code,work,design}` | `~/.workbuddy/plugins/cache/workbuddy-builtin/<plugin>/<最高版本目录>/prompt.tpl` | **头部** | 标记法 |
 
 - **版本哈希定位**：双版本并存时挑**最高版本**，旧版本原样保留不猜
-- 闸门 `app-must-be-closed`：待实测 #3 证实可热改前，保守要求应用退出
+- 闸门 `app-must-be-closed`：在残余 R12 里"插件缓存能否热改"证实之前，保守要求应用退出
 - 删 `personal_files_safety` 段时 preview 显著告警，并提示"放宽档位应保留 No-Go Zones"
 
 ## 行为规则（3 个）
@@ -75,8 +97,8 @@
 
 | 把手 | 说明 |
 |---|---|
-| `rules.file` | 三域 × 三动作 × 路径粒度。实测 135 条（**write=ask 49 / delete=ask 49 / read=ask 2**） |
-| `rules.command` | 0 条（语义待实测 #2） |
+| `rules.file` | 三域 × 三动作 × 路径粒度。条数**现读** `node src/cli.mjs approval-plan relaxed --json`（本组文档不写死） |
+| `rules.command` | 语义未实测（残余 R12） |
 | `rules.network` | 0 条（同上） |
 
 **写入形式是结构化操作，不是整块 JSON 编辑**：
@@ -110,8 +132,10 @@
 | 人设设定 | `SOUL.md` | ✅ |
 | 长期记忆 | `memory/` + 双开关 | ❌ 被禁用 |
 
-> ⚠️ **界面显示的"当前值"才是数据源。** 实测截图回复风格 = **高效务实（`efficient`）**，而侦察基线记的是 `creative`。
-> **文档是快照，会失真**——工具里任何"当前值"必须现读。
+> ⚠️ **界面显示的"当前值"才是数据源，文档不记录它。** `toneStyle` 在三天里被实测到三个不同的值
+> （2026-10-31 记 `creative`、2026-11-01 实测 `efficient`、2026-11-02 实测又是另一个）——
+> 这正是 [AGENTS](../AGENTS.md) 铁律 8 存在的原因。工具里任何"当前值"一律现读：
+> `node src/cli.mjs probe personalization.tone-style`。
 
 ## 已禁用与移出范围
 
@@ -134,13 +158,15 @@
 
 ## 提示词层的具体条款
 
-`personal_files_safety` 实测存在于**插件缓存目录的 6 个文件**：
+`personal_files_safety` 实测存在于**插件缓存目录的多个 `prompt.tpl`**（同一段落会随每个模式 × 每个缓存版本各存一份，
+**份数现读**，不要照抄）：
 
 ```
-~/.workbuddy/plugins/cache/workbuddy-builtin/welcomemode-{code,work,design}/{5.8.3-*,5.9.3-*}/prompt.tpl
+~/.workbuddy/plugins/cache/workbuddy-builtin/welcomemode-{code,work,design}/<版本目录>/prompt.tpl
 ```
 
-（6 处 = 3 个模式 × 双版本缓存并存；**只改 5.9.3 只覆盖 3 处**）
+（只改当前版本目录只覆盖其中一部分；旧版本缓存原样保留。`node src/cli.mjs list` 与本文件顶部的
+「版本哈希定位」说明定位规则。）
 
 原文开头自称 `ALL mandatory, cannot be overridden`，但**运行时零校验**——改文本即改行为。
 
@@ -154,12 +180,14 @@
 
 ## 置信度与限制
 
-18 个把手的实现与验证策略：已实现，自测覆盖，高。规则条数、风格档位、模板定位：真实配置实测，高。
+18 个把手的**实现**在注册表里有据（个数现读 `node src/cli.mjs list`），验证策略声明齐备；
+但**兑现**不在这里声明，逐条以 [DOC-OUTLINE](../DOC-OUTLINE.md) 残余表为准
+（与这些面直接相关的有 R1 / R2 / R3 / R4 / R6 / R7 / R13）。规则条数、风格档位、模板定位：真实配置实测，**条数一律现读**。
 
 三项限制：
 
-- **动态通道三项全未实测**，不要当成可用功能引用。
-- **7 个风格把手的升级行为未验**（待实测 #6），"疑失效"这个词必须保留。
+- **动态通道三项全未实测**，不要当成可用功能引用（残余 R13）。
+- **7 个风格把手的升级行为未验**（残余 R12），"疑失效"这个词必须保留。
 - 清单本身是快照——**加把手前先现探**，别照抄这里的条数与路径。
 
 ## 给下一篇留下的问题

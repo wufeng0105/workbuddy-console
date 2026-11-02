@@ -26,7 +26,9 @@ WorkBuddy（腾讯的桌面 AI 助手）里，"能改它行为的地方"散落�
 
 - **窗口开着 = 服务在跑；关掉窗口 = 服务停止。** 没有后台残留、没有开机自启。
 - 已经在跑时会**复用**那个实例（只开浏览器），不会再起第二个。
-- 启动前会**探测 WorkBuddy 是否还在运行**：在跑就会劝阻并说清后果（见下）。
+- 启动前会**探测 WorkBuddy 是否还在运行**：本意是在跑就劝阻并说清后果（见下）。
+  ⚠️ **这一条当前未兑现**：探测返回的是 `true/false/'unknown'`，而启动器拿它去比字符串 `'running'`，
+  真实路径上**不会触发**劝阻（残余 R29）。在修好之前，请自己确认 WorkBuddy 已退出。
 - 窗口里会打印一张**操作卡**：改什么、改完要重启还是新建会话、后悔了怎么还原。
 
 > 这套工具是**一次性**的用法：先用它改，改完关掉窗口，再开 WorkBuddy。
@@ -68,8 +70,14 @@ node src/cli.mjs replay --confirm
 
 # 后悔了
 node src/cli.mjs backups
-node src/cli.mjs restore <backupId>
+node src/cli.mjs restore <backupId> --dry-run   # 先预演：会覆盖/删除哪些文件
+node src/cli.mjs restore <backupId> --confirm   # 真还原（还原前会先给当前内容留一份副本）
 ```
+
+> ⚠️ **`restore` 从 2026-11-02 起必须带 `--confirm`**：不带就 exit 1、一个字节都不写。
+> 它同时补上了闸门（应用运行中拒绝执行）——这是**有意的破坏性变更**，
+> 换来的是"还原不再是唯一一条无备份的写"。还原前的当前内容会存到
+> `<用户数据目录>\state\restore-pre\<backupId>\`。
 
 ### 验证怎么用（这是重点）
 
@@ -96,7 +104,7 @@ node src/cli.mjs restore <backupId>
 
 把前者当成后者，是这套东西最容易的误用。
 
-## 三个档位的取舍
+## 审批档位的取舍
 
 | 档位 | 规则面（宿主弹窗） | 提示词面（模型自己问） |
 |---|---|---|
@@ -115,28 +123,36 @@ node src/cli.mjs restore <backupId>
 | [`DOC-OUTLINE.md`](DOC-OUTLINE.md) | 文档组账本：主线、术语、分篇、阅读顺序 |
 | [`docs/product.md`](docs/product.md) | 产品要什么：定位、层边界、档位模型、范围、分期 |
 | [`docs/framework.md`](docs/framework.md) | 怎么造：四条契约、参照系、分层、事务语义 |
-| [`docs/verification.md`](docs/verification.md) | 怎么证明：三态、三种已实现策略、**判据何时给错答案**、待实测 8 条 |
+| [`docs/verification.md`](docs/verification.md) | 怎么证明：三态、三种有实现的策略、**判据什么时候会给出错答案**、待实测清单 |
 | [`docs/handles.md`](docs/handles.md) | 有哪些面：18 个把手的清单 |
 | [`docs/recon-amendments.md`](docs/recon-amendments.md) | 哪些旧结论被推翻（**冲突时以它为准**） |
 | [`docs/ledger.md`](docs/ledger.md) | 动过什么、还原了没 |
 
 ## 状态
 
-P0–P3 共十项**已实现**。剩下两件事：**待实测 8 条**（见 [`docs/verification.md`](docs/verification.md)），以及**两处不能兑现的承诺**（标记法对普通编辑只能报「无法判定」、`render-log` 策略有名无实，登记在 [`DOC-OUTLINE.md`](DOC-OUTLINE.md) 的「已知残余」）。
+P0–P3 共十项**均已实现**。但本组不使用"已完成"这个词——代码在、没有会变红的断言守住的，一律叫**未兑现**，
+逐条登记在 [`DOC-OUTLINE.md`](DOC-OUTLINE.md)「已知残余」（R1–R20，每条带状态、负责阶段与复核命令）。
 
-> 「已实现」不等于「承诺已兑现」。2026-11-02 的两轮独立复核（27 条）证明过这个区别：
-> 功能都在、链路都通，但**判据会安静地把答案给错**——删减改动永远判不出生效、
-> 前端会把用户正在编辑的内容在点「应用」前冲掉。这些已全部修复并各配断言。
+现在最值得先读的三条残余：
+
+- **R3**：三态判据有 6 条路径会**安静地给出错答案**（含"完全没生效却报生效"）
+- **R17**：还原这条链是唯一"无备份的写"，且 CLI 侧不过闸门
+- **R4**：后端算出的警告在 11 个把手的界面上到不了用户眼前
 
 ### 怎么验证它可信
 
-| 命令 | 证明什么 |
-|---|---|
-| `node src/selftest.mjs` | 后端六步与把手契约（157 条，合成 fixture，不碰真实配置） |
-| `npm test` | 前端六条不变量 + 三态判定边界 + 启动器（47 条，零依赖） |
-| `npm run verify:all` | 以上串跑 |
+四道门禁，**期望值不写死**（数字会腐烂，见 [`DOC-OUTLINE.md`](DOC-OUTLINE.md)「数字出处表」）：
 
-新增断言必须做**红灯验证**：把修复改回去，确认断言真的变红。本轮有两条断言第一版是空转的，全靠这一步才发现。
+| 门禁 | 命令 | 看什么 |
+|---|---|---|
+| 契约 | `npm run check:contracts` | exit 0（该门禁当前恒真，见 R9） |
+| 自测 | `node src/selftest.mjs` | 末行 `失败 0` |
+| 断言 | `npm test` | `fail 0` |
+| 体检 | `node src/cli.mjs doctor --store <临时目录>` | `总判：✅ 全部通过`（只验锚点可解析，见 R16） |
+
+> **新增断言必须做三证**：① 把修复改回去 → 断言必须红；② 正常态 → 绿；
+> ③ **把被测字段删掉 → 仍必须红**（第三证挡的是"常量定义了、没进判定"这类空转）。
+> 只做前两证不够——本工程历史上就有断言"改回去也全绿"。
 
 ## 关于 `recon-baseline/`
 
