@@ -164,10 +164,10 @@
 | R4 | 后端带出的 `previewWarnings` 在 11 个把手的界面上不可达（只有 style 编辑器读了它） | 未兑现 | P4 | `handles`「写入前会调 /plan 预演」 |
 | R5 | **`I8`「六步每步都要在界面有出口」与用户 2026-11-01 定版「页面不再驱动验证」直接冲突**。已按用户决定撤回 I8：界面不承担验证，只承担"看得见改了什么、写没写、怎么自测" | 已裁定（撤回 I8） | —（已改口） | `framework`「前端不变量」 |
 | R6 | 审批 `relaxed` 档**未**实现凭据目录豁免：现会把 `~/.ssh` `~/.aws` `~/.gnupg` 的 read/write ask 一并放开 | 未兑现 | P1′ | `product`「越界行为」 |
-| R7 | 漂移分类声明 5 类，`detectDrift` 实际只产出 3 类（`value-changed` / `mode-dependent` 无生产者）；守它的断言只查单向 | 未兑现 | P5 | `framework`「状态契约」 |
-| R8 | 断言空转缺口：1 条整条恒真、3 条结构性/词存在、1 条覆盖洞、前端 7 条、launcher 11 条纯字符串；另有 3 处无任何断言覆盖 | 未兑现 | P2 | `.zhll/audit2/06`、`07` |
-| R9 | 门禁 `npm run check:contracts` 恒真（只有 `console.log`，清空契约常量仍 exit 0） | 未兑现 | P2 | `AGENTS.md`「门禁」 |
-| R10 | 跑一次自测会往**真实**用户数据目录写约 89 文件且从不清理（已积累 80 个 fixture） | 未兑现 | P6 | `.zhll/audit2/04` F8 |
+| R7 | 漂移分类声明 5 类，`detectDrift` 实际只产出 3 类（`value-changed` / `mode-dependent` 无生产者） | 未兑现（**本体**）／**已兑现（守它的判据）**：P2 的门禁⑤ 已改成双向对账，并对这两类**显式标注无生产者**，且「标注过期」也会红 | P5（只差给这两个现象找生产者或撤掉承诺） | `node scripts/check-contracts.mjs` |
+| R8 | 断言空转缺口：1 条整条恒真、3 条结构性/词存在、1 条覆盖洞、前端 7 条、launcher 11 条纯字符串；另有 3 处无任何断言覆盖 | **已兑现**（P2，两半） | —（已改口） | 实测：`npm test` 63/0；24 份注入日志全部 `fail ≥ 1`（`gates/WP10/redlight-summary.log`、`gates/WP11/`）；`HANDLE_STEPS` 清空 → `check:contracts` exit 1 |
+| R9 | 门禁 `npm run check:contracts` 恒真（只有 `console.log`，清空契约常量仍 exit 0） | **已兑现**（P2）：换成 `scripts/check-contracts.mjs` 的 5 条真断言 | —（已改口） | 实测四种注入全部 exit 1：`HANDLE_STEPS=[]` → ①、`DRIFT_KINDS` 加 `ghost-kind` → ⑤、`VERIFY_STRATEGIES` 加 `ghost-strategy` → ②、删掉 value-changed 的无生产者标注 → ⑤（`.zhll/audit2/gates/WP20/`） |
+| R10 | 跑一次自测会往**真实**用户数据目录写一批文件且从不清理 | 未兑现 | P6 | 份数**现读**：`(Get-ChildItem "$env:USERPROFILE\.workbuddy-console\sandbox" -Directory).Count`（不写死——本条原来写"约 89 文件 / 已积累 80 个"，是会腐烂的快照） |
 | R11 | 非 UTF-8 字节与 CRLF 行尾在 JSON 字段写入时不保真（会被替换成 U+FFFD / 被改成 LF）；BOM 与合法 UTF-8 往返逐字节一致 | 未兑现 | P6 | `handles`「最小改动写入」 |
 | R12 | 待实测 8 条（规则是否被启动抹掉、纯 `command`/`network` 域语义、插件缓存能否热改、提示词能否治住"模型问"、超时自动拒绝、`style-*.md` 升级是否被还原、SOUL 单件增量、截断阈值） | 不可判 | 需真机会话/真升级 | `verification`「待实测清单」 |
 | R13 | 动态通道三项（`system-reminder` / `ask-mode-reminder` / `<mentioned_plugins>`）未实测 | 不可判 | 需真机会话 | `handles`「动态通道」 |
@@ -177,14 +177,15 @@
 | R28 | `ENOSPC → DISK_FULL` 的错误映射只写在 **HTTP 层**（`server.mjs:345`）；CLI 撞 ENOSPC 时打裸 `Error: ENOSPC …` + 栈，**不告知"目标文件已被截断为 0 B"、不给 backupId、不给恢复命令**。用户会误以为"写入失败＝文件没变"，而事实相反 | 未兑现 | P3 | `.zhll/audit2/gates/lead/e4-enospc.log` 的 `stderr` 原文 |
 
 | R14 | trace 排除表只覆盖 `wb-lite` 与 `step-5-preview` | **已裁定（不是缺陷）**：2026-11-02 用真 WorkBuddy 实测确认，本机聊天主模型就是 **`hy3`**（35k–64k tokens、带 `tool_calls`），**不该被排除**；真正过期的是文档里"3 种模型"那句计数（已删） | —（已改口） | 复核 `node src/cli.mjs traces` 看模型分布 |
-| R26 | **token 增量法的噪声下限从未被测量，且它大于小改动的判定窗口**：2026-11-02 受控对照实测，"同一模型 + 同一改动 + 同一句用户消息"的两次会话首条请求差 **26 tokens**，而 35 tokens 量级改动的 ±30% 容差只有 ±10.5 tokens。⇒ 小改动的判据必然退化成 `undetermined`，或靠运气落进容差带报 `effective`；且"单变量对照"里**首条用户消息并未被控制**（基线会话与观测会话的提问不同，差值被算进增量） | 未兑现 | P3（需重新设计小改动的判据：加样本、取多会话中位数、或对首条消息做长度归一） | `.zhll/audit2/gates/lead/e1-real-session.log`（含三次会话的 tokens 对照表） |
+| R26 | **token 增量法的噪声下限从未被测量，且它大于小改动的判定窗口**：2026-11-02 受控对照实测，"同一模型 + 同一改动 + 同一句用户消息"的两次会话首条请求差 **26 tokens**，而 35 tokens 量级改动的 ±30% 容差只有 ±10.5 tokens。⇒ 小改动的判据必然退化成 `undetermined`，或靠运气落进容差带报 `effective`；且"单变量对照"里**首条用户消息并未被控制**（基线会话与观测会话的提问不同，差值被算进增量） | 未兑现 | **P4**（2026-11-02 需求复审改判：判据给 `undetermined` 是**正确行为**，缺的是"改之前告诉你代价"没覆盖"这次改动太小、验不了"——所以在**预览**里加一句可判定的话，不是重新设计统计） | `.zhll/audit2/gates/lead/e1-real-session.log`（含三次会话的 tokens 对照表）；`00-需求复审.md` 第四节 |
 | R15 | trace 文件 >8 MB 时只读末 8 MB，标记落在前段会判"未生效" | **潜伏（本机不可达）**：2026-11-02 复查发现，唯一超 8 MB 的是 `traces/12892/trace_…json`（**9.67 MB，`.json` 后缀**），而 `trace.mjs` 的 `listTraceFiles` 硬编码 `if (!n.endsWith('.jsonl')) continue;` —— 两个读取器都不看 `.json`，所以截断分支走不到。原来的理由（"最大 213 KB"）是错的，已更正 | 不排期 | `Get-ChildItem ~\.workbuddy\traces -Recurse -File \| Where Length -gt 8MB` → 只有 `.json` 那一个 |
-| R30 | **traces 的格式漂移被静默跳过**：`~/.workbuddy/traces` 下 178 个 `trace_*` 里 **25 个是 `.json`**（另一种形态：单个 `{"trace":{…}}` 文档，`spanCount: 590`、`totalTokens: 8065756`），而 `listTraceFiles` 只认 `.jsonl`。⇒ 若某个 WorkBuddy 版本换了 trace 的扩展名/格式，**每一个 `verify` 都会退化成"样本不足→无法判定"，而工具说不出原因**。这正撞在演进契约上：「升级只加数据；**锚点失效必须硬报错**」——trace 的**文件命名约定**是锚点，却没被当成锚点 | 未兑现 | P3（小修：找不到任何 `.jsonl` 但目录里**有别的 `trace_*`** 时，明确报"可能换了 trace 格式"） | `.zhll/audit2/00-需求复审.md` 第七节 |
+| R30 | **traces 的格式漂移被静默跳过**：`~/.workbuddy/traces` 下 178 个 `trace_*` 里 **25 个是 `.json`**（另一种形态：单个 `{"trace":{…}}` 文档，`spanCount: 590`、`totalTokens: 8065756`），而 `listTraceFiles` 只认 `.jsonl`。⇒ 若某个 WorkBuddy 版本换了 trace 的扩展名/格式，**每一个 `verify` 都会退化成"样本不足→无法判定"，而工具说不出原因**。这是**可诊断性缺口**（不是错答案——失败模式是诚实的 `undetermined`），但撞在演进契约的"锚点失效必须硬报错"上：trace 的**文件命名约定**是锚点，却没被当成锚点 | 未兑现 | P3（小修：找不到任何 `.jsonl` 但目录里**有别的 `trace_*`** 时，明确报"可能换了 trace 格式"） | `.zhll/audit2/00-需求复审.md` 第七节；独立审计认为原措辞"违反演进契约"**定性偏重**，已按它的意见改为"可诊断性缺口"（`.zhll/audit2/20-独立审计（对作者）/WP20.md` A8） |
+| R31 | **畸形 `next` 报错不可行动，且留下孤儿备份**：`next: 0` / `false` / `{}` / `[]` / `true` → HTTP 400 但 `code=INTERNAL` + 裸 `TypeError`（栈直指 `identity-file.mjs:141`），文件未变，**但 `backups/` 多出一份**——引擎在调 `h.apply` 之前就建了备份。同时 `server.mjs:217` 的注释「显式 `''`/`0`/`false` 是合法写入值」对**整文件把手是错的**（`writeFileSync` 只接受 string/Buffer） | 未兑现 | 并入 P3-4（同一处代码） | `.zhll/audit2/gates/WP20/`（独立审计 A1 探针；Lead 另用隔离 fixture 复现：`next:0` → `INTERNAL`、SOUL 32 B 未变、`backups 1`） |
 | R16 | `doctor` 的「总判」只验"锚点可解析"，不验目标存在性、不跑探针；而帮助文案承诺"把手是否可用" | 未兑现 | P3 | `AGENTS.md`「门禁」 |
 | R17 | CLI `restore` 不过闸门、不要 `--confirm`；`restoreBackup` 删除"备份时不存在"的文件前不留当前副本；写后审计有 6 处不在 `try/catch` 内 | **已兑现**（P1，2026-11-02） | —（已改口） | 复核：`node src/selftest.mjs` 的 B1/B2/B3/B4 四条断言 + CLI 不给 `--confirm` → 非零退出 |
 | R21 | `style-file.mjs` 对**非生效档位**把理论增量给成 `0`（不是 `null`）——它是 F3 的**第 4 个生产者**，含非生效 `style.*` 的专家档位仍可能被判 `effective`（P1 只堵了 `?? 0` 求和这一层） | 未兑现 | P3 | `node .zhll/audit2/gates/WP9/redlight.mjs --only=C2-profile-field` |
 | R22 | 还原前的当前内容副本 `<store>/state/restore-pre/` **没有份数上限与清理策略**（P1 先保证不丢数据，磁盘增长留后批） | 未兑现 | P6 | `Get-ChildItem <store>\state\restore-pre` 份数随还原次数线性增长 |
-| R23 | 仍有两处写后审计裸调：`apply` 的 noop 分支与 `verifyProfile` 的 `finish()`（P1 只包了 6 处主路径） | 未兑现 | P6 | `grep -n "appendAudit(storeRoot" src/core/engine.mjs` 对照 `auditAfterWrite(` 的覆盖 |
+| R23 | 写后审计仍有**裸调**：`appendAudit(storeRoot` 共 **10 处**，其中只有 6 处经 `auditAfterWrite()`（`engine.mjs` 的 L139 是包装器本体），**其余 9 处**直接调用，`state/` 不可写时同样会"文件已改、台账零行"。原登记写"两处"且点名 `apply` 的 noop 分支——**实测该分支不写盘，不是"写后"**，原措辞错 | 未兑现（口径已更正） | P6 | `Select-String -Path src\core\engine.mjs -Pattern 'appendAudit\(storeRoot'`（10 命中）对照 `auditAfterWrite\(`（1 定义 + 6 调用） |
 | R24 | CLI `--confirm` 只认裸旗标，而 `--restarted` 认 `true`/`'1'` 三种写法（同一工程两套参数解析风格） | 未兑现 | P6 | `node src/cli.mjs restore <id> --confirm=true` → 当前不认 |
 | R25 | 前端不展示 `restore` 的 `status/failed/savedDir`：CLI 现在会打"部分失败 / 还原前副本在哪"，界面仍只说"已还原" | 未兑现 | P4 | `web/app.js` 的 `doRestore` 只读 `changed`/`results` |
 | R18 | 闸门探测返回 `unknown` 时放行；`checkRestoreGate` 读不出 manifest（含损坏）时放行 | 未兑现 | P6 | `.zhll/audit2/01` #11/#16 |
@@ -204,7 +205,11 @@
 
 | 日期 | 触发 | 首句连读 | 主线兑现 | 读者兑现 | 术语/指称/声音 | 累积矛盾（改了哪几处） |
 |---|---|---|---|---|---|---|
-| 2026-11-02 | 第二轮独立审计后统一十篇 | 通过 | 通过（撤回 I8，见 R5） | 通过（每篇都给"给谁看"） | 拆名「专家档位/审批档位」「最初基线/参考件基线」；术语两方向各查一遍 | **53 处**，九类，逐条对账见下表；另加两处首句连读才看出的问题（两篇抢同一段开场、两处"有自测覆盖"过度声明） |
+| 2026-11-02 | 第二轮独立审计后统一十篇 | 通过 | 通过（撤回 I8，见 R5） | 通过（每篇都给"给谁看"） | 拆名「专家档位/审批档位」「最初基线/参考件基线」；术语两方向各查一遍 | **58 处，13 类**（= 下表逐行相加），另加两处首句连读才看出的问题（两篇抢同一段开场、两处"有自测覆盖"过度声明） |
+
+> ⚠️ **数字口径的更正（独立审计 A10 抓出）**：本行的"处数"此前写 **53**，而同一批改动的提交信息 `15c3045` 写 **47**，下表实际相加是 **58** —— 三个数互斥，根因是**"处"从未定义**（是"被改的文档位置数"还是"被改的文档篇数"）。
+> 本条以**下表逐行相加的 58 处 / 13 类**为准；提交信息不可改，故在此更正并留痕。
+> 同时下表类别数此前写"九类"，实为 **13 行**，一并更正。
 
 ### 改掉的累积矛盾（逐条对账）
 
