@@ -31,7 +31,7 @@ const fail = (msg) => failures.push(msg);
 // ── ① 解析残余表 ─────────────────────────────────────────────
 const rows = [];
 for (let i = 0; i < lines.length; i += 1) {
-  const m = /^\|\s*(R\d+b?)\s*\|/.exec(lines[i]);
+  const m = /^\|\s*(R\d+[a-z]?)\s*\|/.exec(lines[i]);
   if (!m) continue;
   /**
    * ⚠️ 数单元格前必须先把**转义竖线** `\|` 换掉：那是单元格**内容**，不是分隔符。
@@ -156,7 +156,7 @@ for (const d of allMarkdown()) {
    * 相邻行的状态词「未兑现」会落进 ±2 行窗口，把隔壁行的编号误判成过期声明
    * （第一版加强后一次报了 80 条，全是这种。状态词那一格已经由上面的 ⑤ 单独校验过）。
    */
-  const isRow = dl.map((l) => /^\|\s*R\d+b?\s*\|/.test(l));
+  const isRow = dl.map((l) => /^\|\s*R\d+[a-z]?\s*\|/.test(l));
   for (let i = 0; i < dl.length; i += 1) {
     if (isRow[i]) continue;
     const win = [-2, -1, 0, 1, 2].map((k) => (isRow[i + k] ? '' : (dl[i + k] ?? ''))).join('\n');
