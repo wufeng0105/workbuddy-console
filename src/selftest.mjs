@@ -37,10 +37,32 @@ function record(name, err) {
   }
 }
 
-/** @param {string} name @param {() => any} fn */
+/**
+ * 同步断言。
+ *
+ * ⚠️ **不许传 async 函数**（2026-11-03 修，本轮独立检查抓出）。
+ *
+ * 原实现的 `try { const r = fn(); … }` 对 async 函数只能拿到一个 **Promise**：
+ *   ① `r === false` 永远不成立（Promise 不是 false）；
+ *   ② 函数体抛错时那个 Promise **被 reject**，而这里从不 await ⇒ 异常逃出 try/catch，
+ *      变成 **unhandled rejection**。
+ *
+ * 实测后果：`test('doctor 全绿', async () => {…})` 在锚点全坏时会打印
+ *   `✅ doctor 全绿`（先 record 成功）**再**把 unhandled rejection 甩到 stderr、进程 exit 1。
+ * 也就是说，"门禁是红的"这件事靠的是**进程崩溃**，不是断言 —— 而它的输出里那条断言是 ✅。
+ * 任何按"末行 失败 0"读结果的人/脚本都会看反。
+ *
+ * 现在：传进来 async 直接判这条断言**失败**，并指名改成 `atest`。
+ * 这是"断言必须能变红"的底线 —— 不能让一个不可能红的测试假装成测试。
+ *
+ * @param {string} name @param {() => any} fn
+ */
 function test(name, fn) {
   try {
     const r = fn();
+    if (r && typeof r.then === 'function') {
+      throw new Error('async 断言不许用 test() —— 它的失败只会变成 unhandled rejection 并打印 ✅；请改用 atest()');
+    }
     if (r === false) throw new Error('断言为 false');
     record(name, null);
   } catch (e) { record(name, e); }
@@ -220,7 +242,7 @@ test('插件缓存目录在、但无任何合法版本目录 → ANCHOR_MISSING�
   const e = throwsCode(() => createEngine({ configRoot: dirty, storeRoot: store }), 'ANCHOR_MISSING');
   ok(/版本/.test(e.message), `错误信息应说明版本探测失败，实际：${e.message}`);
 });
-test('doctor 全绿（可选锚点缺席不算失败）', async () => {
+test('doctor 全绿（可选锚点缺席不算失败）', () => {
   const d = engine.doctorAnchors();
   const badA = d.anchors.filter((a) => !a.ok).map((a) => a.key);
   const badH = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
@@ -730,39 +752,50 @@ await atest('C3/回归：给了 store 就必须隔离账本，不许落进项目
    * **不带参数会读 `WORKBUDDY_CONSOLE_HOME`**。于是"既传 `--store X` 又设同名环境变量"时
    * 两者相等 ⇒ isolated=false ⇒ 账本写进项目目录。
    *
-   * ⚠️ **这条断言的第一版是假的**（我抽检时发现：把判据改回旧的，它照样绿）：
-   * 它直接给 `createEngine` 传 `baselinesDir`，**根本没经过 server 的 isolated 判据**。
-   * 现在改成两段：
-   *   ① 静态：`server.mjs` 的 isolated 判据不许再和环境变量比（那是 bug 的来源）
-   *   ② 行为：真起 server，看 `describe().isolation` 与账本落点
+   * ⚠️ **这条断言的前两版都是假的**，换法过程本身就是教训：
+   *   第一版直接给 `createEngine` 传 `baselinesDir` —— 根本没经过 server 的 isolated 判据；
+   *   第二版加了静态正则（`/const isolated = …/`）+ 仍是"自己传 baselinesDir"的行为腿。
+   *   2026-11-03 独立检查做变异：把判据改成 `… && false`（隔离**恒不生效**，正是那个 bug），
+   *   **两腿全绿** —— 静态正则只认字形，行为腿走的是自己传的参数。
+   *
+   * 现在只有一条腿，且**只认副作用**：真调 `startConsole({store})`（用户/启动器真走的那条路），
+   * 看账本文件到底落在哪个目录。判据用"回落目录是否被写过"来测 ——
+   *   · 隔离生效 ⇒ 账本在 `<store>/baselines`
+   *   · 隔离失效 ⇒ `explicitBaselinesDir` 为 undefined，账本落到 `WORKBUDDY_BASELINES_DIR`（这里当"回落目录"的哨兵）
+   * 两边都断言，缺一个方向都会漏掉"两处都写"或"两处都没写"。
    */
-  // ① 判据本身：不许出现 `store !== resolveStoreRoot()` 这种与环境漂移比较
-  const srvSrc = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
-  /** 只看代码行，不看注释 —— 注释里正解释这个旧写法为什么错（第一版对整个文件跑正则 → 误报） */
-  const srvCodeOnly = srvSrc.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
-  ok(!/store\s*!==\s*resolveStoreRoot\(\)/.test(srvCodeOnly),
-    'server.mjs 的隔离判据不许和 resolveStoreRoot() 比 —— 它不带参数会读环境变量，导致恒等');
-  ok(/const isolated = typeof store === 'string' && store\.trim\(\) !== ''/.test(srvSrc),
-    '隔离判据必须是「显式给了 store 就算隔离」');
-
-  // ② 行为：显式 store + 同值环境变量（原 bug 触发条件）→ 账本必须落在 store 下
-  const isoStore = ensureDir(path.join(fixtureRoot, 'c3-iso-store2'));
+  const { startConsole } = await import('./server.mjs');
+  const isoStore = ensureDir(path.join(fixtureRoot, 'c3-iso-store3'));
+  /** 哨兵：隔离失效时账本会落在这里（模拟"项目 baselines/"，但绝不动真目录） */
+  const fallbackDir = ensureDir(path.join(fixtureRoot, 'c3-fallback-baselines'));
   const savedHome = process.env.WORKBUDDY_CONSOLE_HOME;
-  process.env.WORKBUDDY_CONSOLE_HOME = isoStore;   // 关键：与传入值相同
+  const savedBaselines = process.env.WORKBUDDY_BASELINES_DIR;
+  // 关键：环境变量与传入值**相同** —— 这正是旧判据 `store !== resolveStoreRoot()` 恒假的触发条件
+  process.env.WORKBUDDY_CONSOLE_HOME = isoStore;
+  process.env.WORKBUDDY_BASELINES_DIR = fallbackDir;
+  const jsonIn = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((x) => x.endsWith('.json')) : []);
+  let s;
   try {
-    const { createConsoleServer } = await import('./server.mjs');
-    createConsoleServer({ configRoot: cfg, storeRoot: isoStore, isolatedBaselines: true });
-    const r = createEngine({ configRoot: cfg, storeRoot: isoStore });
-    // 用 server 侧同一套规则：显式 store ⇒ 账本在 store/baselines
-    const isoEngine = createEngine({
-      configRoot: cfg, storeRoot: isoStore, baselinesDir: path.join(isoStore, 'baselines'),
-    });
-    await isoEngine.baselineCapture();
-    const books = fs.readdirSync(path.join(isoStore, 'baselines')).filter((x) => x.endsWith('.json'));
-    ok(books.length >= 1, `账本必须落在隔离 store 下（实际 ${books.length} 个）`);
-    void r;
+    s = await startConsole({ root: cfg, store: isoStore, port: 0 });
+    /**
+     * `createConsoleServer` 里的 `baselineCapture()` 是**发射后不管**的（不 await），
+     * 所以这里必须等它落地：两边任一出现账本就停等。
+     */
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && jsonIn(isoStore).length === 0 && jsonIn(fallbackDir).length === 0) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const inStore = jsonIn(path.join(isoStore, 'baselines'));
+    const inFallback = jsonIn(fallbackDir);
+    ok(inStore.length >= 1,
+      `显式给了 store ⇒ 账本必须落在 <store>/baselines（实际 ${inStore.length} 个；落进回落目录的是 ${JSON.stringify(inFallback)}）`);
+    eq(inFallback.length, 0,
+      `隔离生效时账本**一个都不许**落进回落目录（实际 ${JSON.stringify(inFallback)}）—— 判据又和 resolveStoreRoot() 比了？`);
   } finally {
     process.env.WORKBUDDY_CONSOLE_HOME = savedHome;
+    process.env.WORKBUDDY_BASELINES_DIR = savedBaselines;
+    /** 真服务必须关掉，否则监听中的 server 会吊着事件循环，让整个自测退不出去 */
+    try { await s?.app?.close(); } catch { /* 关不掉不影响断言结论 */ }
   }
 });
 

@@ -238,7 +238,7 @@ const bodyOf = (opts) => {
   try { return JSON.parse(opts?.body ?? '{}'); } catch { return {}; }
 };
 
-function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null, restorePreview = null, applyResult = null } = {}) {
+function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null, restorePreview = null, applyResult = null, restoreResult = null } = {}) {
   const doc = new StubDocument();
   const apiCalls = [];
 
@@ -279,6 +279,8 @@ function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], 
       if (body.dryRun === true) {
         return restorePreview ?? { changed: [], willDelete: [], backupId: body.backupId };
       }
+      /** 实际执行的结果：让用例能注入 `results[]`（含失败项）与 `savedDir`（R25 需要） */
+      if (restoreResult) return { backupId: body.backupId, ...restoreResult };
       return { changed: ['x'], deleted: [], backupId: body.backupId };
     }
     if (p === '/api/baseline') return { available: true, versionKey: '5.9.3(t)', capturedAt: '2026-11-01T00:00:00Z', entries: {}, ledgers: [] };
@@ -907,19 +909,71 @@ test('R4：apply 必须在界面上显示后端返回的 previewWarnings', async
   assert.match(flashText, /已写入/, '结论本身仍要保留');
 });
 
-test('R25：还原部分失败时不许打绿说"已还原"', async () => {
+test('R25：还原部分失败时不许打绿说"已还原"（行为）', async () => {
   /**
    * 后端 `restoreBackup` 返回 `ok`/`partial`/`savedDir`/`results[]`，
    * 而前端原来只读 `changed` 和 `deleted` —— 一条失败时照样打绿。
    * 用户以为回到原状了，其实没有。
+   *
+   * ⚠️ **这条断言的第一版是源码正则**，2026-11-03 独立检查用变异证伪：
+   * 把过滤条件从 `x.ok === false` 反转成 `x.ok === true`（失败项当成成功项统计，
+   * 界面从此**永远打绿**，正好是本条要防的那个 bug），四条 `assert.match` **全部照样匹配**。
+   * 它钉的是字形，不是行为。
+   *
+   * 现在走用户真走的那条路：守护页 → 备份时间线「还原」→ 后端返回一条失败 →
+   * 断言 flash 必须是 **err（红）**、必须列出失败路径、必须给出还原前副本位置。
+   * 三证：① 反转 `ok === false` → 红；② 正常 → 绿；③ 删掉 `r.savedDir` 那行 → 红。
    */
-  const code = stripComments(readHead());
-  const fn = /async function doRestore\([\s\S]*?\n  \}/.exec(code)?.[0] ?? '';
-  assert.ok(fn, '找不到 doRestore');
-  assert.match(fn, /results/, '必须读 results 才能知道哪一条失败了');
-  assert.match(fn, /failedItems/, '必须把失败项筛出来');
-  assert.match(fn, /savedDir/, '必须告诉用户还原前副本在哪（失败时唯一能救回来的东西）');
-  assert.match(fn, /type: failedItems\.length \? 'err' : 'ok'/, '有失败时 flash 必须是 err（红色），不许打绿');
+  const backups = [{ id: 'bk-20261103-9', createdAt: '2026-11-03T00:00:00Z', entries: 2, reason: 'apply personalization.soul' }];
+  await loadApp({
+    mode: 'ok',
+    handles: [SOUL_HANDLE],
+    overview: {
+      version: '5.9.3', configRoot: 'c', storeRoot: 's',
+      health: { ok: true, anchors: 11, anchorFailures: 0, handles: 1 },
+      gate: { appRunning: false }, drift: { available: false },
+      customized: [], unknown: [], todos: [], recent: [], backups, counts: {},
+    },
+    // 预演：有变化、无删除 ⇒ 不弹确认框，直接进执行
+    restorePreview: { changed: ['C:/x/SOUL.md'], willDelete: [] },
+    // 执行：两条结果，一条失败 —— 后端此时 status 会是 'partial'
+    restoreResult: {
+      changed: ['C:/x/SOUL.md'],
+      deleted: [],
+      status: 'partial',
+      savedDir: 'C:\\store\\state\\restore-pre\\bk-20261103-9',
+      results: [
+        { key: 'personal.soul', absPath: 'C:\\x\\SOUL.md', action: 'restore', ok: true },
+        { key: 'personal.user', absPath: 'C:\\x\\USER.md', action: 'error', ok: false, error: 'EPERM' },
+      ],
+    },
+  });
+  const root = await boot();
+  const nav = root.querySelectorAll('.nav-tab').find((x) => x.textContent.trim() === '守护');
+  assert.ok(nav, '找不到导航「守护」');
+  nav.click();
+  await tick(150);
+
+  const row = root.querySelectorAll('.tl-row')[0];
+  assert.ok(row, '找不到备份时间线的行');
+  const btn = row.querySelectorAll('button').find((x) => x.textContent.trim() === '还原');
+  assert.ok(btn, '备份时间线里必须有「还原」按钮');
+  btn.click();
+  await tick(250);
+
+  const flash = root.querySelectorAll('.flash')[0];
+  assert.ok(flash, '还原之后必须有结果条（静默什么都不说同样是错的）');
+  const text = flash.textContent;
+  assert.match(text, /失败/, `部分失败必须说出来。实际 flash: ${JSON.stringify(text.slice(0, 200))}`);
+  assert.match(text, /USER\.md/, `必须点名哪一条失败了（用户才知道去查哪个文件）。实际: ${JSON.stringify(text.slice(0, 200))}`);
+  assert.match(text, /restore-pre/, `必须给出还原前副本的位置（失败时唯一能救回来的东西）。实际: ${JSON.stringify(text.slice(0, 200))}`);
+  /**
+   * 颜色/语义：flash 的 class 决定用户看到红还是绿。
+   * 只断言文案不够 —— 文案里出现"失败"却配绿色底，等于还是"打绿"。
+   */
+  assert.ok(flash.classList.contains('flash-err'),
+    `有失败项时必须是 flash-err（红），实际 class=${JSON.stringify(flash.className)}`);
+  assert.ok(!flash.classList.contains('flash-ok'), '同一份结果不许同时打绿');
 });
 test('P0/T12：API 全 401 时，一轮渲染不得自激重排（曾经的 401 次）', async () => {
   const { } = await loadApp({ mode: 'down' });
