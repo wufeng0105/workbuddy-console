@@ -129,8 +129,30 @@ export function combineVerdicts({ ruleVerdict, promptVerdict, ruleChanged, promp
   if (ruleChanged) parts.push({ face: '规则面', verdict: ruleVerdict });
   if (promptChanged) parts.push({ face: '提示词面', verdict: promptVerdict });
 
+  /**
+   * ⚠️ `parts.length === 0` **不是「已生效」**（残余 R3c，2026-11-03 修）。
+   *
+   * 原实现：`off` 档没有任何面需要改，直接
+   * `return { verdict: 'effective', reason: '没有需要改动的面（原厂档）' }`。
+   * 于是**用户从没 apply 过任何东西**也会看到绿色「✅ 生效」、退出码 0。
+   *
+   * 为什么错：`off` 档确实"不需要改动"，但用户点「验证」问的是
+   * **「我现在的状态是不是原厂状态」**——而这段代码**从来没检查过**当前规则是不是原厂那 135 条。
+   * 它把「无事可做」答成了「已生效」，正是铁律 6 禁止的那一种：**把「没测」说成「通过」**。
+   *
+   * 为什么不改成"真去回读当前规则、与出厂值对照"：那需要一个**出厂状态**参照系，
+   * 而最初基线账本存的是**用户捕获那一刻**的状态，不是出厂——拿它当出厂会造出新的假确定。
+   * 所以如实判 `undetermined`，并给出**可行动的下一步**。
+   */
   if (parts.length === 0) {
-    return { verdict: 'effective', reason: '没有需要改动的面（原厂档）', parts };
+    return {
+      verdict: 'undetermined',
+      reason: '这个档位没有需要改动的面（原厂档），因此没有可验证的改动。'
+        + '注意：这**不代表**你当前就是原厂状态——本次没有读过规则，也就没有证据。'
+        + '要确认现状，请 `node src/cli.mjs probe rules.file`（看当前规则）'
+        + ' 与 `node src/cli.mjs baseline`（看最初基线记录的条目）自行对照。',
+      parts,
+    };
   }
   if (parts.some((p) => p.verdict === 'ineffective')) {
     const bad = parts.filter((p) => p.verdict === 'ineffective').map((p) => p.face);

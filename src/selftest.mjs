@@ -220,8 +220,8 @@ test('插件缓存目录在、但无任何合法版本目录 → ANCHOR_MISSING�
   const e = throwsCode(() => createEngine({ configRoot: dirty, storeRoot: store }), 'ANCHOR_MISSING');
   ok(/版本/.test(e.message), `错误信息应说明版本探测失败，实际：${e.message}`);
 });
-test('doctor 全绿（可选锚点缺席不算失败）', () => {
-  const d = engine.doctor();
+test('doctor 全绿（可选锚点缺席不算失败）', async () => {
+  const d = engine.doctorAnchors();
   const badA = d.anchors.filter((a) => !a.ok).map((a) => a.key);
   const badH = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
   ok(d.ok, `doctor 未通过：锚点[${badA.join(',')}] 把手[${badH.join(',')}]`);
@@ -240,7 +240,7 @@ test('回归：目标文件缺席时锚点仍可确定（全新安装可用）',
   const r = e2.resolver.resolve('personal.soul');
   ok(r.path && r.path.toLowerCase().endsWith('soul.md'), '锚点路径仍应可确定');
   eq(r.exists, false, 'SOUL.md 应报告"不存在"，而不是让锚点报错');
-  const bad = e2.doctor().handles.filter((h) => !h.anchorOk).map((h) => h.id);
+  const bad = e2.doctorAnchors().handles.filter((h) => !h.anchorOk).map((h) => h.id);
   eq(bad.length, 0, `全新安装下 doctor 应为绿，失败：${bad.join(',')}`);
 });
 
@@ -590,7 +590,7 @@ console.log('\n【8】P1a · 个性化五项（SOUL / USER / IDENTITY / toneStyl
 const APP_CONFIG = path.join(cfg, 'app', 'app-config.json');
 
 await atest('五项个性化把手全部注册且锚点可解析', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const want = [
     'personalization.soul', 'personalization.user', 'personalization.identity',
     'personalization.tone-style', 'personalization.custom-prompt',
@@ -721,6 +721,89 @@ await atest('无令牌 → 401；正确令牌 → doctor 返回 5 把手', async
   eq(j.ok, true, 'ok 应为 true');
   ok(j.data.handles.length >= 5, `应返回至少 5 个把手，实际 ${j.data.handles.length}`);
 });
+await atest('C3/回归：给了 store 就必须隔离账本，不许落进项目 baselines/', async () => {
+  /**
+   * ⚠️ 实测踩过**两次**的隔离漏洞（独立审计者一次、我一次），而它不会自己暴露：
+   * `baselines/` 是 gitignore 的，**永远不出现在 `git status` 里**。
+   *
+   * 根因：`server.mjs` 的判据曾是 `store !== resolveStoreRoot()`，而 `resolveStoreRoot()`
+   * **不带参数会读 `WORKBUDDY_CONSOLE_HOME`**。于是"既传 `--store X` 又设同名环境变量"时
+   * 两者相等 ⇒ isolated=false ⇒ 账本写进项目目录。
+   *
+   * ⚠️ **这条断言的第一版是假的**（我抽检时发现：把判据改回旧的，它照样绿）：
+   * 它直接给 `createEngine` 传 `baselinesDir`，**根本没经过 server 的 isolated 判据**。
+   * 现在改成两段：
+   *   ① 静态：`server.mjs` 的 isolated 判据不许再和环境变量比（那是 bug 的来源）
+   *   ② 行为：真起 server，看 `describe().isolation` 与账本落点
+   */
+  // ① 判据本身：不许出现 `store !== resolveStoreRoot()` 这种与环境漂移比较
+  const srvSrc = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
+  /** 只看代码行，不看注释 —— 注释里正解释这个旧写法为什么错（第一版对整个文件跑正则 → 误报） */
+  const srvCodeOnly = srvSrc.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+  ok(!/store\s*!==\s*resolveStoreRoot\(\)/.test(srvCodeOnly),
+    'server.mjs 的隔离判据不许和 resolveStoreRoot() 比 —— 它不带参数会读环境变量，导致恒等');
+  ok(/const isolated = typeof store === 'string' && store\.trim\(\) !== ''/.test(srvSrc),
+    '隔离判据必须是「显式给了 store 就算隔离」');
+
+  // ② 行为：显式 store + 同值环境变量（原 bug 触发条件）→ 账本必须落在 store 下
+  const isoStore = ensureDir(path.join(fixtureRoot, 'c3-iso-store2'));
+  const savedHome = process.env.WORKBUDDY_CONSOLE_HOME;
+  process.env.WORKBUDDY_CONSOLE_HOME = isoStore;   // 关键：与传入值相同
+  try {
+    const { createConsoleServer } = await import('./server.mjs');
+    createConsoleServer({ configRoot: cfg, storeRoot: isoStore, isolatedBaselines: true });
+    const r = createEngine({ configRoot: cfg, storeRoot: isoStore });
+    // 用 server 侧同一套规则：显式 store ⇒ 账本在 store/baselines
+    const isoEngine = createEngine({
+      configRoot: cfg, storeRoot: isoStore, baselinesDir: path.join(isoStore, 'baselines'),
+    });
+    await isoEngine.baselineCapture();
+    const books = fs.readdirSync(path.join(isoStore, 'baselines')).filter((x) => x.endsWith('.json'));
+    ok(books.length >= 1, `账本必须落在隔离 store 下（实际 ${books.length} 个）`);
+    void r;
+  } finally {
+    process.env.WORKBUDDY_CONSOLE_HOME = savedHome;
+  }
+});
+
+await atest('C0/回归：/api/overview 必须 200 且带 health —— 首页数据源不许恒 500', async () => {
+  /**
+   * ⚠️ 这是 2026-11-03 的**致命回归**，由独立审计抓到：
+   *
+   * `doctor()` 改成 async（R3d：真跑 probe）之后，`engine.mjs` 的 `overview()` 里
+   * 漏了 `await` ⇒ 拿到 Promise ⇒ `d.anchors.filter(...)` 抛 TypeError
+   * ⇒ **`/api/overview` 恒 500，首页整页失据**。
+   *
+   * 更糟的是它连锁到启动器：`launch.mjs` 用 `/api/overview` 判断"这个端口是不是我的"，
+   * 于是第二次双击会误报「令牌对不上，去旧窗口重抄」——而地址完全可用。
+   *
+   * 为什么三条门禁全绿却没抓到：本文件当时**只测了 `/api/doctor`**（对 `api/overview` 零命中），
+   * 前端断言用的是 DOM stub 假数据。**"有断言" ≠ "断言覆盖了这条路径"。**
+   *
+   * 这条断言就是那个缺口的补丁：**走真 HTTP，打真接口**。
+   */
+  const r = await fetch(`${BASE}/api/overview`, { headers: AUTH });
+  eq(r.status, 200, `/api/overview 应 200，实际 ${r.status}`);
+  const j = await r.json();
+  eq(j.ok, true, 'ok 应为 true');
+  // 首页要用到的字段一个都不能少（缺了就是"界面画不出来"，不是"某个字段可选"）
+  for (const k of ['health', 'counts', 'gate', 'version']) {
+    ok(j.data && j.data[k] !== undefined, `/api/overview 必须返回 ${k}（首页首屏依赖它）`);
+  }
+  /**
+   * 深层字段：**这里才是曾经炸的地方** —— `d.anchors.filter(...)` 在 Promise 上取 `.anchors`。
+   * 所以断言必须咬到 `health` 的**内部**（anchorFailures 就是从 anchors 过滤出来的），
+   * 只断言"health 存在"会漏掉真现场。
+   */
+  const hz = j.data.health;
+  eq(typeof hz, 'object', `health 应是对象，实际 ${typeof hz}`);
+  for (const k of ['ok', 'anchors', 'anchorFailures', 'handles']) {
+    ok(hz[k] !== undefined, `health.${k} 缺失 —— 它由 doctor() 的结果算出，缺了说明那一层又断了`);
+  }
+  ok(typeof hz.anchors === 'number' && hz.anchors > 0, `health.anchors 应是正数（实际 ${hz.anchors}）`);
+  eq(hz.anchorFailures, 0, `fixture 下锚点不该失败，实际 ${hz.anchorFailures}`);
+});
+
 await atest('错误令牌 → 401', async () => {
   const r = await fetch(`${BASE}/api/doctor`, { headers: { 'X-WBC-Token': 'definitely-wrong-token' } });
   eq(r.status, 401, '错误令牌应 401');
@@ -907,7 +990,7 @@ await atest('删除档位', async () => {
 console.log('\n【11】P1c · style 档位内容把手（安装目录 / 厂商文件 / 升级失效）');
 
 await atest('七个 style 把手全部注册且锚点可解析', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('style.'));
   eq(ids.length, 7, `应有 7 个 style 把手，实际 ${ids.length}`);
   const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
@@ -915,7 +998,7 @@ await atest('七个 style 把手全部注册且锚点可解析', async () => {
 });
 
 await atest('resolveTarget 按 id 定位到各自的 style 文件（静态锚点表达不了）', async () => {
-  const h = engineB.doctor().handles.find((x) => x.id === 'style.socratic');
+  const h = engineB.doctorAnchors().handles.find((x) => x.id === 'style.socratic');
   ok(h.anchorPath.endsWith('style-socratic.md'), `路径不符：${h.anchorPath}`);
 });
 
@@ -986,7 +1069,7 @@ for (const mode of ['code', 'work', 'design']) {
 }
 
 await atest('三个提示词模板把手注册，doctor 全绿', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('prompt.welcomemode-'));
   eq(ids.length, 3, `应有 3 个模板把手，实际 ${ids.length}`);
   const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
@@ -1006,7 +1089,7 @@ await atest('识别 content_policy / personal_files_safety 段存在', async () 
 });
 
 await atest('通道是请求头部，验证策略必须是标记法（不是 token-delta）', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const h = d.handles.find((x) => x.id === 'prompt.welcomemode-code');
   eq(h.channel, 'request-head', '通道应为 request-head');
   eq(h.verification.strategy, 'marker-trace-grep', '验证策略应为标记法');
@@ -1014,7 +1097,7 @@ await atest('通道是请求头部，验证策略必须是标记法（不是 tok
 });
 
 await atest('闸门：应用运行中/未确认状态下的保护齐备', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const h = d.handles.find((x) => x.id === 'prompt.welcomemode-code');
   eq(h.writeClass, 'vendor-file', '应为厂商文件（逐次确认）');
   eq(h.upgradeBehavior, 'invalidated', '升级应标记为失效');
@@ -1178,7 +1261,7 @@ const engineRules = createEngine({
 });
 
 await atest('三域规则把手注册，doctor 全绿', async () => {
-  const d = engineB.doctor();
+  const d = engineB.doctorAnchors();
   const ids = d.handles.map((h) => h.id).filter((x) => x.startsWith('rules.'));
   eq(ids.length, 3, `应有 3 个规则把手，实际 ${ids.length}`);
   const bad = d.handles.filter((h) => !h.anchorOk).map((h) => h.id);
@@ -1630,6 +1713,127 @@ await atest('verifyApproval：无重启/无新请求时如实报 undetermined，
   ok(/永远不可能被完全验证/.test(r.caveat), '必须带那句免责说明');
 });
 
+// ══════════════ R3 三条错答案路径（2026-11-03 修）══════════════
+//
+// R3 原本把 6 件不同性质的事塞在一条残余里，状态词只能给一个「未兑现」，
+// 于是修掉一条整条状态不会变。这里为真修掉的三条各配一条断言。
+
+await atest('R3c：off 档（没有需要改动的面）verify 必须 undetermined，不许 effective', async () => {
+  /**
+   * 原实现：`combineVerdicts` 在 `parts.length === 0` 时直接
+   *   `return { verdict: 'effective', reason: '没有需要改动的面（原厂档）' }`
+   * 于是**用户从没 apply 过任何东西**也看到绿色「✅ 生效」、退出码 0。
+   *
+   * 为什么错：`off` 档确实"不需要改动"，但用户问的是
+   * 「我现在的状态是不是原厂状态」——而代码**从来没检查过**。
+   * 把「无事可做」答成「已生效」= 把「没测」说成「通过」（铁律 6）。
+   */
+  const { combineVerdicts } = await import('./core/approval.mjs');
+  const r = combineVerdicts({ ruleChanged: false, promptChanged: false });
+  eq(r.verdict, 'undetermined', `off 档不许报 effective，实际 ${r.verdict}：${r.reason}`);
+  ok(!/生效/.test(r.reason.split('不代表')[0] ?? ''), '理由里不许出现"生效"字样冒充结论');
+  ok(/probe rules\.file/.test(r.reason), '必须给出可行动的下一步（怎么自查）');
+});
+
+await atest('R3b：approval-verify 的 --restarted 必须真的改变结论（行为断言，不是源码正则）', async () => {
+  /**
+   * 原缺陷：`verifyApproval(level)` 不收任何参数，内部 `verify('rules.file', {})`
+   * 传空对象 ⇒ readback 拿不到"已重启"声明 ⇒ 规则面永久「无法判定」。
+   * 而 CLI 一直打印「重启后验证：approval-verify <档位>」——那条命令给不出结论。
+   *
+   * ⚠️ **这里的第一版是源码正则**，被独立审计用变异测试证伪：
+   * 把 `restarted: parseRestarted(f.restarted)` 改成 `restarted: true`
+   * （行为错误：永远声称重启过）→ 正则照样匹配、断言全绿。
+   * **它钉的是字形不是行为。**
+   *
+   * 现在改成行为断言：造出"写入记录 + 已重启"两阶段状态，
+   * 断言"不带 flag" 与 "带 flag" 得到**不同**结论。
+   */
+  const approvalStore = ensureDir(path.join(fixtureRoot, 'r3b-store'));
+  const e4 = createEngine({ configRoot: cfg, storeRoot: approvalStore });
+  // 前置：必须让 rules.file 的 apply 真的跑过一次（recordAfterWrite 只在 rules.mjs 的 apply 里调）
+  // fixture 的 file.rules 初始为空 ⇒ 先写一条 ask 规则，才有东西可迁移
+  {
+    const st = path.join(cfg, 'settings.json');
+    const stj = JSON.parse(fs.readFileSync(st, 'utf8'));
+    stj.sandbox.orderedRules.file.rules = [
+      { path: 'C:\\r3b-probe', isDirectory: true, read: 'ask', write: 'ask', delete: 'ask' },
+    ];
+    fs.writeFileSync(st, JSON.stringify(stj, null, 2));
+  }
+  await e4.apply('rules.file', { next: { from: 'ask', to: 'allow', actions: ['write'] }, actor: 'selftest' });
+  await e4.applyApproval('relaxed', { confirm: true, actor: 'selftest' });
+
+  const off = await e4.verifyApproval('relaxed', { restarted: false });
+  const on = await e4.verifyApproval('relaxed', { restarted: true });
+
+  // 判据：两侧都必须有规则面的结论，且**必须不同**
+  const ruleOf = (r) => r.parts?.find((p) => p.face === '规则面')?.verdict;
+  eq(ruleOf(off), 'undetermined', `不带 --restarted 时规则面必须 undetermined（实际 ${ruleOf(off)}）`);
+  eq(ruleOf(on), 'effective', `带 --restarted 时规则面必须 effective（实际 ${ruleOf(on)}）—— 若仍 undetermined，说明参数没被透传`);
+  ok(ruleOf(off) !== ruleOf(on),
+    '两种写法的规则面结论必须不同 —— 相同说明 --restarted 是个摆设');
+});
+
+await atest('R3d：doctor 必须真跑 probe，目标缺失时不许报「全部通过」', async () => {
+  /**
+   * 原实现：`ok = anchors.every(a => a.ok) && handles.every(h => h.anchorOk)`
+   * —— 只验"锚点能解析出路径"。11 个锚点里 7 个目标**文件根本不存在**时照样
+   * 「总判：✅ 全部通过」+ exit 0，而帮助文案承诺"把手是否可用"。
+   *
+   * 这里造一个 style 目录为空的 fixture：锚点仍可解析，但目标全不存在。
+   */
+  const broken = path.join(fixtureRoot, 'r3d-broken');
+  fs.rmSync(broken, { recursive: true, force: true });
+  ensureDir(path.join(broken, 'app'));
+  ensureDir(path.join(broken, 'user-0000000000-personal'));
+  for (const mode of ['code', 'work', 'design']) {
+    const d = ensureDir(path.join(broken, 'plugins', 'cache', 'workbuddy-builtin', `welcomemode-${mode}`, '5.9.3-wb.x.g0000.h0000'));
+    fs.writeFileSync(path.join(d, 'prompt.tpl'), 'x', 'utf8');
+  }
+  fs.writeFileSync(path.join(broken, 'app', 'app-config.json'), '{"personalization":{"toneStyle":"efficient","customPrompt":""}}', 'utf8');
+  fs.writeFileSync(path.join(broken, 'settings.json'), '{}', 'utf8');
+
+  /**
+   * ⚠️ 必须**临时把安装根指到一个空目录**。
+   *
+   * 自测全局把 `WORKBUDDY_CONSOLE_INSTALL_DIR` 指向 `fixtureRoot/install`（那里的
+   * 七个 style 文件是别的用例造的）——不换根的话本用例测的是"目标存在"，
+   * 断言会拿到 `targetExists: true` 而红（我第一次就是这么红的）。
+   */
+  const emptyInstall = ensureDir(path.join(fixtureRoot, 'r3d-empty-install'));
+  fs.mkdirSync(path.join(emptyInstall, 'resources', 'app.asar.unpacked', 'resources', 'templates', 'style'), { recursive: true });
+  const savedInstall = process.env.WORKBUDDY_CONSOLE_INSTALL_DIR;
+  process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = emptyInstall;
+  let e3;
+  try {
+    e3 = createEngine({ configRoot: broken, storeRoot: store, version: '5.9.3' });
+  } finally {
+    // 引擎在构造时读锚点表，但 resolveOptional 是运行时的 —— 必须等 doctor() 跑完再还原
+  }
+  const d = await e3.doctor();
+  process.env.WORKBUDDY_CONSOLE_INSTALL_DIR = savedInstall;
+  // 前置：style 锚点确实解析得出（否则测的就不是"目标缺失"而是"锚点缺失"）
+  const styleEntry = d.handles.find((h) => h.id === 'style.creative');
+  ok(styleEntry, '找不到 style.creative');
+  ok(styleEntry.anchorOk, '前置：锚点应可解析');
+  // 断言本体
+  eq(styleEntry.targetExists, false, '目标不存在时必须如实报 false');
+  eq(styleEntry.probe, 'ok', 'probe 本身应成功（它回答"存在吗"，不是"必须存在"）');
+  eq(d.ok, false, 'doctors 总判必须是 false —— 目标缺失不许说「全部通过」');
+  ok(d.summary.targetMissing > 0, `summary 必须报出目标缺失数，实际 ${JSON.stringify(d.summary)}`);
+
+  /**
+   * ⚠️ 这里原来有一段**假第三证**，已删（2026-11-03，独立审计抓出）：
+   *
+   *   const noProbe = { ...e3.doctorAnchors() };
+   *   eq(noProbe.ok, true, '…说明本断言钉的是新增的 probe 层');
+   *
+   * 它浅拷贝**另一个函数**的结果、再断言它为真 —— 永远不会红，和被测行为毫无关系。
+   * 真正的"第三证"在红灯验证里：把 `ok` 的判据改回只看锚点，**上面那两条 eq 会红**。
+   * 断言里写"对照"不算第三证，**注入变异才算**。
+   */
+});
 // ══════════════ 审计修复回归（2026-11-01 只读审计发现的问题）══════════════
 //
 // 这一节守的是"审计发现 → 修复 → 不再复发"。
@@ -2048,7 +2252,7 @@ await atest('D5：前端 doRestore 必须传 confirm（**剥掉注释后**仍出
 // ══════════════ WP9 · P1 止血 + 立信（2026-11-02）══════════════
 // 每条修复都配一条**行为**断言（不是"源码里有这个词"），并各自做过三证：
 //   ① 把修复改回缺陷态 → 红；② 正常态 → 绿；③ 把被测字段删掉 → 红。
-// 三证的原始输出见 `.zhll/audit2/gates/WP9/`。
+    // 三证的原始输出是过程资料，不入库。
 
 console.log('\n【WP9】P1 止血：F1 漏参数 / F2 还原留副本 / F6 写后台账 / F7 逐条容错 / F3 null 传播');
 
@@ -2446,7 +2650,7 @@ await atest('C2：applyProfile 多把手求和 —— 任一项估不出则整�
 // ══════════════ WP12 · P3a 收口：写路径原子化 / 报错说得清 / 畸形输入不留孤儿备份（2026-11-02）══════════════
 // 三条残余是一件事：**写入**在三处极端情况下也要说得清 —— 写失败（R27）、盘满（R28）、输入畸形（R31）。
 // 每条断言都做了三证：① 改回缺陷态 → 红；② 正常态 → 绿；③ 删掉被测守卫/调用 → 仍必须红。
-// 三证原始输出见 `.zhll/audit2/gates/WP12/`。
+    // 三证原始输出是过程资料，不入库。
 
 console.log('\n【WP12】P3a 收口：R27 原子写 / R28 写失败文案 / R31 畸形 next 不留孤儿备份');
 
@@ -2599,7 +2803,7 @@ await atest('W3（R27/R28）：真实把手写入失败 → 目标逐字节不�
 
 await atest('W4（R28）：errno 映射层 —— ENOSPC→DISK_FULL + 状态声明；"不是写失败"不许蹭这句话', async () => {
   /**
-   * 真 ENOSPC 由 Lead 的 VHD 台架跑（`.zhll/audit2/gates/lead/e4-enospc.mjs`）；
+       * 真 ENOSPC 需要造一个真满盘的环境才能测（本机不做，见残余表）；
    * 这里把**映射层**单独钉住：同一个 errno 在两处（HTTP/CLI）必须给出同一句话。
    */
   const { mapWriteError, writeFailureError, WRITE_NOT_HAPPENED } = await import('./core/atomic-write.mjs');

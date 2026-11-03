@@ -160,11 +160,23 @@ async function main(argv) {
    */
   const isolationLines = (onlyHandleId) => {
     const installRoot = requestedInstallRoot();
-    const all = findVendorEscapes(engine.doctor().handles, { configRoot, installRoot });
+    const all = findVendorEscapes(engine.doctorAnchors().handles, { configRoot, installRoot });
     const escapes = onlyHandleId ? all.filter((e) => e.id === onlyHandleId) : all;
     return isolationWarning({ escapes, configRoot, installRoot, requestedRoot: typeof f.root === 'string' ? f.root : null });
   };
   const storeRoot = resolveStoreRoot(typeof f.store === 'string' ? f.store : undefined);
+  /**
+   * 解析 `--restarted`。三种写法都要认（裸旗标 / `=true` / 空格 true）。
+   *
+   * 抽成函数是因为它现在有**两个**消费点：把手级 `verify` 与审批级 `approval-verify`。
+   * 同一工程两套参数解析风格是 R24 登记的债，别再添一处。
+   *
+   * ⚠️ 必须定义在 `switch` 之外：曾把它写进 `case` 分支里，
+   * 而 `approval-verify` 在更前面的 case 中调用它 → `ReferenceError: Cannot access
+   * 'parseRestarted' before initialization`（TDZ，const 不提升）。三个修复一起跑才暴露。
+   */
+  const parseRestarted = (v) => v === true || v === 'true' || v === '1';
+
   registerAll();
 
   const engine = createEngine({
@@ -176,7 +188,7 @@ async function main(argv) {
 
   switch (cmd) {
     case 'doctor': {
-      const d = engine.doctor();
+      const d = await engine.doctor();
       const iso = isolationLines(null);
       if (json) return out({ ...d, isolation: iso ? { ok: false, warnings: iso } : { ok: true } }, true);
       console.log(`WorkBuddy ${d.version}   （锚点表 ${tildify(d.tableFile)}）`);
@@ -185,9 +197,18 @@ async function main(argv) {
       for (const a of d.anchors) console.log(`  ${a.ok ? '✅' : '❌'} ${a.key.padEnd(24)} ${a.ok ? a.path : `${a.error} ${a.message}`}`);
       console.log('\n把手：');
       for (const h of d.handles) {
-        console.log(`  ${h.anchorOk ? '✅' : '❌'} ${h.id}  [${h.writeClass}/${h.privilege}/${h.channel}/${h.upgradeBehavior}]`);
+        // 三层：锚点 → 目标存不存在 → probe 结论（R3d）。
+        // 曾经只打第一层，于是 7 个目标文件不存在也照样「✅ 全部通过」。
+        const mark = !h.anchorOk ? '❌' : h.probe === 'failed' ? '❌' : (h.probe === 'ok' && h.targetExists !== true) ? '❌' : '✅';
+        console.log(`  ${mark} ${h.id}  [${h.writeClass}/${h.privilege}/${h.channel}/${h.upgradeBehavior}]`);
         console.log(`      锚点 ${h.anchorPath ?? h.error}`);
         console.log(`      验证 ${h.verification.strategy} @ ${h.verification.channel}`);
+        // 目标存在性与可写性（只有真跑过 probe 才知道）
+        const targetNote = h.probe === 'failed' ? `探测失败 ${h.probeError}`
+      : h.probe === 'skipped' ? '未探测'
+        : h.targetExists !== true ? '目标不存在'
+          : `存在${typeof h.bytes === 'number' ? ` ${h.bytes} B` : ''}${h.writeAccess === false ? ' · 不可写' : h.writeAccess === true ? ' · 可写' : ''}`;
+        console.log(`      目标 ${targetNote}`);
       }
       if (iso) { console.log(''); for (const l of iso) console.log(l); }
       console.log(`\n总判：${d.ok && !iso ? '✅ 全部通过' : (d.ok ? '❌ 锚点通过，但隔离不一致（见上）' : '❌ 有问题')}`);
@@ -195,7 +216,7 @@ async function main(argv) {
     }
 
     case 'list': {
-      const rows = engine.doctor().handles;
+      const rows = (await engine.doctor()).handles;
       if (json) return out(rows, true);
       for (const h of rows) console.log(`${h.id.padEnd(26)} ${h.title}  [${h.writeClass}] 验证=${h.verification.strategy}`);
       return undefined;
@@ -213,7 +234,7 @@ async function main(argv) {
     }
 
     case 'plan': {
-      const h = engine.doctor().handles.find((x) => x.id === f._[1]);
+      const h = (await engine.doctor()).handles.find((x) => x.id === f._[1]);
       const next = f.set !== undefined ? readNextFor(f.set, h?.inputKind) : undefined;
       const p = await engine.plan(f._[1], { next });
       /**
@@ -260,7 +281,7 @@ async function main(argv) {
     }
 
     case 'apply': {
-      const h = engine.doctor().handles.find((x) => x.id === f._[1]);
+      const h = (await engine.doctor()).handles.find((x) => x.id === f._[1]);
       /**
        * ⚠️ 必须**显式**要求 --set（独立复核 D1，CRITICAL）。
        *
@@ -304,6 +325,7 @@ async function main(argv) {
       return undefined;
     }
 
+
     case 'verify': {
       /** @type {{baselineTokens?:number, observedTokens?:number, expectedDelta?:number, restarted?:boolean}} */
       const args = {};
@@ -317,7 +339,7 @@ async function main(argv) {
       // `--restarted=true` 与 `--restarted true`（parseArgs 给字符串 "true"）。
       // 曾经只判 `=== true`，后两种**静默失效**——输出与不带参数逐字相同，
       // 用户以为"重启过了但没生效"，实际是参数没被认出来（独立复核 [C13] 抓出）。
-      if (f.restarted === true || f.restarted === 'true' || f.restarted === '1') args.restarted = true;
+      if (parseRestarted(f.restarted)) args.restarted = true;
       const r = await engine.verify(f._[1], args);
       if (json) return out(r, true);
       console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   ${r.handle ?? f._[1]}`);
@@ -634,13 +656,21 @@ async function main(argv) {
         console.log(d.ok ? `   · ${d.face}` : `   ❌ ${d.face}  ${d.error}`);
       }
       console.log('\n⚠️  两个面都需要**重启 WorkBuddy** 才生效。');
-      console.log(`   重启后验证：node src/cli.mjs approval-verify ${r.level}`);
+      console.log(`   重启后验证：node src/cli.mjs approval-verify ${r.level} --restarted`);
+      console.log('     （--restarted 是在告诉工具"我真的重启过了"；没有它，规则面只能报无法判定）');
       if (r.failed > 0) process.exitCode = 2;
       return undefined;
     }
 
     case 'approval-verify': {
-      const r = await engine.verifyApproval(f._[1]);
+      /**
+       * `--restarted` 必须在这里也认（残余 R3b）。
+       *
+       * 规则面走 readback-after-restart，收不到「我重启过了」这个声明就**永远**是 undetermined；
+       * 而 `approval-apply` 一直打印「重启后验证：approval-verify <档位>」——
+       * 那条命令给不出结论，是空承诺。
+       */
+      const r = await engine.verifyApproval(f._[1], { restarted: parseRestarted(f.restarted) });
       if (json) return out(r, true);
       console.log(`${VERDICT_BADGE[r.verdict] ?? r.verdict}   档位 ${r.level}`);
       console.log(r.reason);

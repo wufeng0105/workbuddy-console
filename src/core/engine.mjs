@@ -1190,15 +1190,32 @@ export function createEngine({
    * 验证某档"审批自动同意" —— 逐面给结论，再合成一个**诚实的三态**。
    * @param {string} level
    */
-  async function verifyApproval(level) {
+  /**
+   * 审批档位的验证。
+   *
+   * @param {string} level
+   * @param {{restarted?:boolean}} [opts]
+   *   `restarted` —— 用户声明「我已经重启过 WorkBuddy 了」。
+   *
+   *   ⚠️ 残余 R3b（2026-11-03 修）：本函数原来**不收任何参数**，
+   *   内部 `verify('rules.file', {})` 传的是空对象 ⇒ `readback-after-restart`
+   *   永远拿不到 `restarted: true` ⇒ **规则面永久停在「无法判定」**。
+   *   而 CLI 在 `approval-apply` 之后打印「重启后验证：approval-verify <档位>」——
+   *   那条命令**给不出结论**，是空承诺。
+   *
+   *   注意这里是**用户声明**，不是工具猜测（项目反对猜）：工具无法可靠判断
+   *   "这次读到的值是不是重启后才读的"，只能由做过重启的人说。
+   *   不声明时仍然如实判 `undetermined`，但提示语会告诉用户**该加什么参数**。
+   */
+  async function verifyApproval(level, { restarted = false } = {}) {
     const lv = findApprovalLevel(level);
     const parts = { ruleChanged: Boolean(lv.ruleOp), promptChanged: lv.promptLevel !== 'off' };
 
-    /** 规则面：重启后回读 */
+    /** 规则面：重启后回读（需要用户声明 restarted，见上方注释） */
     let ruleVerdict;
     if (parts.ruleChanged) {
       try {
-        const v = await verify('rules.file', {});
+        const v = await verify('rules.file', { restarted });
         ruleVerdict = v.verdict;
       } catch (e) {
         ruleVerdict = 'undetermined';
@@ -1247,7 +1264,20 @@ export function createEngine({
    * 设计原则：能给"未知"就给"未知"，绝不猜。
    */
   async function overview() {
-    const d = doctor();
+    /**
+     * ⚠️ 必须 await（2026-11-03 致命回归）。
+     *
+     * `doctor()` 改成 async 之后（R3d：真跑 probe），这里漏了 await ⇒ 拿到的是 Promise，
+     * 下面 `d.anchors.filter(...)` 在 Promise 上取 `.anchors` → TypeError。
+     *
+     * 后果不是"报个错"：**整个 `/api/overview` 恒 500**，首页全空；
+     * 而 `launch.mjs` 用 `/api/overview` 判断"这个端口是不是我的实例"，
+     * 于是第二次双击会误报「令牌对不上，去旧窗口重抄」——地址完全可用。
+     *
+     * 三条门禁全绿却没抓到它：自测只测 `/api/doctor`（对 `api/overview` 零命中），
+     * 前端断言用的是 DOM stub 假数据。**"有断言"和"断言覆盖了这条路径"是两件事。**
+     */
+    const d = await doctor();
     const drift = await checkDrift();
 
     /** 定制清单：用重放包的 sha 判断"改过没"；无包 = 未知 */
@@ -1432,7 +1462,14 @@ export function createEngine({
   function audit(limit) { return readAudit(storeRoot, { limit }); }
 
   /** 体检：锚点是否成立 + 把手契约是否满足 */
-  function doctor() {
+  /**
+   * 轻量体检：只验锚点能不能解析出路径。**同步、不跑 probe**。
+   *
+   * 存在的理由：`describe()` / 隔离警告这类调用点要的是**同步**结果
+   * （它们在对象字面量里、在启动路径上，改成 async 会连锁改一大片）。
+   * 它回答的问题只有"锚点键能不能定位到路径"——**不要**拿它当"把手可用"。
+   */
+  function doctorAnchors() {
     const anchors = resolver.probeAll();
     const handles = registry.list().map((h) => {
       const entry = { ...meta(h), anchorOk: true, anchorPath: null, error: null };
@@ -1452,6 +1489,99 @@ export function createEngine({
       anchors,
       handles,
       ok: anchors.every((a) => a.ok) && handles.every((h) => h.anchorOk),
+    };
+  }
+
+  /**
+   * 体检（完整）。
+   *
+   * ⚠️ 残余 R3d（2026-11-03 修）：本函数原来只验「锚点能不能解析」——
+   * `ok = anchors.every(a => a.ok) && handles.every(h => h.anchorOk)`。
+   * 于是 11 个锚点里 7 个**目标文件根本不存在**时，它照样打「总判：✅ 全部通过」、退出码 0；
+   * 而 CLI 帮助文案承诺的是「锚点是否成立、**把手是否可用**」。
+   *
+   * 现在做三层，逐层回答不同的问题：
+   *   ① `anchors` —— 锚点键能不能解析出路径（原来就有的那层）
+   *   ② `handles[].targetExists` —— 那个路径上**真的有文件吗**（新增；不存在就 ❌）
+   *   ③ `handles[].probe` —— **真跑一次 `h.probe()`**，拿到「存在 / 可写 / 内容指纹」（新增）
+   *
+   * 为什么 ③ 必须真跑而不是"看路径存不存在"：可写性、内容能不能解析（JSON 坏没坏）、
+   * 按 id 动态定位（style.* 七个 / prompt 的版本目录）都只有 probe 知道。
+   *
+   * 三态而非布尔：`probe` 抛错时是**判不了**，不是"通过"——铁律 6。
+   */
+  async function doctor() {
+    const anchors = resolver.probeAll();
+    const handles = [];
+    for (const h of registry.list()) {
+      const entry = {
+        ...meta(h),
+        anchorOk: true,
+        anchorPath: null,
+        error: null,
+        /** 目标路径上是否真有东西：true / false / null（没查到） */
+        targetExists: null,
+        /** 真跑 probe 的结论：'ok' | 'failed' | 'skipped' */
+        probe: 'skipped',
+        probeError: null,
+        /** 可写性（只有 probe 能答；null = 该把手不报告此项） */
+        writeAccess: null,
+      };
+      try {
+        entry.anchorPath = tildify(anchorFor(h).path);
+      } catch (e) {
+        entry.anchorOk = false;
+        entry.error = `${e.code ?? 'ERROR'}: ${e.message}`;
+        handles.push(entry);
+        continue;               // 锚点都不成立，probe 一定失败，不必再打一次
+      }
+      if (typeof h.probe !== 'function') {
+        entry.probe = 'skipped';
+        handles.push(entry);
+        continue;
+      }
+      try {
+        const st = await h.probe(ctx);
+        entry.probe = 'ok';
+        entry.targetExists = st?.exists === true;
+        if (typeof st?.writeAccess === 'boolean') entry.writeAccess = st.writeAccess;
+        if (typeof st?.bytes === 'number') entry.bytes = st.bytes;
+        if (typeof st?.sha256 === 'string') entry.sha256 = st.sha256;
+        // probe 成功但目标不存在 —— 不是"通过"，是"锚点指向的地方还没有东西"
+        if (st?.exists !== true) entry.error = '目标不存在（锚点可解析，但该路径下没有文件）';
+      } catch (e) {
+        entry.probe = 'failed';
+        entry.probeError = `${e.code ?? 'ERROR'}: ${e.message}`;
+        entry.error = entry.probeError;
+      }
+      handles.push(entry);
+    }
+
+    /**
+     * 总判：任一项不确定即不算通过。
+     * 这里的判据读法 —— **"不知道" 与 "失败" 都不通过**，只有全部确实成立才 ✅。
+     */
+    const anchorBad = anchors.filter((a) => !a.ok);
+    const probeFailed = handles.filter((h) => h.probe === 'failed');
+    const targetMissing = handles.filter((h) => h.anchorOk && h.probe === 'ok' && h.targetExists !== true);
+    const notWritable = handles.filter((h) => h.writeAccess === false);
+    const ok = anchorBad.length === 0 && probeFailed.length === 0 && targetMissing.length === 0;
+
+    return {
+      version: resolver.version,
+      tableFile: resolver.tableFile,
+      configRoot: tildify(configRoot),
+      storeRoot: tildify(storeRoot),
+      anchors,
+      handles,
+      summary: {
+        anchorBad: anchorBad.length,
+        probeFailed: probeFailed.length,
+        targetMissing: targetMissing.length,
+        notWritable: notWritable.length,
+        probeSkipped: handles.filter((h) => h.probe === 'skipped').length,
+      },
+      ok,
     };
   }
 
@@ -1682,7 +1812,7 @@ export function createEngine({
 
   return {
     resolver, ctx,
-    probe, plan, apply, verify, restore, backups, audit, doctor,
+    probe, plan, apply, verify, restore, backups, audit, doctor, doctorAnchors,
     checkRestoreGate,
     // 最初基线
     baselineCapture: captureBaseline, baseline: baselineInfo, baselineRestore: restoreBaseline,

@@ -363,7 +363,7 @@ export function createConsoleServer({ configRoot, storeRoot, version, isolatedBa
        * `vendorEscapes` 给**明细**（含路径），启动时可以拿它拼同一条警告。
        */
       const installRoot = requestedInstallRoot();
-      const escapes = findVendorEscapes(engine.doctor().handles, { configRoot, installRoot });
+      const escapes = findVendorEscapes(engine.doctorAnchors().handles, { configRoot, installRoot });
       return {
         configRoot: tildify(configRoot),
         storeRoot: tildify(storeRoot),
@@ -384,7 +384,24 @@ export async function startConsole({ root, store, port } = {}) {
    * 那就连最初基线账本一起隔离到那个 store 下，别落进项目 `baselines/`。
    * 不给 `--store` 的正常路径保持原样（账本仍在项目目录，随仓库维护）。
    */
-  const isolated = typeof store === 'string' && store.trim() !== '' && store !== resolveStoreRoot();
+  /**
+   * 「这是不是隔离运行」的唯一判据。
+   *
+   * ⚠️ 曾经的写法是 `store !== resolveStoreRoot()`，而 `resolveStoreRoot()` **不带参数时会读
+   * `WORKBUDDY_CONSOLE_HOME` 环境变量**。于是当调用方既给了 `--store X` 又设了同名环境变量（同值）时：
+   *
+   *   store === resolveStoreRoot()  ⇒ 相等 ⇒ isolated = false
+   *   ⇒ 账本照旧写进**项目目录 `baselines/`**
+   *
+   * 实测踩过两次（审计者一次、我一次），而 `baselines/` 是 gitignore 的，**永远不出现在 git status 里**，
+   * 所以这个漏洞不会自己暴露。
+   *
+   * 现在的判据是「**显式给了 store 就算隔离**」——不再和环境变量比。理由：
+   *   - 显式传参是调用方在说"我要一个指定目录"，这是最强的意图信号；
+   *   - 与环境变量比较会随环境漂移（这正是 bug 的来源）。
+   * 正常用户路径（双击启动器、`start-console.cmd`）**不传 store**，所以账本仍在项目目录，行为不变。
+   */
+  const isolated = typeof store === 'string' && store.trim() !== '';
   const app = createConsoleServer({ configRoot, storeRoot, isolatedBaselines: isolated });
   /**
    * 启动时就把"隔离不一致"说出来（残余 R39）：`--root` 只换配置树，厂商面另有安装树。
