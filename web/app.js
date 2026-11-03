@@ -1522,12 +1522,27 @@ async function doApply(getNext) {
     });
     // 写入成功：用户输入已落盘，"未保存"状态作废，下次渲染以探针到的新内容为准
     clearPendingFields();
+    /**
+     * ⚠️ 必须把后端算出来的警告显示出来（残余 R4，2026-11-03）。
+     *
+     * `engine.apply` 从 D2 修复起就返回 `previewWarnings`，但**全站只有风格编辑器读了它**
+     * —— 其余 11 个把手（SOUL/USER/IDENTITY/toneStyle/customPrompt/prompt×3/rules×3）
+     * 的警告全部被丢掉。
+     *
+     * 最要命的一条是 style 把手的「该档位当前未生效 —— 改这个文件不会影响任何请求」：
+     * 没有它，用户改完看到「✅ 已写入」，**以为生效了，其实那份内容根本没参与请求**。
+     * 这正是本项目存在的理由（防"写成功但效果为零"）。
+     */
+    const warns = Array.isArray(r.previewWarnings) ? r.previewWarnings : [];
+    const lines = [];
     if (r.noop || !r.backupId) {
       // 后端判成"内容与现状一致"：没写、没建备份。不许拼「备份 null」冒充成功。
-      S.flash = { type: 'ok', text: `${r.handle}：${r.note ?? '内容与现状一致，未做任何改动'}` };
+      lines.push(`${r.handle}：${r.note ?? '内容与现状一致，未做任何改动'}`);
     } else {
-      S.flash = { type: 'ok', text: `已写入 ${r.handle}　备份 ${r.backupId}（点「还原」回到最初）` };
+      lines.push(`已写入 ${r.handle}　备份 ${r.backupId}（点「还原」回到最初）`);
     }
+    for (const w of warns) lines.push(`⚠ ${w}`);
+    S.flash = { type: 'ok', text: lines[0], lines };
     await reloadAll();
     await loadProbeQuiet();
   }, (e) => { S.flash = { type: 'err', text: `写入失败 [${e.code ?? 'ERR'}] ${e.message}` }; });
@@ -1656,11 +1671,29 @@ async function doRestore(backupId) {
 
     // 3) 执行（confirm 必传，否则后端拒绝）
     const r = await api('/api/restore', { method: 'POST', body: { backupId, confirm: true } });
-    S.flash = {
-      type: 'ok',
-      text: `已还原 ${backupId}：${r.changed.length} 项变化`
-        + `${r.deleted?.length ? `（其中删除 ${r.deleted.length} 项）` : ''}`,
-    };
+    /**
+     * ⚠️ 必须把「部分失败」说清楚（残余 R25）。
+     *
+     * 后端 `restoreBackup` 返回 `ok` / `partial` / `savedDir` / `results[]`，
+     * 而这里原来只读 `changed` 和 `deleted` —— **一条失败时界面照样打绿说"已还原"**。
+     * 用户以为回到原状了，其实没有。这正是本项目最反对的那种错：
+     * 把「没全成」说成「成了」。
+     */
+    const failedItems = (r.results ?? []).filter((x) => x.ok === false);
+    const lines = [];
+    if (failedItems.length) {
+      lines.push(`⚠ 已还原 ${backupId}，但有 ${failedItems.length} 项失败（${r.changed?.length ?? 0} 项变化）`);
+      for (const x of failedItems.slice(0, 5)) {
+        lines.push(`　✗ ${x.absPath ?? x.key}${x.error ? ` —— ${x.error}` : ''}`);
+      }
+      if (failedItems.length > 5) lines.push(`　…另有 ${failedItems.length - 5} 项`);
+    } else {
+      lines.push(`已还原 ${backupId}：${r.changed?.length ?? 0} 项变化`
+        + `${r.deleted?.length ? `（其中删除 ${r.deleted.length} 项）` : ''}`);
+    }
+    // 还原前副本在哪 —— 失败时这是唯一能救回来的东西，必须给
+    if (r.savedDir) lines.push(`　还原前副本：${r.savedDir}`);
+    S.flash = { type: failedItems.length ? 'err' : 'ok', text: lines[0], lines };
     await reloadAll();
     S.probes = {};          // 还原后所有把手现状可能变化，全部重探
     await loadProbes();

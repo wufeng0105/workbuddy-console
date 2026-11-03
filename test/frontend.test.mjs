@@ -238,7 +238,7 @@ const bodyOf = (opts) => {
   try { return JSON.parse(opts?.body ?? '{}'); } catch { return {}; }
 };
 
-function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null, restorePreview = null } = {}) {
+function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], probeOverride = null, drift = null, audit = null, restorePreview = null, applyResult = null } = {}) {
   const doc = new StubDocument();
   const apiCalls = [];
 
@@ -257,6 +257,12 @@ function makeHarness({ mode = 'ok', overview = {}, handles = [], profiles = [], 
       const e = new Error('数据目录写不进去');
       e.code = 'EPERM';
       throw e;
+    }
+    /** apply 的返回值：让用例能注入 previewWarnings / backupId / noop（R4 需要） */
+    if (/\/apply$/.test(p)) {
+      if (applyResult) return applyResult;
+      const id = decodeURIComponent(/\/api\/handle\/([^/]+)\/apply/.exec(p)?.[1] ?? "h");
+      return { handle: id, backupId: "20260101T000000Z-test", contentChanged: true, previewWarnings: [] };
     }
     if (p === '/api/overview') return overview;
     if (p === '/api/doctor') return { version: '5.9.3', anchors: [], handles };
@@ -860,6 +866,61 @@ test('F9：枚举卡不给「还原到最初基线」，文本卡必须保留', 
   assert.match(fn, /isEnum/, '必须按"是不是枚举"分流（否则枚举卡又会冒出还原按钮）');
   assert.match(fn, /if \(!isEnum\) \{/, '还原按钮必须被 !isEnum 守卫住');
 });
+test('R4：apply 必须在界面上显示后端返回的 previewWarnings', async () => {
+  /**
+   * `engine.apply` 从 D2 修复起就返回 `previewWarnings`，但全站只有风格编辑器读它——
+   * 其余 11 个把手的警告全被丢掉。最要命的是 style 那条
+   * 「该档位当前未生效 —— 改这个文件不会影响任何请求」：
+   * 没有它，用户看到「✅ 已写入」，以为生效了，其实那份内容根本没参与请求。
+   */
+  const handles = [
+    { id: 'personalization.soul', title: '人设设定（SOUL.md）', writeClass: 'user-data', anchorOk: true },
+  ];
+  await loadApp({
+    mode: 'ok',
+    handles,
+    applyResult: {
+      handle: 'personalization.soul', backupId: '20260101T000000Z-test', contentChanged: true,
+      previewWarnings: ['该档位**当前未生效** —— 改这个文件不会影响任何请求。'],
+    },
+  });
+  const root = await boot();
+  root.querySelectorAll('.nav-tab').find((b) => b.textContent.trim() === '个性化').click();
+  await new Promise((r) => setTimeout(r, 120));
+  const card = root.querySelectorAll('.acc').find((c) => (c.querySelector('.acc-title')?.textContent ?? '').includes('人设'));
+  if (card && card.dataset.open !== 'true') card.querySelector('.acc-head').click();
+  await new Promise((r) => setTimeout(r, 150));
+
+  const ta = root.querySelectorAll('#editor')[0];
+  assert.ok(ta, '找不到编辑器');
+  ta.value = '# 新内容\n- 加了东西';
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 60));
+  const btn = root.querySelectorAll('.btn-primary').find((b) => b.textContent.trim() === '应用');
+  assert.ok(btn, '找不到「应用」');
+  btn.click();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const flashText = root.querySelectorAll('.flash')[0]?.textContent ?? '';
+  assert.match(flashText, /当前未生效/,
+    `警告必须出现在界面上。实际 flash: ${JSON.stringify(flashText.slice(0, 160))}`);
+  assert.match(flashText, /已写入/, '结论本身仍要保留');
+});
+
+test('R25：还原部分失败时不许打绿说"已还原"', async () => {
+  /**
+   * 后端 `restoreBackup` 返回 `ok`/`partial`/`savedDir`/`results[]`，
+   * 而前端原来只读 `changed` 和 `deleted` —— 一条失败时照样打绿。
+   * 用户以为回到原状了，其实没有。
+   */
+  const code = stripComments(readHead());
+  const fn = /async function doRestore\([\s\S]*?\n  \}/.exec(code)?.[0] ?? '';
+  assert.ok(fn, '找不到 doRestore');
+  assert.match(fn, /results/, '必须读 results 才能知道哪一条失败了');
+  assert.match(fn, /failedItems/, '必须把失败项筛出来');
+  assert.match(fn, /savedDir/, '必须告诉用户还原前副本在哪（失败时唯一能救回来的东西）');
+  assert.match(fn, /type: failedItems\.length \? 'err' : 'ok'/, '有失败时 flash 必须是 err（红色），不许打绿');
+});
 test('P0/T12：API 全 401 时，一轮渲染不得自激重排（曾经的 401 次）', async () => {
   const { } = await loadApp({ mode: 'down' });
   const root = await boot();
@@ -987,7 +1048,7 @@ test('P0/T13：加载失败必须明说，不得伪装成空态', async () => {
 
 test('P2/T16：最近动态里 verify 事件必须按 verdict 分色，不得一律涂绿', async () => {
   /**
-   * ⚠️ 这条断言曾经是**空转**的（由独立复核抓出，见 .zhll/gates/wp6-verify.log [C20]）：
+     * ⚠️ 这条断言曾经是**空转**的（由独立复核抓出）：
    * 旧版只 grep 源码里 `ineffective` 和 `mk-bad` 的字面共存，**根本不走渲染路径**——
    * 把 `const m = mkOf(r)` 换成硬编码 `mk-ok`（也就是 D7 原样复发），测试照样全绿。
    *
@@ -1067,7 +1128,7 @@ test('P2/T16：最近动态里 verify 事件必须按 verdict 分色，不得一
  * 而文本存在 ≠ 机制生效。下面每条都改成**走一遍用户真的会走的那条路**，再读结果。
  *
  * 每条都做了三证（改回缺陷态 / 正常态 / 删掉被测字段），原始输出在
- * .zhll/audit2/gates/WP11/ ，结论见 .zhll/audit2/exec-WP11.md。
+     * 每条都做了三证（改回缺陷态 / 正常态 / 删掉被测字段）。
  * ══════════════════════════════════════════════════════════════════════════ */
 
 test('I2（行为）：双击「应用」只写一次 —— 第一下之后按钮必须立刻 disabled', async () => {
