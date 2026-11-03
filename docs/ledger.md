@@ -117,7 +117,7 @@ Get-ChildItem <repo>/.local-store/backups -Directory       # 隔离测试留下�
 `node src/cli.mjs verify personalization.custom-prompt` → 关闭 → 还原 → 逐字节核对。
 
 **结果**：判据给的是 **`undetermined`**（实测 Δ57 vs 预期 +35，偏差 62.9%），**不是** `effective`。
-逐条证据与"噪声下限 ≥ 26 tokens"那个受控对照，见本机审计留存的三次会话 tokens 对照表（过程资料，不入库）。
+逐条证据与"噪声下限 ≥ 26 tokens"那个受控对照，见本机审计留存的三次会话 tokens 对照表（过程记录已不保留）。
 
 **真实 store 台账**：这一轮在 `~/.workbuddy-console/state/audit.jsonl` 留下 **6 行 `actor=cli`**
 （`apply` 06:29:27 / `verify` 06:36:22 / `verify` 06:36:24 / `restore` 06:36:42 / `apply` 06:38:08 / `restore` 06:39:22，

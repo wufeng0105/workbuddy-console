@@ -7,7 +7,7 @@
 ```
 src/
 ├─ core/       Core（框架 · 少变）—— 契约 / 引擎 / 注册表 / 备份 / 漂移 / 锚点
-├─ handles/    把手适配器（Data · 多变）—— 一个把手一个文件
+├─ handles/    把手实现（Data · 多变）—— 一个把手一个文件
 ├─ anchors/    锚点表（Data · 多变）—— 按 WorkBuddy 版本
 └─ verify/     验证策略实现（三条：标记法 / token 增量法 / 重启后回读）
 ```
@@ -16,36 +16,37 @@ src/
 
 ## 模块落点（在不在仓库里）
 
-> 本表只答一件事：**这个模块在不在**。**兑现状态**（有没有会变红的断言守住）不在这里声明
+> 本表只答一件事：**这个模块在不在盘上**。状态列的「✅ 在」只表示文件存在、导出了预期接口；
+> **兑现状态**（有没有会变红的断言守住）不在这里声明
 > ——见 [`../DOC-OUTLINE.md`](../DOC-OUTLINE.md)「已知残余」。「已实现」在本组不是状态词。
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | `core/contracts.mjs` | ✅ 已定 | 契约定义 + `assertHandle()` 校验（**只有接口，无实现**） |
-| `core/anchor.mjs` | ✅ 已实现 | 锚点解析：运行时探测版本；位置不可确定即硬报错 |
-| `core/backup.mjs` | ✅ 已实现 | manifest + sha256 备份仓、还原、预演、漂移报告 |
-| `core/profiles.mjs` | ✅ 已实现 | 档位（源状态）存取：原子写、结构校验、损坏可见；**存用户数据目录，不进仓库** |
-| `core/engine.mjs` | ✅ 已实现 | `plan → apply → verify → audit`；apply 前必然先备份；**档位多把手事务**（一次备份 / 一条审计 / 整体还原） |
-| `core/trace.mjs` | ✅ 已实现 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
-| `core/replay.mjs` | ✅ 已实现 | 版本重放：建包（存锚点键不存路径）、漂移检测（**声明 5 类、实际产出 3 类**，见残余 R7）、重放（一次事务 + 如实报告失败） |
-| `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 已实现 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
-| `verify/token-delta.mjs` | ✅ 已实现 | 三态判定（生效 / 未生效 / 无法判定） |
-| `verify/auto-capture.mjs` | ✅ 已实现 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
-| `handles/personalization.soul.mjs` / `.user.mjs` / `.identity.mjs` | ✅ 已实现 | 身份文件三件，共用 `identity-file.mjs` 工厂（含 10 000 字符截断与模式可达性） |
-| `handles/personalization.tone-style.mjs` / `.custom-prompt.mjs` | ✅ 已实现 | JSON 字段，共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + `trim()` 对齐） |
-| `cli.mjs` | ✅ 已实现 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces / **serve** |
-| `server.mjs` | ✅ 已实现 | 本地控制台服务端：仅回环 + 随机端口 + 一次性 token；前端永不直触文件系统 |
-| `handles/style-file.mjs` + `handles/styles.mjs` | ✅ 已实现 | 七档 style 内容（安装目录厂商文件）：`resolveTarget` 参数化定位、生效档位判定、可写性如实报告 |
-| `core/appconfig.mjs` | ✅ 已实现 | app-config 读取 + toneStyle 枚举（避免把手之间互相依赖） |
-| `handles/prompt-template.mjs` + `handles/prompt-templates.mjs` | ✅ 已实现 | C 组三模式根模板（请求**头部**通道）：版本哈希定位、标记法验证、闸门 `app-must-be-closed` |
-| `verify/marker.mjs` | ✅ 已实现 | 标记法三态判定（逐条时间过滤 / 无时间戳降级 / 无 apply 记录降级） |
-| `core/trace-raw.mjs` | ✅ 已实现 | trace 原文扫描（标记法用），与 `trace.mjs`（usage 抽取）分工 |
-| `handles/rules.mjs` + `handles/rules-index.mjs` | ✅ 已实现 | 规则矩阵三域：**结构化批量改动作**（from/to/actions/paths）+ **重启后回读**验证 |
-| `core/safety-block.mjs` | ✅ 已实现 | `personal_files_safety` 段落手术：按**语义**（非编号）分级放宽、幂等、红线守卫 |
-| `core/approval.mjs` | ✅ 已实现 | 审批自动同意编排：三档位、双面预览、`combineVerdicts`（诚实三态合成） |
-| `core/rules.mjs` | ✅ 已实现 | 规则读取/统计/批量提升/最小改动写入（`customized` 自动置真） |
-| `verify/readback.mjs` | ✅ 已实现 | 重启后回读两阶段判定（写完只能 undetermined，重启后才 effective） |
-| `web/` 前端 | ✅ 已实现 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
+| `core/anchor.mjs` | ✅ 在 | 锚点解析：运行时探测版本；位置不可确定即硬报错 |
+| `core/backup.mjs` | ✅ 在 | manifest + sha256 备份仓、还原、预演、漂移报告 |
+| `core/profiles.mjs` | ✅ 在 | 档位（源状态）存取：原子写、结构校验、损坏可见；**存用户数据目录，不进仓库** |
+| `core/engine.mjs` | ✅ 在 | `plan → apply → verify → audit`；apply 前必然先备份；**档位多把手事务**（一次备份 / 一条审计 / 整体还原） |
+| `core/trace.mjs` | ✅ 在 | 读 `traces/<pid>/trace_*.jsonl` 的 generation usage；排除标题生成 |
+| `core/replay.mjs` | ✅ 在 | 版本重放：建包（存锚点键不存路径）、漂移检测（**声明 5 类、实际产出 3 类**，见残余 R7）、重放（一次事务 + 如实报告失败） |
+| `core/diff.mjs` · `tokens.mjs` · `audit.mjs` · `registry.mjs` · `errors.mjs` · `paths.mjs` · `appstate.mjs` | ✅ 在 | 差异、token 估算、台账、注册表、错误、路径、进程探测 |
+| `verify/token-delta.mjs` | ✅ 在 | 三态判定（生效 / 未生效 / 无法判定） |
+| `verify/auto-capture.mjs` | ✅ 在 | **自动对照**：用台账的 apply 时间戳 + trace 的 prompt_tokens 取基线/观测；同 worker 时强制降级 |
+| `handles/personalization.soul.mjs` / `.user.mjs` / `.identity.mjs` | ✅ 在 | 身份文件三件，共用 `identity-file.mjs` 工厂（含 10 000 字符截断与模式可达性） |
+| `handles/personalization.tone-style.mjs` / `.custom-prompt.mjs` | ✅ 在 | JSON 字段，共用 `json-field.mjs` 工厂（最小改动写入 + 枚举守卫 + `trim()` 对齐） |
+| `cli.mjs` | ✅ 在 | doctor / list / probe / plan / apply / verify / restore / backups / audit / traces / **serve** |
+| `server.mjs` | ✅ 在 | 本地控制台服务端：仅回环 + 随机端口 + 一次性 token；前端永不直触文件系统 |
+| `handles/style-file.mjs` + `handles/styles.mjs` | ✅ 在 | 七档 style 内容（安装目录厂商文件）：`resolveTarget` 参数化定位、生效档位判定、可写性如实报告 |
+| `core/appconfig.mjs` | ✅ 在 | app-config 读取 + toneStyle 枚举（避免把手之间互相依赖） |
+| `handles/prompt-template.mjs` + `handles/prompt-templates.mjs` | ✅ 在 | C 组三模式根模板（请求**头部**通道）：版本哈希定位、标记法验证、闸门 `app-must-be-closed` |
+| `verify/marker.mjs` | ✅ 在 | 标记法三态判定（逐条时间过滤 / 无时间戳降级 / 无 apply 记录降级） |
+| `core/trace-raw.mjs` | ✅ 在 | trace 原文扫描（标记法用），与 `trace.mjs`（usage 抽取）分工 |
+| `handles/rules.mjs` + `handles/rules-index.mjs` | ✅ 在 | 规则矩阵三域：**结构化批量改动作**（from/to/actions/paths）+ **重启后回读**验证 |
+| `core/safety-block.mjs` | ✅ 在 | `personal_files_safety` 段落手术：按**语义**（非编号）分级放宽、幂等、红线守卫 |
+| `core/approval.mjs` | ✅ 在 | 审批自动同意编排：三档位、双面预览、`combineVerdicts`（诚实三态合成） |
+| `core/rules.mjs` | ✅ 在 | 规则读取/统计/批量提升/最小改动写入（`customized` 自动置真） |
+| `verify/readback.mjs` | ✅ 在 | 重启后回读两阶段判定（写完只能 undetermined，重启后才 effective） |
+| `web/` 前端 | ✅ 在 | 把手面板 / 差异预览 / 三态验证 / 备份还原 |
 
 ## 硬约束（写代码前必读）
 
